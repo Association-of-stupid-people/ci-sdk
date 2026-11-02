@@ -1,0 +1,147 @@
+name: unity-build
+description: >-
+  Build a Unity project on Windows, macOS or Linux, on the host editor (found by version, installed
+  with Unity Hub when missing) or in a Docker image built per Unity version. Secrets go through
+  environment variables, hung editors are killed, only license errors are retried, and errors from
+  the Unity log are written to the job summary. Built on ci-sdk.
+author: 'ci-sdk'
+
+inputs:
+  workdir:
+    description: Unity project directory.
+    required: false
+    default: '.'
+  version:
+    description: >-
+      Unity version (e.g. 2022.3.20f1). Empty = the UNITY_VER environment variable, then
+      ProjectSettings/ProjectVersion.txt.
+    required: false
+  changeset:
+    description: >-
+      Changeset of that version (12 hex chars). Needed to install versions Hub does not list.
+      Default: ProjectVersion.txt when the versions match, else Unity's release API.
+    required: false
+  mode:
+    description: 'host (editor on the runner) | docker (editor in a Docker image, Linux editor).'
+    required: false
+    default: 'host'
+  default-args-override:
+    description: Base Unity arguments. No shell; $(pwd) is replaced with the project path.
+    required: false
+    default: '-batchmode -nographics -silent-crashes -quit -logFile - -executeMethod BuildScript.BuildCLI'
+  args:
+    description: Extra Unity arguments (e.g. -buildTarget Android). Do not put passwords here.
+    required: false
+    default: ''
+  timeout:
+    description: Hard limit for one Unity run (e.g. 90m, 3h). The process tree is killed.
+    required: false
+    default: '3h'
+  idle-timeout:
+    description: Kill Unity when it prints nothing for this long (hung editor). 0 = off.
+    required: false
+    default: '30m'
+  license-retries:
+    description: Extra attempts when (and only when) the log shows a license error.
+    required: false
+    default: '2'
+  license-retry-delay:
+    description: Delay before the first license retry; doubles each time.
+    required: false
+    default: '30s'
+  license-error-patterns:
+    description: Extra regular expressions (one per line, case-insensitive) that mean a license error.
+    required: false
+  keystore-path:
+    description: Android keystore, relative to workdir. Passed as UNITY_KEYSTORE_PATH.
+    required: false
+  keystore-password:
+    description: Keystore password. Passed as UNITY_KEYSTORE_PASS (environment only, masked).
+    required: false
+  keystore-alias:
+    description: Key alias name. Passed as UNITY_KEYALIAS_NAME.
+    required: false
+  keystore-alias-password:
+    description: Key alias password. Passed as UNITY_KEYALIAS_PASS (environment only, masked).
+    required: false
+  install:
+    description: Install the editor / missing modules with the Unity Hub CLI when they are missing (host mode).
+    required: false
+    default: 'true'
+  modules:
+    description: >-
+      Hub modules to require (android, ios, webgl, ...). auto = from -buildTarget; none = no modules.
+    required: false
+    default: 'auto'
+  editor-path:
+    description: Use this editor binary instead of searching.
+    required: false
+  editors-dir:
+    description: Extra folders that hold one sub-folder per Unity version (comma or newline separated).
+    required: false
+  hub-path:
+    description: Unity Hub binary (default locations are searched).
+    required: false
+  install-timeout:
+    description: Time limit for a Hub install or a Docker image build/pull.
+    required: false
+    default: '1h'
+  docker-image:
+    description: Use this image (pulled when missing) instead of building ci-unity-editor:<version>-<modules>.
+    required: false
+  docker-image-repo:
+    description: Repository name of the images this action builds.
+    required: false
+    default: 'ci-unity-editor'
+  dockerfile:
+    description: Dockerfile used to build the image (default is the bundled one; its folder is the context).
+    required: false
+  docker-env:
+    description: Extra environment variable names to forward into the container.
+    required: false
+  docker-gradle-volume:
+    description: Named volume for /root/.gradle, kept between builds. none = no volume.
+    required: false
+    default: 'ci-unity-gradle'
+  unity-license-file:
+    description: .ulf license file mounted into the container (docker mode).
+    required: false
+  unity-serial:
+    description: Unity serial to activate inside the container (docker mode; returned after the build).
+    required: false
+  unity-email:
+    description: Unity account email for unity-serial.
+    required: false
+  unity-password:
+    description: Unity account password for unity-serial.
+    required: false
+  clean-gradle-cache:
+    description: Delete ~/.gradle/caches first. auto = on macOS hosts only (old composite behaviour).
+    required: false
+    default: 'auto'
+  summary:
+    description: Write the result and the Unity log errors to the job summary.
+    required: false
+    default: 'true'
+
+outputs:
+  status:
+    description: success | failure | cancelled
+  failure-kind:
+    description: 'Empty on success, else: license | build | timeout | hang'
+  unity-version:
+    description: Unity version used.
+  editor-path:
+    description: Editor binary used (host mode).
+  image:
+    description: Docker image used (docker mode).
+  attempts:
+    description: Number of Unity runs.
+  log-file:
+    description: Full Unity log (upload it with actions/upload-artifact on failure).
+  errors:
+    description: JSON array of the errors found in the Unity log.
+
+runs:
+  using: node24
+  main: dist/index.js

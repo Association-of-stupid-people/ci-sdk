@@ -1,0 +1,59 @@
+name: 'ci-sdk resilient run'
+description: 'Run CI commands as steps with retries, timeouts, cancellation-safe cleanup and a job summary. Built on ci-sdk.'
+author: 'ci-sdk'
+
+branding:
+  icon: 'refresh-cw'
+  color: 'blue'
+
+inputs:
+  run:
+    description: 'Commands to run, one per line. Blank lines and lines starting with # are ignored.'
+    required: true
+  name:
+    description: 'Name shown in logs and the job summary.'
+    required: false
+    default: 'ci-sdk'
+  shell:
+    description: >-
+      none (default) runs each line without a shell, so input values cannot inject commands;
+      bash | sh | pwsh run the line through that shell (pipes, &&, $VAR available).
+    required: false
+    default: 'none'
+  working-directory:
+    description: 'Directory to run commands in.'
+    required: false
+  retries:
+    description: 'Extra attempts per command after a failure (0-10). Use for flaky network steps only.'
+    required: false
+    default: '0'
+  retry-delay:
+    description: 'Initial delay before a retry; doubles each attempt, with jitter (e.g. 2s, 30s, 1m).'
+    required: false
+    default: '2s'
+  timeout:
+    description: 'Time budget per attempt (e.g. 90s, 10m). 0 = no limit. The process tree is killed on timeout.'
+    required: false
+    default: '0'
+  continue-on-error:
+    description: 'Report failures as warnings and keep the action green.'
+    required: false
+    default: 'false'
+  summary:
+    description: 'Write a results table to the job summary.'
+    required: false
+    default: 'true'
+
+outputs:
+  status:
+    description: 'success | failure | cancelled'
+  failed-steps:
+    description: 'JSON array of failed command lines.'
+  duration-ms:
+    description: 'Total duration in milliseconds.'
+  report:
+    description: 'Full JSON report (steps, statuses, attempts, durations, errors).'
+
+runs:
+  using: node24
+  main: dist/index.js

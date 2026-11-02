@@ -1,0 +1,16 @@
+name: string-interpolate
+description: Interpolates strings
+inputs:
+  value:
+    description: The string to interpolate
+    required: true
+  mask:
+    description: Mask the output
+    required: false
+    default: 'false'
+outputs:
+  value:
+    description: The interpolated string
+runs:
+  using: node24
+  main: dist/index.js

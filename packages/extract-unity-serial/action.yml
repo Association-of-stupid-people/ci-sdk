@@ -1,0 +1,16 @@
+name: extract-unity-serial
+description: Extract unity serial from ULF license file
+author: _MoonLight_ <moonlight8978@gmail.com>
+
+inputs:
+  license:
+    description: ULF license file
+    required: true
+
+outputs:
+  serial:
+    description: Unity serial
+
+runs:
+  using: node24
+  main: dist/index.js

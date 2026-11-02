@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [actions, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    name: Lint, typecheck, test, build
+    # Never run fork PR code on a self-hosted runner (vars.CI_RUNNER).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository || !vars.CI_RUNNER
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run ci-test
+      - run: npm run build
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: actions-dist
+          path: dist/
+          retention-days: 3
+
+  smoke:
+    name: Run the built actions
+    needs: check
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: actions-dist
+          path: dist/
+
+      - id: runs-on
+        uses: ./dist/runs-on
+        with:
+          branch: this-branch-does-not-exist
+          silent: 'true'
+
+      - name: runs-on must report not allowed
+        env:
+          ALLOWED: ${{ steps.runs-on.outputs.allowed }}
+        run: test "$ALLOWED" = "false"
+
+      - id: eval
+        uses: ./dist/eval
+        with:
+          template: '{github:repo.owner}/{vars:NAME}'
+          vars: '{"NAME":"sdk"}'
+
+      - name: eval must interpolate
+        env:
+          VALUE: ${{ steps.eval.outputs.value }}
+          OWNER: ${{ github.repository_owner }}
+        run: test "$VALUE" = "$OWNER/sdk"
+
+      - id: run
+        uses: ./dist/run
+        with:
+          name: smoke
+          run: |
+            node --version
+            node -e "console.log('hello from ci-sdk')"
+          retries: '1'
+          timeout: 1m
+
+      - name: run must succeed
+        env:
+          STATUS: ${{ steps.run.outputs.status }}
+        run: test "$STATUS" = "success"
