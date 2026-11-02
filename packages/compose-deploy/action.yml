@@ -1,0 +1,113 @@
+name: 'ci-sdk compose deploy'
+description: 'Deploy a Docker Compose service over SSH: Postgres backup, pull, up, health check and rollback to the previous image. Built on ci-sdk.'
+author: 'ci-sdk'
+
+branding:
+  icon: 'upload-cloud'
+  color: 'blue'
+
+inputs:
+  host:
+    description: 'SSH host of the VPS.'
+    required: true
+  port:
+    description: 'SSH port.'
+    required: false
+    default: '22'
+  username:
+    description: 'SSH user.'
+    required: true
+  password:
+    description: 'SSH password. Exactly one of password / ssh-key is required.'
+    required: false
+  ssh-key:
+    description: 'SSH private key (text). Exactly one of password / ssh-key is required.'
+    required: false
+  known-hosts:
+    description: 'known_hosts lines for the host. Without it the host key is accepted on first use (not recommended).'
+    required: false
+  directory:
+    description: 'Remote application directory (contains the compose file).'
+    required: true
+  compose-file:
+    description: 'Compose file, relative to directory.'
+    required: false
+    default: 'compose.yaml'
+  project-name:
+    description: 'Compose project name (docker compose -p).'
+    required: false
+  service:
+    description: 'Service to deploy and health-check.'
+    required: false
+    default: 'app'
+  pull:
+    description: 'Services to pull, one per line. Default: the service.'
+    required: false
+  env:
+    description: 'KEY=VALUE lines exported on the remote before compose runs (e.g. DOCKER_IMAGE, APP_PORT).'
+    required: false
+  registry:
+    description: 'Registry host for docker login on the remote (omit for Docker Hub).'
+    required: false
+  registry-username:
+    description: 'Registry username. With registry-password, enables docker login before pull, using a temporary Docker config that is removed afterwards. Guaranteed temporary only on hosts without an installed credential helper (pass, secretservice): the docker CLI may pick one by itself.'
+    required: false
+  registry-password:
+    description: 'Registry password or token.'
+    required: false
+  backup:
+    description: 'none | postgres. postgres runs pg_dump in the db service before deploying.'
+    required: false
+    default: 'none'
+  db-service:
+    description: 'Compose service running Postgres.'
+    required: false
+    default: 'db'
+  backup-dir:
+    description: 'Backup directory, relative to directory.'
+    required: false
+    default: 'backups'
+  backup-keep:
+    description: 'Number of deploy-*.dump files to keep.'
+    required: false
+    default: '10'
+  health-command:
+    description: 'Command run inside the service container (sh -c); exit 0 = healthy.'
+    required: false
+  health-url:
+    description: 'URL checked from the VPS host with curl (or wget). Exclusive with health-command.'
+    required: false
+  health-retries:
+    description: 'Health check attempts.'
+    required: false
+    default: '30'
+  health-interval:
+    description: 'Delay between health check attempts.'
+    required: false
+    default: '5s'
+  rollback:
+    description: 'Roll back to the previous image when compose up or the health check fails.'
+    required: false
+    default: 'true'
+  log-lines:
+    description: 'Service log lines printed when the deploy fails.'
+    required: false
+    default: '120'
+  timeout:
+    description: 'Time budget for the whole SSH session (e.g. 20m). The session is killed on timeout.'
+    required: false
+    default: '20m'
+
+outputs:
+  status:
+    description: 'deployed | rolled-back | failed'
+  previous-image-id:
+    description: 'Image id of the service before the deploy.'
+  image-id:
+    description: 'Image id of the running service container after the deploy.'
+  backup-file:
+    description: 'Remote path of the Postgres backup (empty when skipped).'
+
+runs:
+  using: node24
+  main: dist/index.js
