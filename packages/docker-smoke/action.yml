@@ -1,0 +1,89 @@
+name: 'ci-sdk docker smoke'
+description: 'Run a container, wait until it is healthy, dump logs on failure and always clean up (post step). Built on ci-sdk.'
+author: 'ci-sdk'
+
+branding:
+  icon: 'box'
+  color: 'blue'
+
+inputs:
+  image:
+    description: 'Image to run.'
+    required: true
+  name:
+    description: 'Container name. Default: smoke-<run id>-<attempt>-<step id>.'
+    required: false
+  command:
+    description: 'Command and arguments appended after the image (parsed without a shell).'
+    required: false
+  args:
+    description: 'Extra `docker run` arguments placed before the image (parsed without a shell).'
+    required: false
+  env:
+    description: 'Container environment, one KEY=VALUE per line. Values never appear in argv.'
+    required: false
+  secret-env:
+    description: 'Like env, but values are also masked in logs.'
+    required: false
+  ports:
+    description: 'Published ports, one per line (e.g. 127.0.0.1:18080:8080).'
+    required: false
+  network:
+    description: 'Docker network to attach to. Created when missing and removed at cleanup only if this action created it.'
+    required: false
+  network-alias:
+    description: 'Network aliases, one per line (needs network).'
+    required: false
+  pull:
+    description: 'missing | always | never (docker run --pull).'
+    required: false
+    default: 'missing'
+  health-url:
+    description: 'URL polled from the runner. Takes precedence over health-command.'
+    required: false
+  expect-status:
+    description: 'Accepted HTTP status: a class like 2xx, or exact codes like 200,204.'
+    required: false
+    default: '2xx'
+  expect-body:
+    description: 'Text the response body must contain.'
+    required: false
+  health-command:
+    description: 'Command run via `docker exec <name> sh -c <cmd>`; exit 0 means healthy.'
+    required: false
+  health-retries:
+    description: 'Maximum health attempts.'
+    required: false
+    default: '30'
+  health-interval:
+    description: 'Delay between health attempts (e.g. 2s).'
+    required: false
+    default: '2s'
+  keep:
+    description: 'Leave the container running for later steps (removed in the post step). Default removes it right after the check.'
+    required: false
+    default: 'false'
+  logs-on-failure:
+    description: 'Print container logs when the check fails.'
+    required: false
+    default: 'true'
+  log-lines:
+    description: 'Number of log lines to print on failure.'
+    required: false
+    default: '200'
+
+outputs:
+  name:
+    description: 'Container name.'
+  container-id:
+    description: 'Container id.'
+  healthy:
+    description: 'true | false'
+  attempts:
+    description: 'Health attempts used.'
+
+runs:
+  using: node24
+  main: dist/index.js
+  post: dist/index.js
+  post-if: always()
