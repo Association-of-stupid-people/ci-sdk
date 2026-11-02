@@ -99,3 +99,33 @@ jobs:
         env:
           STATUS: ${{ steps.run.outputs.status }}
         run: test "$STATUS" = "success"
+
+      - name: Read package version
+        id: pkg
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - id: gate
+        uses: ./dist/release-gate
+        with:
+          version-file: package.json
+          tag: v${{ steps.pkg.outputs.version }}
+          skip-ci-check: 'true'
+
+      - name: release-gate must report the version
+        env:
+          VERSION: ${{ steps.gate.outputs.version }}
+          EXPECTED: ${{ steps.pkg.outputs.version }}
+        run: test "$VERSION" = "$EXPECTED"
+
+      - id: smoke
+        uses: ./dist/docker-smoke
+        with:
+          image: nginx:1.27-alpine
+          health-command: wget -q -O /dev/null http://127.0.0.1/
+          health-retries: '15'
+          health-interval: 1s
+
+      - name: docker-smoke must report healthy
+        env:
+          HEALTHY: ${{ steps.smoke.outputs.healthy }}
+        run: test "$HEALTHY" = "true"
