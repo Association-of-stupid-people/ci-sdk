@@ -23,6 +23,10 @@ packages/
   unity-project-info/   read ProjectSettings.asset (company, name, version, web size)
   run/                  NEW: run commands with retries, timeouts and a job summary
   unity-build/          NEW: replaces the unity-build composite (host or Docker, see below)
+  compose-deploy/       NEW: SSH deploy of a Compose service (backup, pull, up, health, rollback)
+  docker-smoke/         NEW: run a container, wait for health, dump logs, always clean up
+  release-gate/         NEW: release waits for a green CI run of the same commit; tag == version
+  release-assets/       NEW: upload files + SHA256SUMS to a GitHub Release, marked notes section
 scripts/build.mjs       bundles each action -> dist/<name>/{action.yml,dist/index.js}
 ```
 
@@ -102,19 +106,20 @@ await runAction(run) // any thrown error -> core.setFailed, exit code 1
 
 ### SDK modules
 
-| Export                                                                           | Purpose                                                                                                                                        |
-| -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `readInputs`, `input.*`                                                          | `string`, `number`, `boolean` (true/yes/on/1), `list`, `lines`, `oneOf`, `duration`, `json`                                                    |
-| `getCiContext()`                                                                 | Typed `GITHUB_*` env: repo, branch (PR head aware), PR number, run URL, `uniqueName()`                                                         |
-| `exec(cmd, args, opts)`                                                          | No shell, live log + captured output, `timeout`/`signal` kill the process tree, Windows `.cmd` shims work                                      |
-| `parseCommandLine(line)`                                                         | Shell-free argv splitting (quotes, escapes; no pipes/globs)                                                                                    |
-| `retry(fn, opts)`                                                                | Exponential backoff + jitter, `retryIf`, abortable                                                                                             |
-| `withTimeout(fn, ms)`                                                            | Time budget with an AbortSignal handed to `fn`                                                                                                 |
-| `Pipeline`                                                                       | Steps with `retry`, `timeout`, `continueOnError`, `if`, `always`; SIGINT/SIGTERM (run cancelled) stops the running step and still runs cleanup |
-| `writeJobSummary`, `reportToMarkdown`                                            | Results table on the run page                                                                                                                  |
-| `group`, `mask`, `annotate`                                                      | Timed log groups, secret masking (incl. base64/URL forms), file annotations                                                                    |
-| `runAction`                                                                      | Entrypoint wrapper                                                                                                                             |
-| `CiError`, `InputError`, `TimeoutError`, `AbortError`, `RetryError`, `ExecError` | Errors with a stable `code`                                                                                                                    |
+| Export                                                                           | Purpose                                                                                                                                         |
+| -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `readInputs`, `input.*`                                                          | `string`, `number`, `boolean` (true/yes/on/1), `list`, `lines`, `oneOf`, `duration`, `json`                                                     |
+| `getCiContext()`                                                                 | Typed `GITHUB_*` env: repo, branch (PR head aware), PR number, run URL, `uniqueName()`                                                          |
+| `exec(cmd, args, opts)`                                                          | No shell, live log + captured output, `timeout`/`signal` kill the process tree, Windows `.cmd` shims work                                       |
+| `parseCommandLine(line)`                                                         | Shell-free argv splitting (quotes, escapes; no pipes/globs)                                                                                     |
+| `retry(fn, opts)`                                                                | Exponential backoff + jitter, `retryIf`, abortable                                                                                              |
+| `withTimeout(fn, ms)`                                                            | Time budget with an AbortSignal handed to `fn`                                                                                                  |
+| `Pipeline`                                                                       | Steps with `retry`, `timeout`, `continueOnError`, `if`, `always`; SIGINT/SIGTERM (run cancelled) stops the running step and still runs cleanup  |
+| `writeJobSummary`, `reportToMarkdown`                                            | Results table on the run page                                                                                                                   |
+| `group`, `mask`, `annotate`                                                      | Timed log groups, secret masking (incl. base64/URL forms), file annotations                                                                     |
+| `printUntrusted`, `withoutCommands`                                              | Print or stream untrusted output (container logs, remote scripts) inside `::stop-commands::`, so `::error::`-like lines are shown, not executed |
+| `runAction`                                                                      | Entrypoint wrapper                                                                                                                              |
+| `CiError`, `InputError`, `TimeoutError`, `AbortError`, `RetryError`, `ExecError` | Errors with a stable `code`                                                                                                                     |
 
 ## `run` action
 
@@ -199,6 +204,147 @@ PlayerSettings.Android.keyaliasPass = Arg("-keystoreAliasPassword", "UNITY_KEYAL
 
 Also make the build method call `EditorApplication.Exit(1)` on failure; the action additionally
 fails on `Build Finished, Result: Failure` when Unity exits 0.
+
+## `compose-deploy` action
+
+Replaces the `appleboy/ssh-action` deploy script copied between projects (tool-gen-level-*): over
+SSH it backs up Postgres, pulls, runs `docker compose up -d --remove-orphans`, checks health and
+rolls back to the previous image when `compose up` or the health check fails.
+
+- **Nothing secret in argv**: settings reach the VPS as an `export` preamble on the stdin of
+  `ssh ... 'sh -s'` (the script is wrapped in a function run with `</dev/null`, so commands that
+  read stdin cannot eat it). Password auth uses `SSH_ASKPASS` with the password in the environment
+  (Linux/macOS runners); `ssh-key` is written to a `0600` temp file. Temp files are always removed.
+- **Registry login** (`registry-username`/`registry-password`) uses a temporary `DOCKER_CONFIG` on the
+  VPS, removed afterwards, so the host's own logins are untouched. If the host's `config.json` uses a
+  credential helper (`credsStore`/`credHelpers`), or the docker CLI finds an installed
+  `pass`/`secretservice` helper, the credentials may be kept by that helper.
+- **Host keys**: pass `known-hosts` (`ssh-keyscan -p 22 host` output). Without it the first key is
+  accepted (`accept-new`) and a warning is printed.
+- **Health**: `health-command` runs in the service container, `health-url` is fetched on the VPS
+  (curl, else wget); with neither, the container's `HEALTHCHECK` status, else "running".
+- **Backup** (`backup: postgres`): `pg_dump -Fc` of `db-service` into `backup-dir`, keeping the
+  newest `backup-keep`; skipped on a first deploy (no db container), fatal if the dump fails.
+- Outputs `status` (`deployed`, `rolled-back`, `failed`), `previous-image-id`, `image-id`,
+  `backup-file`; the step fails unless `deployed`. A job summary lists them.
+
+```yaml
+deploy-vps:
+  needs: docker-publish
+  runs-on: ubuntu-latest
+  timeout-minutes: 30
+  environment: production
+  steps:
+    - uses: <owner>/ci-sdk/.github/actions/compose-deploy@runner
+      with:
+        host: ${{ secrets.VPS_HOST }}
+        port: ${{ secrets.VPS_PORT || '22' }}
+        username: ${{ secrets.VPS_USER }}
+        password: ${{ secrets.VPS_PASSWORD }} # or ssh-key: ${{ secrets.VPS_SSH_KEY }}
+        known-hosts: ${{ vars.VPS_KNOWN_HOSTS }}
+        directory: /root/toolgenlevelmanhunt
+        compose-file: docker-compose.production.yml
+        env: |
+          DOCKER_IMAGE=hungtrinh203/human-hunt-level-editor:latest
+          APP_PORT=8092
+        backup: postgres
+        health-command: python -c 'import os, urllib.request; urllib.request.urlopen("http://127.0.0.1:%s/api/health" % os.getenv("PORT", "5000"), timeout=5)'
+```
+
+## `docker-smoke` action
+
+Replaces the "`docker run` → poll health → `docker logs` on failure → `docker rm` in `if: always()`"
+steps. The container name is unique per run attempt and step (`smoke-<run_id>-<attempt>-<step id>`), so parallel jobs
+on a shared Docker daemon do not collide.
+
+- Health: `health-url` (polled from the runner; `expect-status` `2xx` or `200,204`, optional
+  `expect-body`), `health-command` (`docker exec <name> sh -c ...`), else the image `HEALTHCHECK`,
+  else "running". Fails at once if the container exits, with its exit code.
+- `env` / `secret-env` values are passed through the docker CLI's environment (`-e KEY`), never
+  argv; `secret-env` values are masked.
+- `keep: true` leaves a healthy container running for later steps; the action's `post` step removes
+  it (and a `network` it created) even when the job fails or is cancelled. A failed check always
+  removes it right away after dumping `log-lines` of logs.
+
+```yaml
+- uses: <owner>/ci-sdk/.github/actions/docker-smoke@runner
+  with:
+    image: ${{ env.SMOKE }}:test
+    secret-env: |
+      MASTER_ENCRYPTION_KEY=${{ secrets.CI_MASTER_KEY }}
+    health-command: /lsm healthcheck
+    health-retries: 15
+    health-interval: 1s
+
+- id: be
+  uses: <owner>/ci-sdk/.github/actions/docker-smoke@runner
+  with:
+    image: bibg-backend:ci
+    network: bibg-ci-be-net
+    ports: 127.0.0.1:18181:8080
+    env: |
+      DATABASE_URL=postgres://bibg:bibg@bibg-ci-pg:5432/bibg
+    health-url: http://127.0.0.1:18181/api/v1/health
+    keep: true # later steps call the API; removed in the post step
+```
+
+## `release-gate` action
+
+For workflows that build on `push` and publish on `release`: the release run first waits (up to
+`timeout`, default 60 min) for a green run of `workflow` (default: the current workflow file) for
+the same commit, triggered by one of `events` (default `push, workflow_dispatch`), so a release
+never ships an untested SHA. The current run is ignored.
+
+- Passes as soon as one matching run succeeded; keeps waiting while one is still running.
+- Fails at once when every matching run finished without success (e.g. the push run was cancelled
+  by `cancel-in-progress`), and after `no-run-grace` (default 5 min) when no matching run is listed
+  at all. The message says how to fix it: run the workflow with `workflow_dispatch` on the release
+  tag, then re-run the failed release jobs.
+- Transient API errors and rate limits are retried until `timeout`; a 401/403/404 fails at once.
+- With `version-file` (`Cargo.toml`, `package.json` or `pyproject.toml`) it also checks
+  `tag == tag-prefix + version`; `skip-ci-check: true` does only that check.
+
+Needs `permissions: actions: read`.
+
+```yaml
+release-gate:
+  if: github.event_name == 'release'
+  runs-on: light
+  timeout-minutes: 75
+  permissions:
+    actions: read
+  steps:
+    - uses: actions/checkout@<sha> # only needed for version-file
+      with:
+        persist-credentials: false
+    - uses: <owner>/ci-sdk/.github/actions/release-gate@runner
+      with:
+        version-file: Cargo.toml
+```
+
+Jobs that also run outside releases and need `release-gate` must use
+`if: ${{ !cancelled() && (needs.release-gate.result == 'success' || needs.release-gate.result == 'skipped') }}`:
+a skipped `needs` otherwise skips the whole chain.
+
+## `release-assets` action
+
+Uploads `files` (paths, directories or globs) to the release of `tag` (default: the release that
+triggered the run; drafts are found too), writes `SHA256SUMS` (`checksums: ''` to skip) and sets
+the `notes` markdown between `<!-- <notes-id>:start/end -->` markers in the release body, where
+`{checksums}` expands to the checksum list. Re-runs replace assets of the same name and the marked
+section, so they are idempotent. Needs `permissions: contents: write`.
+
+```yaml
+- uses: <owner>/ci-sdk/.github/actions/release-assets@runner
+  with:
+    files: release-assets/*
+    notes: |
+      ## Binaries
+
+      ~~~text
+      {checksums}
+      ~~~
+```
 
 ## Changes from v1 (behaviour notes)
 
