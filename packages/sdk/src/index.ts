@@ -37,5 +37,21 @@ export {
   type ConditionContext
 } from './pipeline.js'
 export { reportToMarkdown, writeJobSummary } from './summary.js'
-export { group, mask, annotate, type AnnotationLocation } from './log.js'
+export {
+  group,
+  mask,
+  annotate,
+  printUntrusted,
+  withoutCommands,
+  type AnnotationLocation
+} from './log.js'
 export { runAction } from './action.js'
+export {
+  GitHubClient,
+  GitHubApiError,
+  nextLink,
+  type GitHubClientOptions,
+  type GitHubRequestOptions,
+  type GitHubResponse,
+  type Query
+} from './github.js'

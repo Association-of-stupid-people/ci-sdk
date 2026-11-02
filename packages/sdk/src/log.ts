@@ -1,4 +1,5 @@
 import * as core from '@actions/core'
+import { randomUUID } from 'node:crypto'
 import { formatDuration } from './duration.js'
 import { errorMessage } from './errors.js'
 
@@ -18,6 +19,39 @@ export async function group<T>(name: string, fn: () => Promise<T>): Promise<T> {
     throw err
   } finally {
     core.endGroup()
+  }
+}
+
+/**
+ * Print untrusted text (container logs, remote output) without letting it run
+ * workflow commands: a line like `::error::` or `::add-mask::` inside it is
+ * shown, not processed. Uses `::stop-commands::<random token>`.
+ */
+export function printUntrusted(text: string): void {
+  if (text === '') return
+  const token = `ci-sdk-${randomUUID()}`
+  core.info(`::stop-commands::${token}`)
+  try {
+    core.info(text.replace(/\r?\n$/, ''))
+  } finally {
+    core.info(`::${token}::`)
+  }
+}
+
+/**
+ * Run `fn` with workflow commands disabled, for steps that stream untrusted
+ * output live (e.g. `exec` of a remote script). `fn` must not call `core.*`
+ * commands itself (`setOutput`/`saveState` use files and are fine).
+ */
+export async function withoutCommands<T>(fn: () => Promise<T>): Promise<T> {
+  const token = `ci-sdk-${randomUUID()}`
+  core.info(`::stop-commands::${token}`)
+  try {
+    return await fn()
+  } finally {
+    // Leading newline: fn's output may end mid-line (killed process), and the
+    // runner only reads the resume command at the start of a line.
+    core.info(`\n::${token}::`)
   }
 }
 
