@@ -1,0 +1,22 @@
+name: runs-on
+description: Allow a job to run only on specific branches
+author: _MoonLight_ <moonlight8978@gmail.com>
+
+inputs:
+  branch:
+    description: >-
+      Allowed branches, separated by commas. Supports globs (develop*, release/**)
+      and exclusions (!develop_old); the last matching pattern wins.
+    required: true
+  silent:
+    description: Do not fail the job when not allowed; only set outputs.allowed=false
+    required: false
+    default: 'false'
+
+outputs:
+  allowed:
+    description: '"true" when the current branch is allowed'
+
+runs:
+  using: node24
+  main: dist/index.js

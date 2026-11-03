@@ -1,0 +1,20 @@
+name: eval
+description: Eval string with secrets, vars, github
+inputs:
+  template:
+    description: The template string
+    required: true
+  secrets:
+    description: JSON secrets
+    required: false
+    default: '{}'
+  vars:
+    description: JSON vars
+    required: false
+    default: '{}'
+outputs:
+  value:
+    description: The interpolated string
+runs:
+  using: node24
+  main: dist/index.js

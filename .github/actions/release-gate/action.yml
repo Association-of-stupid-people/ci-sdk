@@ -1,0 +1,61 @@
+name: 'ci-sdk release gate'
+description: 'On a release, wait for a green CI run of the same commit and optionally verify the release tag matches the project version. Built on ci-sdk.'
+author: 'ci-sdk'
+
+branding:
+  icon: 'shield'
+  color: 'green'
+
+inputs:
+  token:
+    description: 'GitHub token used to list workflow runs. The job needs `permissions: actions: read`.'
+    required: false
+    default: ${{ github.token }}
+  workflow:
+    description: 'Workflow file name or id whose runs count. Default: the current workflow file.'
+    required: false
+  sha:
+    description: 'Commit SHA the CI run must have built. Default: GITHUB_SHA.'
+    required: false
+  events:
+    description: 'Events of runs that count, comma or newline separated.'
+    required: false
+    default: 'push, workflow_dispatch'
+  timeout:
+    description: 'How long to wait for a green run (e.g. 30m, 1h).'
+    required: false
+    default: '60m'
+  no-run-grace:
+    description: 'How long to wait for a matching run to appear before failing (capped by timeout).'
+    required: false
+    default: '5m'
+  poll-interval:
+    description: 'Delay between polls (e.g. 15s, 1m).'
+    required: false
+    default: '30s'
+  version-file:
+    description: 'Cargo.toml, package.json or pyproject.toml whose version must match the release tag.'
+    required: false
+  tag:
+    description: 'Release tag. Default: release.tag_name from the event, else the pushed tag.'
+    required: false
+  tag-prefix:
+    description: 'Prefix the tag has on top of the version.'
+    required: false
+    default: 'v'
+  skip-ci-check:
+    description: 'Only verify the version, do not wait for CI.'
+    required: false
+    default: 'false'
+
+outputs:
+  run-id:
+    description: 'Id of the green CI run.'
+  run-url:
+    description: 'URL of the green CI run.'
+  version:
+    description: 'Project version read from version-file (when checked).'
+
+runs:
+  using: node24
+  main: dist/index.js

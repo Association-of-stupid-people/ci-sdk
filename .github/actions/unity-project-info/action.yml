@@ -1,0 +1,25 @@
+name: unity-project-info
+description: Parse unity project info
+author: '_MoonLight_ <moonlight8978@gmail.com>'
+
+inputs:
+  file:
+    description: Relative path to project settings file
+    required: false
+    default: 'ProjectSettings/ProjectSettings.asset'
+
+outputs:
+  version:
+    description: Product version
+  company:
+    description: Company
+  name:
+    description: Product name
+  web-sh:
+    description: Web screen height
+  web-sw:
+    description: Web screen width
+
+runs:
+  using: node24
+  main: dist/index.js

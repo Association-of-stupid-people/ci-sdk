@@ -1,0 +1,54 @@
+name: 'ci-sdk release assets'
+description: 'Upload files to a GitHub Release idempotently, generate SHA256SUMS and write a marked section into the release notes. Built on ci-sdk.'
+author: 'ci-sdk'
+
+branding:
+  icon: 'upload-cloud'
+  color: 'blue'
+
+inputs:
+  token:
+    description: 'GitHub token. The job needs `contents: write`.'
+    required: false
+    default: ${{ github.token }}
+  tag:
+    description: 'Release tag. Default: release.tag_name of the event, else the pushed tag.'
+    required: false
+  files:
+    description: >-
+      Files to upload, one per line: paths or glob patterns relative to the workspace.
+      A directory adds its direct files. Basenames must be unique.
+    required: false
+  fail-if-no-files:
+    description: 'Fail when `files` matches nothing.'
+    required: false
+    default: 'true'
+  checksums:
+    description: 'Name of the generated checksum asset (sha256sum format). Empty = none.'
+    required: false
+    default: 'SHA256SUMS'
+  notes:
+    description: 'Markdown for a section of the release notes. `{checksums}` is replaced with the checksum text. Empty = leave the notes alone.'
+    required: false
+  notes-id:
+    description: 'Id used in the `<!-- id:start -->` / `<!-- id:end -->` markers around the section.'
+    required: false
+    default: 'ci-sdk-release-assets'
+  overwrite:
+    description: 'Replace existing assets with the same name. false = fail on a name clash.'
+    required: false
+    default: 'true'
+
+outputs:
+  release-id:
+    description: 'Release id.'
+  release-url:
+    description: 'Release page URL.'
+  assets:
+    description: 'JSON array of {name, size, url} for the uploaded assets.'
+  checksums:
+    description: 'Checksum text (empty when checksums are disabled).'
+
+runs:
+  using: node24
+  main: dist/index.js
