@@ -40,8 +40,7 @@ const WRAPPER = [
   '#!/bin/sh',
   'case " $* " in',
   '  *" -serial "*)',
-  '    echo "activate $*" >>"$FAKE_LOG"',
-  '    "$(dirname "$0")/fake-activation"',
+  '    FAKE_ARGS="$*" "$(dirname "$0")/fake-activation"',
   '    exit $? ;;',
   '  *" -returnlicense "*)',
   '    echo "return start $*" >>"$FAKE_LOG"',
@@ -75,9 +74,11 @@ const EDITOR = [
   ''
 ].join('\n')
 
+/** Logs the call only once its trap is set: a test that stops the script on that line must not race the trap. */
 const ACTIVATION = [
   '#!/bin/sh',
   'trap \'sleep 1; echo "activation stopped" >>"$FAKE_LOG"; exit 143\' TERM',
+  'echo "activate $FAKE_ARGS" >>"$FAKE_LOG"',
   'i=0',
   'while [ "$i" -lt "${FAKE_ACTIVATE_SECS:-0}" ]; do sleep 1; i=$((i + 1)); done',
   'exit "${FAKE_ACTIVATE_EXIT:-0}"',
