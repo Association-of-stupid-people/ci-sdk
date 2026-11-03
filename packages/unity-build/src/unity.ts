@@ -3,7 +3,7 @@ import { createWriteStream } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import path from 'node:path'
 import { CiError, TimeoutError, exec, formatDuration } from '../../sdk/src/index.js'
-import { UnityLogScanner, classifyFailure, type UnityIssue } from './log-scan.js'
+import { NOTICE_PREFIX, UnityLogScanner, classifyFailure, type UnityIssue } from './log-scan.js'
 
 export type FailureKind = 'license' | 'build' | 'timeout' | 'hang'
 
@@ -45,7 +45,15 @@ export interface UnityRunOptions {
   secrets?: readonly string[]
   /** Called when Unity was killed (timeout/hang/cancel), e.g. to stop a container. */
   onKilled?: (reason: 'timeout' | 'hang' | 'cancel') => Promise<void>
+  /**
+   * Time between SIGTERM and SIGKILL after a timeout or a hang (default 5 s),
+   * e.g. for a container that returns a license seat when signalled. A cancel
+   * always gets 5 s: the runner ends the job soon after it.
+   */
+  stopGraceMs?: number
 }
+
+const CANCEL_GRACE_MS = 5_000
 
 /**
  * Line-buffered writer that redacts secrets, so a secret split across two
@@ -142,6 +150,8 @@ export async function runUnity(o: UnityRunOptions): Promise<UnityRunResult> {
       inheritEnv: false,
       signal: o.signal ? AbortSignal.any([o.signal, idle.signal]) : idle.signal,
       timeout: o.timeoutMs,
+      // Stopped by its own timeout or idle limit unless the caller's signal fired (cancel).
+      killGrace: () => (o.signal?.aborted ? CANCEL_GRACE_MS : (o.stopGraceMs ?? CANCEL_GRACE_MS)),
       allowFailure: true,
       maxBuffer: 64 * 1024, // the full log goes to logFile
       onStdout: onChunk,
@@ -163,6 +173,9 @@ export async function runUnity(o: UnityRunOptions): Promise<UnityRunResult> {
     clearTimeout(idleTimer)
     scanner.end()
     await log.end()
+    // e.g. the container could not return the license seat.
+    if (scanner.notices.length)
+      core.warning(scanner.notices.map(n => n.slice(NOTICE_PREFIX.length)).join('\n'))
   }
   if (log.failed) core.warning(`Could not write ${o.logFile}: ${log.failed.message}`)
 

@@ -6,10 +6,15 @@ it. Successor of the `actions` branch of `sdk` (template submodule + `script/bui
 Actions are published to the `runner` branch and used as before:
 
 ```yaml
-- uses: <owner>/sdk/.github/actions/runs-on@runner
+- uses: <owner>/ci-sdk/.github/actions/runs-on@runner
   with:
     branch: develop*, main, !develop_old
 ```
+
+The repository is public so that workflows in other orgs can use the actions (GitHub shares a
+private repository's actions only within its own org). `@runner` follows every publish, breaking
+ones included (v3.0.0 changed the `unity-build` default, see below). Workflows that must not change
+under them pin a commit of the `runner` branch instead: `.../unity-build@<runner commit sha> # v3.0.0`.
 
 ## Layout
 
@@ -22,7 +27,7 @@ packages/
   string-interpolate/   pass a value through, optionally masked
   unity-project-info/   read ProjectSettings.asset (company, name, version, web size)
   run/                  NEW: run commands with retries, timeouts and a job summary
-  unity-build/          NEW: replaces the unity-build composite (host or Docker, see below)
+  unity-build/          NEW: replaces the unity-build composite (Docker by default, or host)
   compose-deploy/       NEW: SSH deploy of a Compose service (backup, pull, up, health, rollback)
   docker-smoke/         NEW: run a container, wait for health, dump logs, always clean up
   release-gate/         NEW: release waits for a green CI run of the same commit; tag == version
@@ -110,7 +115,7 @@ await runAction(run) // any thrown error -> core.setFailed, exit code 1
 | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | `readInputs`, `input.*`                                                          | `string`, `number`, `boolean` (true/yes/on/1), `list`, `lines`, `oneOf`, `duration`, `json`                                                     |
 | `getCiContext()`                                                                 | Typed `GITHUB_*` env: repo, branch (PR head aware), PR number, run URL, `uniqueName()`                                                          |
-| `exec(cmd, args, opts)`                                                          | No shell, live log + captured output, `timeout`/`signal` kill the process tree, Windows `.cmd` shims work                                       |
+| `exec(cmd, args, opts)`                                                          | No shell, live log + captured output, `timeout`/`signal` kill the process tree (`killGrace`, also per reason), Windows `.cmd` shims work        |
 | `parseCommandLine(line)`                                                         | Shell-free argv splitting (quotes, escapes; no pipes/globs)                                                                                     |
 | `retry(fn, opts)`                                                                | Exponential backoff + jitter, `retryIf`, abortable                                                                                              |
 | `withTimeout(fn, ms)`                                                            | Time budget with an AbortSignal handed to `fn`                                                                                                  |
@@ -124,7 +129,7 @@ await runAction(run) // any thrown error -> core.setFailed, exit code 1
 ## `run` action
 
 ```yaml
-- uses: <owner>/sdk/.github/actions/run@runner
+- uses: <owner>/ci-sdk/.github/actions/run@runner
   with:
     name: install
     run: |
@@ -144,12 +149,49 @@ added to the job summary.
 Replaces the `unity-build` composite (same `version`, `workdir`, `default-args-override`, `args`
 inputs), with:
 
+> Since v3.0.0 the default is `mode: docker`. The old composite (and v2.x) used the editor installed
+> on the runner: set `mode: host` to keep that. In docker mode the container sees only `workdir`
+> (at `/project`), `keystore-path` and `unity-license-file`: write build output under `$(pwd)`
+> (e.g. `-customBuildPath $(pwd)/Builds/game.apk`), not to `${{ github.workspace }}` or
+> `${{ runner.temp }}` paths, which the action warns about. Give `-buildTarget` in `args`: it
+> picks the image (without it the container gets the base editor, Linux standalone only).
+> With a subfolder `workdir` the repository's `.git` is not mounted: BuildScripts that call git
+> should read the forwarded `GITHUB_SHA` / `GITHUB_RUN_NUMBER` instead. v2 docker-mode workflows
+> with their own `dockerfile`: set `docker-image-source: build`, or `auto` uses the GameCI image
+> (with a warning that the Dockerfile was not used).
+
 - **Secrets in env, not argv**: `keystore-*` inputs reach Unity as `UNITY_KEYSTORE_PATH`,
   `UNITY_KEYSTORE_PASS`, `UNITY_KEYALIAS_NAME`, `UNITY_KEYALIAS_PASS`. The action's own `INPUT_*`
   variables are removed from Unity's environment. Passwords left in `args` still work but warn.
 - **Timeouts**: `timeout` (default 3h) and `idle-timeout` (default 30m without any log line =
-  hung) kill the Unity process tree (or the container).
-- **Finds Unity on every OS** from `version`, else `UNITY_VER`, else `ProjectVersion.txt`: Hub
+  hung) kill the Unity process tree (or the container). Keep the job's `timeout-minutes` above
+  `timeout` + the image pull + 5 min (the container's stop, below): a job stopped by its own limit
+  counts as cancelled, so `if: failure()` steps (the log upload) are skipped.
+- **Docker by default** (`mode: docker`): the runner only needs Docker. The editor image is the
+  prebuilt [GameCI](https://game.ci/docs/docker/docker-images) image of the project's version,
+  `unityci/editor:ubuntu-<version>-<module>-3` (module from `-buildTarget`: `android`, `ios`,
+  `webgl`, `windows-mono`, `mac-mono`, ...; `base` for Linux), pulled once and then reused from the
+  runner's Docker cache. Upgrading Unity = changing `ProjectVersion.txt`; nothing to install.
+  - GameCI has no image for that version, or the build needs 2+ modules: `docker-image-source: auto`
+    builds `ci-unity-editor:<version>-<modules>` from
+    [`assets/Dockerfile`](packages/unity-build/assets/Dockerfile) (Ubuntu + Unity Hub CLI) once per
+    Docker daemon. `gameci` fails instead, `build` always builds locally, `docker-image` forces an
+    image (e.g. your own registry mirror). `gameci-version` pins the GameCI release (`3.2.2`).
+  - License: `unity-license-file` (.ulf, mounted read-only), or `unity-serial` + `unity-email` +
+    `unity-password` (all three required; activated in the container against an empty project,
+    returned after the build, also after a timeout, a hung editor or a cancel; a seat that could
+    not be returned is a warning with the end of Unity's log, except after a cancel: free it in your
+    Unity account). Personal license:
+    read the serial from the .ulf with `extract-unity-serial` (example below); these `F...` serials
+    get a fresh machine id in every container, as GameCI does.
+  - The project is bind-mounted at `/project`, Gradle caches live in the `ci-unity-gradle` volume
+    (`clean-gradle-cache: true` removes it first), and files go back to the owner of the project
+    folder (the runner user; a no-op on rootless Docker).
+  - `CI` and the GitHub context variables (`GITHUB_SHA`, `GITHUB_RUN_NUMBER`, `GITHUB_REF_NAME`,
+    ...) are forwarded into the container; other variables need `docker-env`.
+  - Images run as `linux/amd64` (`docker-platform`; `none` leaves it to the daemon): the Unity
+    Linux editor is x86_64 only.
+- **`mode: host`** (opt-in) **finds Unity on every OS** from `version`, else `UNITY_VER`, else `ProjectVersion.txt`: Hub
   registered editors, Hub secondary install path, default Hub folders (Windows/macOS/Linux),
   `/opt/unity/editors`, `editors-dir`, pre-Hub installs.
 - **Installs what is missing** with the Unity Hub headless CLI (`install`, `install-modules
@@ -158,18 +200,21 @@ inputs), with:
   build or exception errors is never retried.
 - **Job summary** with the errors from the Unity log (compile errors also become annotations), and
   outputs `status`, `failure-kind` (`license|build|timeout|hang`), `log-file`, `errors`.
-- **`mode: docker`**: builds `ci-unity-editor:<version>-<modules>` from
-  [`assets/Dockerfile`](packages/unity-build/assets/Dockerfile) (Ubuntu + Unity Hub CLI) the first
-  time a version is needed on that Docker daemon, then builds inside it. License: `unity-license-file`
-  (.ulf, mounted read-only) or `unity-serial` + `unity-email` + `unity-password` (activated in the
-  container and returned after the build). `docker-image` uses a prebuilt image from a registry.
 
 ```yaml
-- name: Build APK
-  uses: <owner>/sdk/.github/actions/unity-build@runner
+- id: serial # Personal license: the UNITY_LICENSE secret holds the .ulf content
+  uses: <owner>/ci-sdk/.github/actions/extract-unity-serial@runner
   with:
-    version: ${{ vars.UNITY_VER }}
-    args: ${{ inputs.apk-build-args }}
+    license: ${{ secrets.UNITY_LICENSE }}
+
+- name: Build APK
+  uses: <owner>/ci-sdk/.github/actions/unity-build@runner
+  with:
+    version: ${{ vars.UNITY_VER }} # optional: default is ProjectSettings/ProjectVersion.txt
+    args: ${{ inputs.apk-build-args }} # e.g. -buildTarget Android -> unityci/editor:ubuntu-<ver>-android-3
+    unity-serial: ${{ steps.serial.outputs.serial }} # or a Plus/Pro serial secret
+    unity-email: ${{ secrets.UNITY_EMAIL }}
+    unity-password: ${{ secrets.UNITY_PASSWORD }}
     keystore-path: ${{ inputs.keystore-path }}
     keystore-alias: ${{ inputs.keystore-name }}
     keystore-password: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -378,9 +423,26 @@ section, so they are idempotent. Needs `permissions: contents: write`.
   keep cleanup steps short.
 - **unity-build**: Hub install on Windows needs the runner service to have admin rights
   (Program Files). Two jobs installing the same version on one machine at once are not locked.
-  In Docker mode `-serial` is on the command line _inside_ the container (Unity has no other way);
-  a container killed on timeout does not return its serial seat. The Docker image is Linux-only
-  (Android/WebGL/Linux targets; iOS still needs a macOS host).
+  In Docker mode `-serial` is on the command line _inside_ the container (Unity has no other way).
+  After a timeout or a hung editor the action stays attached for up to 5 min while the container
+  stops Unity (SIGKILL after 30 s), returns the seat and restores file ownership, so the output of
+  that (e.g. a seat that could not be returned) still reaches the log; on cancel it only signals
+  the container, which finishes that on its own and removes itself. The container's `--stop-timeout`
+  asks the Docker daemon for the same 5 min when it shuts down; a container killed sooner (the host
+  goes away, or an ephemeral runner pod with a shorter termination grace period is deleted right
+  after a cancelled job) does not return its seat. The editor in Docker is the Linux editor: Android, WebGL,
+  Windows/macOS/Linux standalone build there, iOS exports the Xcode project (compiling and signing
+  it still needs macOS). GameCI images are `linux/amd64` only: an arm64 host (Apple Silicon, ARM
+  Linux) can only emulate them (slow, not tested with Unity), so prefer x86_64 runners. They are
+  5-13 GB compressed: on GitHub-hosted runners free disk space first; on self-hosted runners
+  remove old versions with `docker image rm <tag>` (plain `docker image prune` keeps tagged
+  images; `docker image prune -a --filter label=ci-sdk.unity.version` removes unused local builds,
+  `docker builder prune` the build cache they leave behind).
+- **unity-build** with the Docker daemon in another container (Kubernetes/ARC `dind` sidecar):
+  bind mounts are resolved on the daemon's side, so `workdir`, `keystore-path` and
+  `unity-license-file` must be in a folder both containers share (the runner's `_work`: the
+  workspace and `RUNNER_TEMP`). A file in `/tmp` or `$HOME` passes the action's check but shows up
+  as an empty folder in the container.
 - Logs and the job summary show commands and errors verbatim (no escaping or truncation) so the
   runner's masker can find secrets. Still, prefer passing secrets through `env` or stdin
   (`exec(..., { input })`) rather than argv.

@@ -1,6 +1,6 @@
 # Builds every action and publishes it to the `runner` branch as
 # .github/actions/<name>/{action.yml,dist/index.js}, which is what workflows use:
-#   uses: <owner>/sdk/.github/actions/<name>@runner
+#   uses: <owner>/ci-sdk/.github/actions/<name>@runner
 #
 # Replaces the old build.yml (template submodule + ncc + rsync). Only the
 # folders of the JS actions built here are replaced; composite actions and

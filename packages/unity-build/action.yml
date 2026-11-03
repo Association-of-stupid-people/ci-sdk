@@ -1,7 +1,8 @@
 name: unity-build
 description: >-
-  Build a Unity project on Windows, macOS or Linux, on the host editor (found by version, installed
-  with Unity Hub when missing) or in a Docker image built per Unity version. Secrets go through
+  Build a Unity project in a Docker container (default: the prebuilt GameCI image of the project's
+  Unity version, pulled once per runner; nothing to install) or on the host editor (found by
+  version, installed with Unity Hub when missing). Secrets go through
   environment variables, hung editors are killed, only license errors are retried, and errors from
   the Unity log are written to the job summary. Built on ci-sdk.
 author: 'ci-sdk'
@@ -22,9 +23,11 @@ inputs:
       Default: ProjectVersion.txt when the versions match, else Unity's release API.
     required: false
   mode:
-    description: 'host (editor on the runner) | docker (editor in a Docker image, Linux editor).'
+    description: >-
+      docker (Linux editor in a container; the runner only needs Docker) | host (editor installed on
+      the runner, e.g. to compile iOS on macOS).
     required: false
-    default: 'host'
+    default: 'docker'
   default-args-override:
     description: Base Unity arguments. No shell; $(pwd) is replaced with the project path.
     required: false
@@ -34,7 +37,10 @@ inputs:
     required: false
     default: ''
   timeout:
-    description: Hard limit for one Unity run (e.g. 90m, 3h). The process tree is killed.
+    description: >-
+      Hard limit for one Unity run (e.g. 90m, 3h). The process tree is killed; in docker mode the
+      container then gets up to 5 min to return the license seat. Keep the job's timeout-minutes
+      above this + the image pull + 5 min.
     required: false
     default: '3h'
   idle-timeout:
@@ -74,30 +80,55 @@ inputs:
     required: false
     default: 'auto'
   editor-path:
-    description: Use this editor binary instead of searching.
+    description: Use this editor binary instead of searching (host mode).
     required: false
   editors-dir:
-    description: Extra folders that hold one sub-folder per Unity version (comma or newline separated).
+    description: >-
+      Extra folders that hold one sub-folder per Unity version, comma or newline separated (host mode).
     required: false
   hub-path:
-    description: Unity Hub binary (default locations are searched).
+    description: Unity Hub binary (default locations are searched; host mode).
     required: false
   install-timeout:
     description: Time limit for a Hub install or a Docker image build/pull.
     required: false
     default: '1h'
   docker-image:
-    description: Use this image (pulled when missing) instead of building ci-unity-editor:<version>-<modules>.
+    description: Use this image (pulled when missing) instead of choosing one from docker-image-source.
     required: false
+  docker-image-source:
+    description: >-
+      Where the editor image comes from. auto = GameCI unityci/editor:ubuntu-<version>-<module>-<gameci-version>,
+      built locally from the Dockerfile when GameCI does not publish it (or when 2+ modules are needed) |
+      gameci = GameCI only | build = never GameCI: ci-unity-editor:<version>-<modules> built from the
+      Dockerfile. Either image is kept on the Docker daemon and reused by later runs.
+    required: false
+    default: 'auto'
+  gameci-version:
+    description: >-
+      GameCI image version suffix: 3 = the newest 3.x.x at the first pull on this daemon (reused
+      after that), or pin e.g. 3.2.2.
+    required: false
+    default: '3'
+  docker-platform:
+    description: >-
+      Platform of the editor image (docker pull/build/run --platform). The Unity Linux editor and
+      the GameCI images are x86_64 only. none = no --platform (the Docker daemon's default).
+    required: false
+    default: 'linux/amd64'
   docker-image-repo:
-    description: Repository name of the images this action builds.
+    description: Repository name of the images this action builds locally.
     required: false
     default: 'ci-unity-editor'
   dockerfile:
-    description: Dockerfile used to build the image (default is the bundled one; its folder is the context).
+    description: >-
+      Dockerfile for docker-image-source build, and for auto when GameCI has no image (default: the
+      bundled one; its folder is the build context).
     required: false
   docker-env:
-    description: Extra environment variable names to forward into the container.
+    description: >-
+      Extra environment variable names to forward into the container. CI and the GitHub context
+      variables (GITHUB_SHA, GITHUB_RUN_NUMBER, GITHUB_REF_NAME, ...) are always forwarded.
     required: false
   docker-gradle-volume:
     description: Named volume for /root/.gradle, kept between builds. none = no volume.
@@ -107,16 +138,22 @@ inputs:
     description: .ulf license file mounted into the container (docker mode).
     required: false
   unity-serial:
-    description: Unity serial to activate inside the container (docker mode; returned after the build).
+    description: >-
+      Unity serial to activate inside the container (docker mode; returned after the build). For a
+      Personal license, the serial that extract-unity-serial reads from the .ulf. Needs unity-email
+      and unity-password.
     required: false
   unity-email:
-    description: Unity account email for unity-serial.
+    description: Unity account email for unity-serial (required with it).
     required: false
   unity-password:
-    description: Unity account password for unity-serial.
+    description: Unity account password for unity-serial (required with it).
     required: false
   clean-gradle-cache:
-    description: Delete ~/.gradle/caches first. auto = on macOS hosts only (old composite behaviour).
+    description: >-
+      Delete the Gradle cache first: ~/.gradle/caches (host mode) or the docker-gradle-volume (docker
+      mode; a volume another build is using stays, with a warning). auto = on macOS hosts in host
+      mode only (old composite behaviour).
     required: false
     default: 'auto'
   summary:

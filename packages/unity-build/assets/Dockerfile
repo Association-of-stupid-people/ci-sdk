@@ -1,5 +1,7 @@
-# Unity Editor image for one version + module set, built by the unity-build action
-# (mode: docker) when the tag is missing on the runner's Docker daemon, or by hand:
+# Unity Editor image for one version + module set. Fallback only: the unity-build
+# action (mode: docker) uses the prebuilt GameCI image unityci/editor:ubuntu-<version>-<module>-3
+# and builds this one when GameCI does not publish that version or the build needs
+# two or more modules (docker-image-source: auto | build). By hand:
 #
 #   docker build -t ci-unity-editor:2022.3.20f1-android \
 #     --build-arg UNITY_VERSION=2022.3.20f1 \

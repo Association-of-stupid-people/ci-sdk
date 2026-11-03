@@ -1,6 +1,25 @@
 import { describe, expect, it, vi } from 'vitest'
 import { buildUnityArgs, DEFAULT_ARGS, modulesForTarget } from '../src/args.js'
-import { CONTAINER_SCRIPT, containerPath, dockerRunArgs, imageTag } from '../src/docker.js'
+import {
+  CONTAINER_SCRIPT,
+  NOT_PUBLISHED,
+  containerPath,
+  dockerRunArgs,
+  dockerWarnings,
+  ensureImage,
+  gameciTag,
+  imagePlan,
+  imageTag,
+  pathsOutsideProject
+} from '../src/docker.js'
+import {
+  AbortError,
+  ExecError,
+  InputError,
+  TimeoutError,
+  type ExecResult,
+  type exec
+} from '../../sdk/src/index.js'
 import { hubArgs, hubErrors, installArgs, installModulesArgs } from '../src/hub.js'
 import { UnityLogScanner, classifyFailure } from '../src/log-scan.js'
 import { summaryMarkdown } from '../src/summary.js'
@@ -186,6 +205,18 @@ describe('UnityLogScanner', () => {
     expect(scan('Build Finished, Result: Failure.\n').buildResultFailure).toBe(true)
   })
 
+  it('keeps the container script lines as notices, never as issues', () => {
+    const s = scan(
+      'ci-unity: could not return the license seat (exit 1)\n' +
+        'ci-unity:   Unable to return the license: Code 500\n'
+    )
+    expect(s.notices).toEqual([
+      'ci-unity: could not return the license seat (exit 1)',
+      'ci-unity:   Unable to return the license: Code 500'
+    ])
+    expect(s.issues).toEqual([])
+  })
+
   it('accepts extra license patterns and caps the list', () => {
     const s = new UnityLogScanner(1, [/seat busy/i])
     s.push('SEAT BUSY\nNullReferenceException: boom\n')
@@ -257,6 +288,8 @@ describe('docker', () => {
       'unity-build-1-1-1',
       '-w',
       '/project',
+      '--stop-timeout',
+      '300',
       '-e',
       'TINI_KILL_PROCESS_GROUP=1',
       '-v',
@@ -274,6 +307,350 @@ describe('docker', () => {
       'ci-unity',
       '-quit'
     ])
+  })
+
+  it('runs the container for the given platform', () => {
+    const args = dockerRunArgs({
+      name: 'n',
+      image: 'img',
+      projectHost: '/w',
+      platform: 'linux/amd64',
+      unityArgs: []
+    })
+    expect(args.slice(0, 11)).toEqual([
+      'run',
+      '--rm',
+      '--init',
+      '--name',
+      'n',
+      '-w',
+      '/project',
+      '--stop-timeout',
+      '300',
+      '--platform',
+      'linux/amd64'
+    ])
+    expect(
+      dockerRunArgs({ name: 'n', image: 'img', projectHost: '/w', unityArgs: [] })
+    ).not.toContain('--platform')
+  })
+
+  it('names GameCI images, one module each', () => {
+    expect(gameciTag('2022.3.20f1', ['android'], '3')).toBe(
+      'unityci/editor:ubuntu-2022.3.20f1-android-3'
+    )
+    expect(gameciTag('6000.0.30f1', [], '3.2.2')).toBe(
+      'unityci/editor:ubuntu-6000.0.30f1-base-3.2.2'
+    )
+    expect(gameciTag('2022.3.20f1', ['android', 'ios'], '3')).toBeUndefined()
+  })
+
+  describe('ensureImage', () => {
+    const build = {
+      tag: 'ci-unity-editor:v-android',
+      version: 'v',
+      changeset: async (): Promise<string | undefined> => 'abcdef123456',
+      modules: ['android'],
+      dockerfile: '/d/Dockerfile'
+    }
+    type Answer = (args: readonly string[]) => Promise<ExecResult>
+    const result = (exitCode = 0, stderr = ''): ExecResult => ({
+      command: 'docker',
+      exitCode,
+      signal: null,
+      stdout: '',
+      stderr,
+      durationMs: 0
+    })
+    /**
+     * Fake docker CLI: `local` tags exist, `published` tags are on the registry;
+     * `manifest` / `pull` replace the registry's answers.
+     */
+    const fakeDocker = (
+      local: string[],
+      published: string[],
+      over: { manifest?: Answer; pull?: Answer } = {}
+    ): { calls: string[][]; run: typeof exec } => {
+      const calls: string[][] = []
+      const run = async (_cmd: string, args: readonly string[] = []): Promise<ExecResult> => {
+        calls.push([...args])
+        const tag = args.at(-1) ?? ''
+        if (args[0] === 'image') return result(local.includes(tag) ? 0 : 1)
+        if (args[0] === 'manifest') {
+          if (over.manifest) return over.manifest(args)
+          return published.includes(tag)
+            ? result()
+            : result(1, `no such manifest: docker.io/${tag}`)
+        }
+        if (args[0] === 'pull' && over.pull) return over.pull(args)
+        return result()
+      }
+      return { calls, run }
+    }
+    /** `image inspect`, `manifest inspect`, `pull <tag>`, `build <context>`. */
+    const verbs = (calls: string[][]): string[] =>
+      calls.map(c =>
+        c[0] === 'pull' || c[0] === 'build' ? `${c[0]} ${c.at(-1)}` : `${c[0]} ${c[1]}`
+      )
+    const pullFails =
+      (stderr: string): Answer =>
+      async args => {
+        throw new ExecError({
+          command: `docker ${args.join(' ')}`,
+          exitCode: 1,
+          signal: null,
+          stdout: '',
+          stderr
+        })
+      }
+
+    it('reuses a local image without touching the registry', async () => {
+      const d = fakeDocker(['gameci:x'], [])
+      expect(await ensureImage({ pull: 'gameci:x', build, timeoutMs: 1, run: d.run })).toEqual({
+        tag: 'gameci:x',
+        how: 'cached'
+      })
+      expect(verbs(d.calls)).toEqual(['image inspect'])
+    })
+
+    it('reuses an earlier fallback build before asking the registry', async () => {
+      const d = fakeDocker([build.tag], [])
+      const onWarning = vi.fn()
+      const got = await ensureImage({
+        pull: 'gameci:x',
+        build,
+        timeoutMs: 1,
+        run: d.run,
+        onWarning
+      })
+      expect(got).toEqual({ tag: build.tag, how: 'cached' })
+      expect(verbs(d.calls)).toEqual(['image inspect', 'image inspect'])
+      expect(onWarning).not.toHaveBeenCalled()
+    })
+
+    it('pulls a published image for the given platform', async () => {
+      const d = fakeDocker([], ['gameci:x'])
+      const got = await ensureImage({
+        pull: 'gameci:x',
+        build,
+        platform: 'linux/amd64',
+        timeoutMs: 1,
+        run: d.run
+      })
+      expect(got).toEqual({ tag: 'gameci:x', how: 'pulled' })
+      expect(verbs(d.calls)).toEqual([
+        'image inspect',
+        'image inspect',
+        'manifest inspect',
+        'pull gameci:x'
+      ])
+      expect(d.calls.at(-1)).toEqual(['pull', '--platform', 'linux/amd64', 'gameci:x'])
+    })
+
+    it('builds locally when the registry does not publish the tag', async () => {
+      const d = fakeDocker([], [])
+      const warnings: string[] = []
+      const got = await ensureImage({
+        pull: 'gameci:x',
+        build,
+        platform: 'linux/amd64',
+        timeoutMs: 1,
+        run: d.run,
+        onWarning: m => warnings.push(m)
+      })
+      expect(got).toEqual({ tag: build.tag, how: 'built' })
+      expect(warnings).toEqual([expect.stringMatching(/^gameci:x is not published: building /)])
+      expect(verbs(d.calls)).toEqual([
+        'image inspect',
+        'image inspect',
+        'manifest inspect',
+        'build /d'
+      ])
+      expect(d.calls.at(-1)).toEqual(
+        expect.arrayContaining(['--platform', 'linux/amd64', 'UNITY_CHANGESET=abcdef123456'])
+      )
+    })
+
+    it('lets the pull decide when the registry check fails for another reason', async () => {
+      const d = fakeDocker([], [], {
+        manifest: async () => result(1, 'toomanyrequests: You have reached your pull rate limit')
+      })
+      const got = await ensureImage({ pull: 'gameci:x', build, timeoutMs: 1, run: d.run })
+      expect(got).toEqual({ tag: 'gameci:x', how: 'pulled' })
+    })
+
+    it('fails on a pull error other than "not found", without building', async () => {
+      const d = fakeDocker([], ['gameci:x'], { pull: pullFails('net/http: TLS handshake timeout') })
+      await expect(
+        ensureImage({ pull: 'gameci:x', build, timeoutMs: 1, run: d.run })
+      ).rejects.toBeInstanceOf(ExecError)
+      expect(verbs(d.calls)).not.toContain('build /d')
+    })
+
+    it('builds when only the pull says the tag is missing (probe timed out, containerd store)', async () => {
+      const d = fakeDocker([], [], {
+        manifest: async () => {
+          throw new TimeoutError(120_000)
+        },
+        pull: pullFails(
+          'Error response from daemon: failed to resolve reference "docker.io/gameci:x": docker.io/gameci:x: not found'
+        )
+      })
+      const got = await ensureImage({ pull: 'gameci:x', build, timeoutMs: 1, run: d.run })
+      expect(got).toEqual({ tag: build.tag, how: 'built' })
+    })
+
+    it('stops when the job is cancelled during the registry check', async () => {
+      const d = fakeDocker([], [], {
+        manifest: async () => {
+          throw new AbortError()
+        }
+      })
+      await expect(
+        ensureImage({ pull: 'gameci:x', build, timeoutMs: 1, run: d.run })
+      ).rejects.toBeInstanceOf(AbortError)
+      expect(verbs(d.calls)).toEqual(['image inspect', 'image inspect', 'manifest inspect'])
+    })
+
+    it('pulls without probing when there is no fallback', async () => {
+      const d = fakeDocker([], [])
+      await ensureImage({ pull: 'my/img:1', timeoutMs: 1, run: d.run })
+      expect(verbs(d.calls)).toEqual(['image inspect', 'pull my/img:1'])
+    })
+
+    it('build only: reuses the local image, else builds it', async () => {
+      const cached = fakeDocker([build.tag], [])
+      expect(await ensureImage({ build, timeoutMs: 1, run: cached.run })).toEqual({
+        tag: build.tag,
+        how: 'cached'
+      })
+      const fresh = fakeDocker([], [])
+      expect(await ensureImage({ build, timeoutMs: 1, run: fresh.run })).toEqual({
+        tag: build.tag,
+        how: 'built'
+      })
+      expect(verbs(fresh.calls)).toEqual(['image inspect', 'build /d'])
+    })
+
+    it('needs a changeset to build', async () => {
+      const d = fakeDocker([], [])
+      const noChangeset = { ...build, changeset: async (): Promise<undefined> => undefined }
+      await expect(
+        ensureImage({ build: noChangeset, timeoutMs: 1, run: d.run })
+      ).rejects.toMatchObject({ code: 'E_UNITY_CHANGESET' })
+    })
+
+    it('treats only "no such tag" registry answers as not published', () => {
+      for (const s of [
+        'no such manifest: docker.io/unityci/editor:ubuntu-1-android-3',
+        'manifest for unityci/editor:x not found: manifest unknown: manifest unknown',
+        'failed to resolve reference "docker.io/unityci/editor:x": docker.io/unityci/editor:x: not found'
+      ])
+        expect(s).toMatch(NOT_PUBLISHED)
+      for (const s of [
+        'toomanyrequests: You have reached your pull rate limit',
+        'unauthorized: authentication required',
+        'no matching manifest for linux/arm64/v8 in the manifest list entries',
+        'failed to resolve reference "docker.io/x:y": dial tcp: lookup registry-1.docker.io: no such host'
+      ])
+        expect(s).not.toMatch(NOT_PUBLISHED)
+    })
+  })
+
+  describe('imagePlan', () => {
+    const build = {
+      tag: 'ci-unity-editor:v-android',
+      version: 'v',
+      changeset: async (): Promise<string | undefined> => undefined,
+      modules: ['android'],
+      dockerfile: '/d/Dockerfile'
+    }
+    const plan = (o: Partial<Parameters<typeof imagePlan>[0]>): ReturnType<typeof imagePlan> =>
+      imagePlan({
+        source: 'auto',
+        version: 'v',
+        modules: ['android'],
+        gameciVersion: '3',
+        build,
+        ...o
+      })
+
+    it('docker-image wins over every source', () => {
+      expect(plan({ dockerImage: 'mirror/unity:1', source: 'build' })).toEqual({
+        pull: 'mirror/unity:1'
+      })
+    })
+    it('auto pulls GameCI with the local build as fallback', () => {
+      expect(plan({})).toEqual({ pull: 'unityci/editor:ubuntu-v-android-3', build })
+    })
+    it('auto builds when 2+ modules are needed', () => {
+      expect(plan({ modules: ['android', 'ios'] })).toEqual({ build })
+    })
+    it('gameci never builds, build never pulls', () => {
+      expect(plan({ source: 'gameci' })).toEqual({ pull: 'unityci/editor:ubuntu-v-android-3' })
+      expect(plan({ source: 'build' })).toEqual({ build })
+    })
+    it('gameci with 2+ modules is an input error', () => {
+      expect(() => plan({ source: 'gameci', modules: ['android', 'ios'] })).toThrow(InputError)
+      expect(() => plan({ source: 'gameci', modules: ['android', 'ios'] })).toThrow(
+        /docker-image-source: .*android, ios/
+      )
+    })
+  })
+
+  describe('docker mode warnings', () => {
+    const base = {
+      argv: ['-quit', '-logFile', '-', '-projectPath', '/project'],
+      buildTarget: 'Android' as string | undefined,
+      autoModules: true,
+      hostOnlyInputs: [] as string[]
+    }
+
+    it('says nothing for a plain build', () => {
+      expect(dockerWarnings(base)).toEqual([])
+    })
+
+    it('warns when no -buildTarget leaves the base image', () => {
+      expect(dockerWarnings({ ...base, buildTarget: undefined })).toEqual([
+        expect.stringMatching(/^No -buildTarget/)
+      ])
+      expect(dockerWarnings({ ...base, buildTarget: undefined, autoModules: false })).toEqual([])
+    })
+
+    it('names the host-only inputs it ignores', () => {
+      expect(dockerWarnings({ ...base, hostOnlyInputs: ['editor-path', 'hub-path'] })).toEqual([
+        'editor-path, hub-path only apply to mode: host and are ignored in mode: docker (the default since v3)'
+      ])
+    })
+
+    it('flags paths the container cannot see', () => {
+      expect(
+        pathsOutsideProject([
+          '/project',
+          '/project/Builds/x.apk',
+          '-',
+          'Builds/x.apk',
+          'GameBuildCheck.AndroidDebugApk',
+          '/dev/stdout',
+          '/home/runner/work/g/g/Builds/x.apk',
+          '/project/../out.apk',
+          '/projectX/a',
+          '/tmp/x.apk',
+          'C:\\out\\x.apk',
+          '\\\\share\\x'
+        ])
+      ).toEqual([
+        '/home/runner/work/g/g/Builds/x.apk',
+        '/project/../out.apk',
+        '/projectX/a',
+        '/tmp/x.apk',
+        'C:\\out\\x.apk',
+        '\\\\share\\x'
+      ])
+      expect(dockerWarnings({ ...base, argv: ['-customBuildPath', '/tmp/x.apk'] })).toEqual([
+        expect.stringMatching(/^"\/tmp\/x\.apk" is outside the project/)
+      ])
+    })
   })
 
   it('maps host files into the container', () => {

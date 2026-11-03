@@ -1,5 +1,5 @@
 import * as core from '@actions/core'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -49,6 +49,7 @@ const start = async (mode: string, extra: Record<string, string> = {}): Promise<
   const values: Record<string, string> = {
     workdir: dir,
     version: '2022.3.20f1',
+    mode: 'host',
     'editor-path': process.execPath,
     'default-args-override': `${JSON.stringify(fakeUnity)} -batchmode -logFile -`,
     args: '-buildTarget Android',
@@ -145,10 +146,157 @@ describe('unity-build', () => {
     expect(md).toContain('error CS0103')
   })
 
+  it('docker mode: warns about settings it cannot honour and explains a missing Docker', async () => {
+    process.env.PATH = dir // no docker CLI in here
+    const report = await start('ok', {
+      mode: 'docker',
+      modules: 'auto',
+      args: '-customBuildPath /tmp/out.apk',
+      'unity-serial': 'SC-1',
+      'unity-email': 'e@x',
+      'unity-password': 'pw'
+    })
+    expect(report.status).toBe('failure')
+    const warnings = vi.mocked(core.warning).mock.calls.map(([m]) => String(m))
+    expect(warnings).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/^No -buildTarget/),
+        expect.stringMatching(/^editor-path only apply to mode: host/),
+        expect.stringMatching(/^"\/tmp\/out\.apk" is outside the project/)
+      ])
+    )
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringMatching(/needs Docker on the runner: Failed to start docker.*set mode: host/s)
+    )
+  })
+
   it('rejects a missing license file before Docker can create it as a directory', async () => {
     await expect(
       start('ok', { mode: 'docker', 'unity-license-file': 'missing.ulf' })
     ).rejects.toThrow(/unity-license-file: not found/)
+  })
+
+  it('docker mode: rejects unity-serial without the account before pulling anything', async () => {
+    await expect(start('ok', { mode: 'docker', 'unity-serial': 'SC-1' })).rejects.toThrow(
+      /unity-email: is required with unity-serial\n.*unity-password: is required with unity-serial/
+    )
+    await expect(
+      start('ok', { mode: 'docker', 'unity-serial': 'SC-1', 'unity-email': 'e@x' })
+    ).rejects.toThrow(/^(?!.*unity-email).*unity-password: is required/s)
+  })
+})
+
+/** A docker CLI that logs its arguments: images are cached, `run` succeeds or hangs. */
+describe.skipIf(process.platform === 'win32')('unity-build with a fake docker CLI', () => {
+  let dockerLog: string
+  const docker = (): string[] => readFileSync(dockerLog, 'utf8').trim().split('\n')
+
+  beforeEach(() => {
+    dockerLog = path.join(dir, 'docker.log')
+    writeFileSync(dockerLog, '')
+    const bin = path.join(dir, 'bin')
+    mkdirSync(bin)
+    writeFileSync(
+      path.join(bin, 'docker'),
+      [
+        '#!/bin/sh',
+        'echo "$*" >>"$FAKE_DOCKER_LOG"',
+        'case "$1" in',
+        '  run)',
+        '    [ "${FAKE_DOCKER_RUN:-}" = hang ] && exec sleep 30',
+        // A container that needs 6 s after SIGTERM to return the seat, and fails to.
+        '    if [ "${FAKE_DOCKER_RUN:-}" = slow-stop ]; then',
+        '      trap \'sleep 6; echo "ci-unity: could not return the license seat (exit 1)"; echo "ci-unity:   Unable to return the license: Code 500"; exit 143\' TERM',
+        '      while :; do sleep 1; done',
+        '    fi',
+        '    exit 0 ;;',
+        '  volume) echo "Error response from daemon: remove $4: volume is in use" >&2; exit 1 ;;',
+        'esac',
+        'exit 0',
+        ''
+      ].join('\n')
+    )
+    chmodSync(path.join(bin, 'docker'), 0o755)
+    process.env.PATH = `${bin}:${process.env.PATH ?? ''}`
+    process.env.FAKE_DOCKER_LOG = dockerLog
+  })
+
+  const warnings = (): string[] => vi.mocked(core.warning).mock.calls.map(([m]) => String(m))
+  const dockerMode = { mode: 'docker', 'editor-path': '', 'docker-gradle-volume': 'none' }
+
+  it('runs the cached GameCI image, without --platform for none, and says the Dockerfile went unused', async () => {
+    const report = await start('ok', {
+      ...dockerMode,
+      'docker-platform': 'none',
+      dockerfile: 'ci/unity.Dockerfile'
+    })
+    expect(report.status).toBe('success')
+    expect(output('image')).toBe('unityci/editor:ubuntu-2022.3.20f1-base-3')
+    const run = docker().find(l => l.startsWith('run '))
+    expect(run).toMatch(/ unityci\/editor:ubuntu-2022\.3\.20f1-base-3 sh -c /)
+    expect(run).not.toContain('--platform')
+    expect(warnings()).toContainEqual(
+      expect.stringMatching(/^dockerfile is not used: the image is unityci\/editor:/)
+    )
+  })
+
+  it('docker-image set: no "No -buildTarget" warning, the given image runs', async () => {
+    await start('ok', { ...dockerMode, modules: 'auto', args: '', 'docker-image': 'my/unity:1' })
+    expect(warnings().filter(w => w.startsWith('No -buildTarget'))).toEqual([])
+    expect(docker().find(l => l.startsWith('run '))).toContain(' my/unity:1 sh -c ')
+  })
+
+  it.each([
+    ['build', 'remove docker-image to build'],
+    ['auto', 'remove docker-image and set docker-image-source: build to build']
+  ])(
+    'docker-image and dockerfile (source %s): says docker-image is why the Dockerfile went unused',
+    async (source, advice) => {
+      await start('ok', {
+        ...dockerMode,
+        'docker-image': 'my/unity:1',
+        'docker-image-source': source,
+        dockerfile: 'ci/unity.Dockerfile'
+      })
+      expect(warnings()).toContainEqual(
+        'dockerfile is not used: docker-image (my/unity:1) is set and overrides docker-image-source; ' +
+          `${advice} from the Dockerfile.`
+      )
+    }
+  )
+
+  it('on timeout gives the container time to return the seat, then removes it', async () => {
+    process.env.FAKE_DOCKER_RUN = 'hang'
+    const report = await start('ok', { ...dockerMode, timeout: '400ms', 'idle-timeout': '0' })
+    expect(report.status).toBe('failure')
+    expect(output('failure-kind')).toBe('timeout')
+    const name = /--name (\S+)/.exec(docker().find(l => l.startsWith('run ')) ?? '')?.[1]
+    expect(docker().slice(-2)).toEqual([`stop -t 300 ${name}`, `rm --force ${name}`])
+  }, 20_000)
+
+  it('on timeout stays attached while the container cleans up, and warns about the seat', async () => {
+    process.env.FAKE_DOCKER_RUN = 'slow-stop'
+    const report = await start('ok', { ...dockerMode, timeout: '400ms', 'idle-timeout': '0' })
+    expect(report.status).toBe('failure')
+    // Not a license failure: the notice is never scanned as Unity output.
+    expect(output('failure-kind')).toBe('timeout')
+    expect(output('errors')).toBe('[]')
+    expect(warnings()).toContainEqual(
+      'could not return the license seat (exit 1)\n  Unable to return the license: Code 500'
+    )
+  }, 20_000)
+
+  it('warns when the Gradle volume cannot be removed', async () => {
+    const report = await start('ok', {
+      ...dockerMode,
+      'docker-gradle-volume': 'g',
+      'clean-gradle-cache': 'true'
+    })
+    expect(report.status).toBe('success')
+    expect(docker()[0]).toBe('volume rm --force g')
+    expect(warnings()).toContainEqual(
+      expect.stringMatching(/^Gradle cache not cleaned: .*volume is in use/)
+    )
   })
 })
 

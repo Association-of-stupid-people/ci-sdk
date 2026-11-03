@@ -51,6 +51,9 @@ const BUILD_RULES: readonly Rule[] = [
 ]
 
 const MAX_LINE = 64 * 1024
+/** Lines the docker-mode container script prints about itself (see CONTAINER_SCRIPT). */
+export const NOTICE_PREFIX = 'ci-unity: '
+const MAX_NOTICES = 20
 
 /**
  * Streaming scanner for the Unity Editor log: keeps a bounded, de-duplicated
@@ -59,6 +62,12 @@ const MAX_LINE = 64 * 1024
  */
 export class UnityLogScanner {
   readonly issues: UnityIssue[] = []
+  /**
+   * `ci-unity: ` lines of the container script, e.g. a seat that could not be
+   * returned. Never scanned for issues: they must not make a build look like
+   * a license failure.
+   */
+  readonly notices: string[] = []
   /** Issues found, including the ones dropped past `maxIssues` and duplicates. */
   total = 0
   /** "Build Finished, Result: Failure" seen (Unity may still exit 0). */
@@ -102,6 +111,10 @@ export class UnityLogScanner {
 
   private scanLine(raw: string): void {
     const line = raw.trim()
+    if (line.startsWith(NOTICE_PREFIX)) {
+      if (this.notices.length < MAX_NOTICES) this.notices.push(line)
+      return
+    }
     if (this.expectNext) {
       if (!line) return
       const { kind, prefix } = this.expectNext

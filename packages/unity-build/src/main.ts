@@ -8,6 +8,7 @@ import {
   InputError,
   Pipeline,
   annotate,
+  exec,
   getCiContext,
   input,
   readInputs,
@@ -16,13 +17,18 @@ import {
 } from '../../sdk/src/index.js'
 import { DEFAULT_ARGS, buildUnityArgs, modulesForTarget } from './args.js'
 import {
+  CI_ENV_NAMES,
   CONTAINER_PROJECT,
   CONTAINER_ULF,
   DEFAULT_DOCKERFILE,
+  STOP_GRACE_SECONDS,
   containerPath,
   dockerRunArgs,
+  dockerWarnings,
   ensureImage,
+  imagePlan,
   imageTag,
+  signalContainer,
   stopContainer,
   type Mount
 } from './docker.js'
@@ -53,7 +59,7 @@ const readSpecs = {
   workdir: input.string({ default: '.' }),
   version: input.string(),
   changeset: input.string({ pattern: /^[0-9a-f]{12}$/ }),
-  mode: input.oneOf(['host', 'docker'] as const, { default: 'host' }),
+  mode: input.oneOf(['docker', 'host'] as const, { default: 'docker' }),
   defaultArgs: input.string({ name: 'default-args-override', default: DEFAULT_ARGS }),
   args: input.string({ default: '' }),
   timeout: input.duration({ default: '3h' }),
@@ -78,6 +84,16 @@ const readSpecs = {
   hubPath: input.string({ name: 'hub-path' }),
   installTimeout: input.duration({ name: 'install-timeout', default: '1h' }),
   dockerImage: input.string({ name: 'docker-image' }),
+  imageSource: input.oneOf(['auto', 'gameci', 'build'] as const, {
+    name: 'docker-image-source',
+    default: 'auto'
+  }),
+  gameciVersion: input.string({
+    name: 'gameci-version',
+    default: '3',
+    pattern: /^\d+(\.\d+){0,2}$/
+  }),
+  dockerPlatform: input.string({ name: 'docker-platform', default: 'linux/amd64' }),
   dockerRepo: input.string({ name: 'docker-image-repo', default: 'ci-unity-editor' }),
   dockerfile: input.string({ name: 'dockerfile' }),
   dockerEnv: input.list({ name: 'docker-env', default: [] }),
@@ -196,6 +212,21 @@ export async function run(options: RunOptions = {}): Promise<PipelineReport> {
   const modules = cfg.modules.includes('auto')
     ? modulesForTarget(unity.buildTarget, inDocker ? 'linux' : host.platform)
     : cfg.modules.filter(m => m !== 'none')
+  if (inDocker) {
+    const hostOnlyInputs = [
+      cfg.editorPath && 'editor-path',
+      cfg.editorsDir.length > 0 && 'editors-dir',
+      cfg.hubPath && 'hub-path'
+    ].filter((n): n is string => Boolean(n))
+    for (const w of dockerWarnings({
+      argv: unity.argv,
+      buildTarget: unity.buildTarget,
+      // docker-image overrides the image modules would pick.
+      autoModules: cfg.modules.includes('auto') && !cfg.dockerImage,
+      hostOnlyInputs
+    }))
+      core.warning(w)
+  }
   // A -logFile written with $(pwd) points into the container in docker mode; resolve it on the host.
   const hostLogArg = inDocker ? buildUnityArgs({ ...argsInput, projectDir }).logFile : unity.logFile
   const logFile = path.resolve(
@@ -203,6 +234,9 @@ export async function run(options: RunOptions = {}): Promise<PipelineReport> {
     hostLogArg ?? path.join(ci.runner.temp ?? os.tmpdir(), `${ci.uniqueName('unity-build')}.log`)
   )
 
+  const gradleVolume = cfg.gradleVolume === 'none' ? undefined : cfg.gradleVolume
+  // An empty input means the default (linux/amd64): `none` leaves the platform to the daemon.
+  const platform = cfg.dockerPlatform === 'none' ? undefined : cfg.dockerPlatform
   // Keystore and license secrets travel as environment variables only.
   const secretsEnv: Record<string, string> = {}
   const mounts: Mount[] = []
@@ -222,6 +256,15 @@ export async function run(options: RunOptions = {}): Promise<PipelineReport> {
   if (cfg.keystoreAliasPassword) secretsEnv[KEYSTORE_ENV.aliasPassword] = cfg.keystoreAliasPassword
   const licenseGiven = Boolean(cfg.licenseFile || cfg.serial)
   if (inDocker) {
+    // Unity activates and returns a serial with the account: without it every attempt fails.
+    if (cfg.serial && (!cfg.email || !cfg.password)) {
+      throw new InputError(
+        [
+          !cfg.email && { input: 'unity-email', message: 'is required with unity-serial' },
+          !cfg.password && { input: 'unity-password', message: 'is required with unity-serial' }
+        ].filter((i): i is { input: string; message: string } => Boolean(i))
+      )
+    }
     if (cfg.serial) secretsEnv.UNITY_SERIAL = cfg.serial
     if (cfg.email) secretsEnv.UNITY_EMAIL = cfg.email
     if (cfg.password) secretsEnv.UNITY_PASSWORD = cfg.password
@@ -237,10 +280,6 @@ export async function run(options: RunOptions = {}): Promise<PipelineReport> {
       core.warning(
         'mode: docker without unity-license-file or unity-serial: Unity will have no license'
       )
-    if (typeof process.getuid === 'function' && typeof process.getgid === 'function') {
-      secretsEnv.HOST_UID = String(process.getuid())
-      secretsEnv.HOST_GID = String(process.getgid())
-    }
   } else if (licenseGiven) {
     core.warning(
       'unity-license-file / unity-serial are used in mode: docker only; the host editor uses its own activation'
@@ -331,20 +370,54 @@ export async function run(options: RunOptions = {}): Promise<PipelineReport> {
   }
 
   const prepareImage = async (ctx: StepContext<State>): Promise<void> => {
-    const tag = cfg.dockerImage || imageTag(cfg.dockerRepo, version, modules)
-    const how = await ensureImage({
-      tag,
-      build: !cfg.dockerImage,
+    const plan = imagePlan({
+      dockerImage: cfg.dockerImage,
+      source: cfg.imageSource,
       version,
-      changeset: resolveChangeset,
       modules,
-      dockerfile: path.resolve(cfg.dockerfile || DEFAULT_DOCKERFILE),
-      timeoutMs: cfg.installTimeout,
-      signal: ctx.signal
+      gameciVersion: cfg.gameciVersion,
+      build: {
+        tag: imageTag(cfg.dockerRepo, version, modules),
+        version,
+        changeset: resolveChangeset,
+        modules,
+        dockerfile: path.resolve(cfg.dockerfile || DEFAULT_DOCKERFILE)
+      }
     })
-    ctx.state.image = tag
-    core.setOutput('image', tag)
-    core.info(`Docker image ${tag}: ${how}`)
+    try {
+      const image = await ensureImage({
+        ...plan,
+        platform,
+        timeoutMs: cfg.installTimeout,
+        signal: ctx.signal,
+        onWarning: m => core.warning(m)
+      })
+      ctx.state.image = image.tag
+      core.setOutput('image', image.tag)
+      core.info(`Docker image ${image.tag}: ${image.how}`)
+      // v2 built every docker-mode image from `dockerfile`; auto now prefers GameCI.
+      if (cfg.dockerfile && image.tag !== plan.build?.tag) {
+        core.warning(
+          cfg.dockerImage
+            ? `dockerfile is not used: docker-image (${cfg.dockerImage}) is set and overrides ` +
+                `docker-image-source; remove docker-image${cfg.imageSource === 'build' ? '' : ' and set docker-image-source: build'} ` +
+                'to build from the Dockerfile.'
+            : `dockerfile is not used: the image is ${image.tag}. It is used by docker-image-source: ` +
+                'build, and by auto only when GameCI has no image; set docker-image-source: build to ' +
+                'always build from it.'
+        )
+      }
+    } catch (err) {
+      if (err instanceof CiError && err.code === 'E_EXEC_SPAWN') {
+        throw new CiError(
+          'E_DOCKER_MISSING',
+          `mode: docker (the default since v3) needs Docker on the runner: ${err.message}. ` +
+            'Install Docker, or set mode: host to build with an editor installed on the runner.',
+          { cause: err }
+        )
+      }
+      throw err
+    }
   }
 
   const build = async (ctx: StepContext<State>): Promise<void> => {
@@ -361,13 +434,22 @@ export async function run(options: RunOptions = {}): Promise<PipelineReport> {
         name,
         image: ctx.state.image ?? '',
         projectHost: projectDir,
+        platform,
         mounts,
-        envNames: [...Object.keys(secretsEnv), ...cfg.dockerEnv],
-        gradleVolume: cfg.gradleVolume === 'none' ? undefined : cfg.gradleVolume,
+        envNames: [
+          ...new Set([
+            ...Object.keys(secretsEnv),
+            ...CI_ENV_NAMES.filter(n => process.env[n] !== undefined),
+            ...cfg.dockerEnv
+          ])
+        ],
+        gradleVolume,
         unityArgs: unity.argv
       })
-      // On cancel the runner force-kills us within ~10s: keep the stop grace short then.
-      onKilled = async reason => stopContainer(name, reason === 'cancel' ? 5 : 30)
+      // The docker CLI forwarded SIGTERM already. Timeout/hang: it stays attached while the
+      // container returns the seat (stopGraceMs); stop what outlived it. Cancel: the runner kills
+      // us within ~10 s, so the container finishes on its own.
+      onKilled = async reason => (reason === 'cancel' ? signalContainer(name) : stopContainer(name))
     } else {
       command = ctx.state.editor ?? ''
       args = unity.argv
@@ -385,7 +467,8 @@ export async function run(options: RunOptions = {}): Promise<PipelineReport> {
         signal: ctx.signal,
         licensePatterns,
         secrets,
-        onKilled
+        onKilled,
+        stopGraceMs: inDocker ? (STOP_GRACE_SECONDS + 15) * 1000 : undefined
       })
       Object.assign(ctx.state, {
         issues: res.issues,
@@ -407,13 +490,28 @@ export async function run(options: RunOptions = {}): Promise<PipelineReport> {
   const cleanGradle =
     cfg.cleanGradle === 'true' ||
     (cfg.cleanGradle === 'auto' && !inDocker && host.platform === 'darwin')
+  // Docker builds keep Gradle in a named volume, not in the runner's ~/.gradle.
+  const cleanGradleCache = async (ctx: StepContext<State>): Promise<void> => {
+    if (!inDocker) {
+      await rm(path.join(host.home, '.gradle', 'caches'), { recursive: true, force: true })
+    } else if (gradleVolume) {
+      const res = await exec('docker', ['volume', 'rm', '--force', gradleVolume], {
+        allowFailure: true,
+        signal: ctx.signal,
+        timeout: 120_000
+      })
+      // e.g. "volume is in use" while another job on this daemon builds with it.
+      if (res.exitCode !== 0) {
+        core.warning(
+          `Gradle cache not cleaned: docker volume rm ${gradleVolume} failed: ` +
+            (res.stderr.trim() || `exit code ${res.exitCode}`)
+        )
+      }
+    }
+  }
 
   const report = await new Pipeline<State>({ name: 'unity-build', state, ci })
-    .step(
-      'clean gradle cache',
-      async () => rm(path.join(host.home, '.gradle', 'caches'), { recursive: true, force: true }),
-      { if: () => cleanGradle, continueOnError: true }
-    )
+    .step('clean gradle cache', cleanGradleCache, { if: () => cleanGradle, continueOnError: true })
     .step(
       inDocker ? `docker image (Unity ${version})` : `locate Unity ${version}`,
       inDocker ? prepareImage : resolveEditor
