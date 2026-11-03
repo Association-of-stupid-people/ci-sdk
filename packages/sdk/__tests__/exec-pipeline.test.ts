@@ -86,6 +86,69 @@ describe('exec', () => {
     expect(Date.now() - started).toBeLessThan(10_000)
   })
 
+  it('a killGrace function gets the stop reason', async () => {
+    const reasons: Error[] = []
+    const killGrace = (reason: Error): number => {
+      reasons.push(reason)
+      return 1_000
+    }
+    const timedOut = await exec(node, ['-e', 'setTimeout(() => {}, 30000)'], {
+      silent: true,
+      timeout: 100,
+      killGrace
+    }).catch((e: unknown) => e)
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 100)
+    const aborted = await exec(node, ['-e', 'setTimeout(() => {}, 30000)'], {
+      silent: true,
+      signal: controller.signal,
+      killGrace
+    }).catch((e: unknown) => e)
+    expect(timedOut).toBeInstanceOf(TimeoutError)
+    expect(aborted).toBeInstanceOf(AbortError)
+    expect(reasons).toEqual([timedOut, aborted])
+  })
+
+  it('a killGrace function that throws still gets the process stopped', async () => {
+    const started = Date.now()
+    const err = await exec(node, ['-e', 'setTimeout(() => {}, 30000)'], {
+      silent: true,
+      timeout: 100,
+      killGrace: () => {
+        throw new Error('broken callback')
+      }
+    }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(TimeoutError)
+    expect(Date.now() - started).toBeLessThan(10_000)
+  })
+
+  // Windows has no SIGTERM handlers: taskkill /F ends the tree at once.
+  it.skipIf(process.platform === 'win32')(
+    'the grace a killGrace function picks is used',
+    async () => {
+      // Exits 300 ms after SIGTERM, printing first. Stopped once "ready" shows the handler is set.
+      const script =
+        "process.on('SIGTERM', () => setTimeout(() => { console.log('cleaned up'); process.exit(3) }, 300));" +
+        "console.log('ready'); setTimeout(() => {}, 30000)"
+      const runWith = async (graceMs: number): Promise<string> => {
+        let out = ''
+        const controller = new AbortController()
+        await exec(node, ['-e', script], {
+          silent: true,
+          signal: controller.signal,
+          killGrace: () => graceMs,
+          onStdout: c => {
+            out += c
+            if (out.includes('ready')) controller.abort()
+          }
+        }).catch((e: unknown) => e)
+        return out
+      }
+      expect(await runWith(5_000)).toContain('cleaned up')
+      expect(await runWith(50)).not.toContain('cleaned up')
+    }
+  )
+
   it('kills the process when the signal aborts', async () => {
     const controller = new AbortController()
     setTimeout(() => controller.abort(), 100)

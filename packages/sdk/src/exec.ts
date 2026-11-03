@@ -15,8 +15,13 @@ export interface ExecOptions {
   signal?: AbortSignal
   /** Kill the process after this long (ms or duration string). 0 = no limit. */
   timeout?: number | string
-  /** Grace period between SIGTERM and SIGKILL. Default 5s. */
-  killGrace?: number | string
+  /**
+   * Grace period between SIGTERM and SIGKILL. Default 5s. A function picks it
+   * (in ms) when the process is stopped, from the reason: the TimeoutError of
+   * `timeout`, or the error for the aborted `signal`. A function that throws
+   * or returns no valid number gets the default.
+   */
+  killGrace?: number | string | ((reason: Error) => number)
   /** Do not echo output to the job log. Output is still captured. */
   silent?: boolean
   /** Resolve instead of throwing on a non-zero exit code. */
@@ -37,6 +42,7 @@ export interface ExecResult {
 }
 
 const DEFAULT_MAX_BUFFER = 1024 * 1024
+const DEFAULT_KILL_GRACE_MS = 5_000
 /** How long to wait for stdout/stderr to close after the direct child exits. */
 const PIPE_DRAIN_MS = 1_000
 
@@ -141,7 +147,11 @@ export async function exec(
   throwIfAborted(options.signal)
   const display = formatCommand(command, args)
   const timeoutMs = parseDuration(options.timeout ?? 0)
-  const killGraceMs = parseDuration(options.killGrace ?? 5_000)
+  const graceOption = options.killGrace
+  let killGraceMs =
+    typeof graceOption === 'function'
+      ? DEFAULT_KILL_GRACE_MS
+      : parseDuration(graceOption ?? DEFAULT_KILL_GRACE_MS)
   const maxBuffer = options.maxBuffer ?? DEFAULT_MAX_BUFFER
   const env = mergeEnv(options.inheritEnv === false ? {} : process.env, options.env)
   const started = performance.now()
@@ -179,6 +189,15 @@ export async function exec(
   const stop = (reason: Error): void => {
     if (stopReason || childExited) return
     stopReason = reason
+    if (typeof graceOption === 'function') {
+      let ms = DEFAULT_KILL_GRACE_MS
+      try {
+        ms = graceOption(reason)
+      } catch {
+        // A broken callback must not leave the process running: keep the default.
+      }
+      killGraceMs = Number.isFinite(ms) && ms >= 0 ? ms : DEFAULT_KILL_GRACE_MS
+    }
     killTree(child, 'SIGTERM')
     graceTimer = setTimeout(() => killTree(child, 'SIGKILL'), killGraceMs)
     graceTimer.unref()
