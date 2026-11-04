@@ -36,7 +36,7 @@ import 'timers';
 import { existsSync, readFileSync, createWriteStream } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdir as mkdir$1, readFile, rm as rm$1 } from 'node:fs/promises';
+import { mkdir as mkdir$1, mkdtemp, rm as rm$1, readFile } from 'node:fs/promises';
 import os$1 from 'node:os';
 import path$1 from 'node:path';
 
@@ -31630,6 +31630,184 @@ function hubErrors(res) {
     return lines.length ? `: ${[...new Set(lines)].slice(0, 5).join(' | ')}` : '';
 }
 
+const START = '<DeveloperData Value="';
+const END = '"/>';
+/**
+ * Extract the Unity serial from the content of a `.ulf` license file.
+ * @see https://github.com/game-ci/unity-test-runner/blob/05a00ef5aced57c6f2d3b8f2a98d2239a1f24c0f/src/model/input.ts#L60
+ */
+function getSerialFromLicense(license) {
+    const start = license.indexOf(START);
+    if (start < 0) {
+        throw new CiError('E_LICENSE', 'License file is corrupted: <DeveloperData> not found');
+    }
+    const from = start + START.length;
+    const end = license.indexOf(END, from);
+    if (end < 0) {
+        throw new CiError('E_LICENSE', 'License file is corrupted: <DeveloperData> is not closed');
+    }
+    const serial = Buffer.from(license.slice(from, end), 'base64').toString('binary').slice(4).trim();
+    if (!serial)
+        throw new CiError('E_LICENSE', 'Serial key not found in license');
+    return serial;
+}
+
+/**
+ * Time limit for one activation or return. Unity opens a blank project after
+ * talking to the license server, which takes a minute or two on a cold machine.
+ */
+const LICENSE_TIMEOUT_MS = 10 * 60_000;
+/**
+ * Machine-wide license file of a serial activation (Unity 6 manual, "Unity
+ * license file location"). On Linux it is per user.
+ */
+function machineLicenseFile(host) {
+    if (host.platform === 'win32') {
+        return path$1.win32.join(host.env.PROGRAMDATA ?? 'C:\\ProgramData', 'Unity', 'Unity_lic.ulf');
+    }
+    if (host.platform === 'darwin')
+        return '/Library/Application Support/Unity/Unity_lic.ulf';
+    return path$1.posix.join(host.home, '.local', 'share', 'unity3d', 'Unity', 'Unity_lic.ulf');
+}
+/**
+ * Whether a .ulf holds `serial` and has not expired (empty StopDate = no end).
+ * Only a hint: Unity checks the signature and the server may have revoked the
+ * seat, so a license error later still re-activates.
+ */
+function ulfHasSerial(ulf, serial, now = new Date()) {
+    if (!ulf)
+        return false;
+    let found;
+    try {
+        found = getSerialFromLicense(ulf);
+    }
+    catch {
+        return false;
+    }
+    if (found !== serial)
+        return false;
+    const stop = /<StopDate Value="([^"]*)"/.exec(ulf)?.[1]?.trim();
+    if (!stop)
+        return true;
+    const end = Date.parse(stop);
+    return Number.isFinite(end) && end > now.getTime();
+}
+/** `<editor> <args>` to activate a serial (Unity 6 manual, "Activate a license from the command line"). */
+function activateArgs(a, logFile, project) {
+    return [
+        '-batchmode',
+        '-nographics',
+        '-quit',
+        '-logFile',
+        logFile,
+        '-projectPath',
+        project,
+        '-serial',
+        a.serial,
+        '-username',
+        a.email,
+        '-password',
+        a.password
+    ];
+}
+/** `<editor> <args>` to return the active serial (Unity 6 manual, "Returning the license through the command line"). */
+function returnArgs(a, logFile, project) {
+    return [
+        '-batchmode',
+        '-nographics',
+        '-quit',
+        '-logFile',
+        logFile,
+        '-projectPath',
+        project,
+        '-returnlicense',
+        '-username',
+        a.email,
+        '-password',
+        a.password
+    ];
+}
+/**
+ * License-related lines of a Unity log, safe to print: like docker mode, drop
+ * the echoed command line (`-serial`, `-password`, lines starting with `-`),
+ * then replace every secret with ***.
+ */
+function licenseLogLines(log, secrets, max = 20) {
+    const sorted = [...new Set(secrets.filter(Boolean))].sort((a, b) => b.length - a.length);
+    return log
+        .split(/\r?\n/)
+        .map(l => l.trim())
+        .filter(l => /licen|error/i.test(l))
+        .filter(l => !l.includes('-serial') && !l.includes('-password') && !l.startsWith('-'))
+        .map(l => sorted.reduce((out, s) => out.split(s).join('***'), l))
+        .slice(-max);
+}
+/** Activation or return failed; `lines` are already redacted. */
+class LicenseError extends CiError {
+    lines;
+    constructor(code, message, lines) {
+        super(code, lines.length ? `${message}:\n  ${lines.join('\n  ')}` : message);
+        this.lines = lines;
+    }
+}
+/**
+ * Run the editor once to activate or return the serial. Like docker mode it
+ * opens an empty project (with no -projectPath Unity would open the working
+ * directory as a project). The log holds the command line, secrets included,
+ * so it is deleted; failures carry its redacted license lines.
+ *
+ * @throws {LicenseError} on a non-zero exit or a timeout.
+ * @throws {AbortError} when cancelled; {CiError} E_EXEC_SPAWN when the editor cannot start.
+ */
+async function runLicense(o) {
+    await mkdir$1(o.tempDir, { recursive: true });
+    const dir = await mkdtemp(path$1.join(o.tempDir, 'unity-license-'));
+    const project = path$1.join(dir, 'blank');
+    const logFile = path$1.join(dir, 'license.log');
+    const timeoutMs = o.timeoutMs ?? LICENSE_TIMEOUT_MS;
+    const code = o.action === 'activate' ? 'E_UNITY_ACTIVATION' : 'E_UNITY_RETURN';
+    const what = o.action === 'activate'
+        ? 'Failed to activate the Unity license'
+        : 'Could not return the Unity license';
+    const lines = async (output) => licenseLogLines(`${await readFile(logFile, 'utf8').catch(() => '')}\n${output}`, o.secrets);
+    try {
+        await mkdir$1(path$1.join(project, 'Assets'), { recursive: true });
+        const args = o.action === 'activate'
+            ? activateArgs(o.account, logFile, project)
+            : returnArgs(o.account, logFile, project);
+        let res;
+        try {
+            res = await exec(o.editor, args, {
+                cwd: project,
+                env: o.env,
+                inheritEnv: false,
+                timeout: timeoutMs,
+                signal: o.signal,
+                allowFailure: true,
+                silent: true,
+                maxBuffer: 64 * 1024
+            });
+        }
+        catch (err) {
+            // Our own limit; a step timeout or the cleanup budget arrives through the signal.
+            if (err instanceof TimeoutError && !o.signal?.aborted) {
+                throw new LicenseError(code, `${what}: Unity did not finish within ${formatDuration(timeoutMs)}`, await lines(''));
+            }
+            throw err;
+        }
+        if (res.exitCode !== 0) {
+            throw new LicenseError(code, `${what} (Unity exited with ${res.exitCode === null ? `signal ${res.signal}` : `code ${res.exitCode}`})`, await lines(`${res.stdout}\n${res.stderr}`));
+        }
+    }
+    finally {
+        // The log first: it holds the secrets. Unity's licensing client may still hold a file for a
+        // moment on Windows; RUNNER_TEMP is wiped after the job anyway.
+        // recursive: maxRetries is ignored without it (works on a single file too).
+        await rm$1(logFile, { recursive: true, force: true, maxRetries: 3 }).catch((err) => warning(`Could not delete ${logFile} (it holds the Unity account): ${errorMessage(err)}`));
+        await rm$1(dir, { recursive: true, force: true, maxRetries: 3 }).catch((err) => debug(`Could not delete ${dir}: ${errorMessage(err)}`));
+    }
+}
+
 const ICON = { success: '✅', failure: '❌', cancelled: '🚫' };
 const KIND_TEXT = {
     license: 'license error (retried, still failing)',
@@ -31994,6 +32172,8 @@ async function lookupChangeset(version, options = {}) {
     }
 }
 
+/** Time limit for returning the seat in host mode (the container caps it at about 3 min too). */
+const RETURN_TIMEOUT_MS = 3 * 60_000;
 /** Environment variables a BuildScript reads instead of command-line flags. */
 const KEYSTORE_ENV = {
     path: 'UNITY_KEYSTORE_PATH',
@@ -32048,6 +32228,10 @@ const readSpecs = {
     serial: input.string({ name: 'unity-serial', secret: true }),
     email: input.string({ name: 'unity-email', secret: true }),
     password: input.string({ name: 'unity-password', secret: true }),
+    returnLicense: input.oneOf(['auto', 'true', 'false'], {
+        name: 'return-license',
+        default: 'auto'
+    }),
     cleanGradle: input.oneOf(['auto', 'true', 'false'], {
         name: 'clean-gradle-cache',
         default: 'auto'
@@ -32174,14 +32358,20 @@ async function run(options = {}) {
     if (cfg.keystoreAliasPassword)
         secretsEnv[KEYSTORE_ENV.aliasPassword] = cfg.keystoreAliasPassword;
     const licenseGiven = Boolean(cfg.licenseFile || cfg.serial);
+    // Unity activates and returns a serial with the account: without it every attempt fails.
+    if (cfg.serial && (!cfg.email || !cfg.password)) {
+        throw new InputError([
+            !cfg.email && { input: 'unity-email', message: 'is required with unity-serial' },
+            !cfg.password && { input: 'unity-password', message: 'is required with unity-serial' }
+        ].filter((i) => Boolean(i)));
+    }
+    // Host mode with a serial: activate on the runner before the build.
+    const account = !inDocker && cfg.serial && cfg.email && cfg.password
+        ? { serial: cfg.serial, email: cfg.email, password: cfg.password }
+        : undefined;
+    // auto keeps the seat on a persistent host: other runners on it may be building with it.
+    const returnHostLicense = account !== undefined && cfg.returnLicense === 'true';
     if (inDocker) {
-        // Unity activates and returns a serial with the account: without it every attempt fails.
-        if (cfg.serial && (!cfg.email || !cfg.password)) {
-            throw new InputError([
-                !cfg.email && { input: 'unity-email', message: 'is required with unity-serial' },
-                !cfg.password && { input: 'unity-password', message: 'is required with unity-serial' }
-            ].filter((i) => Boolean(i)));
-        }
         if (cfg.serial)
             secretsEnv.UNITY_SERIAL = cfg.serial;
         if (cfg.email)
@@ -32198,9 +32388,20 @@ async function run(options = {}) {
         }
         if (!licenseGiven)
             warning('mode: docker without unity-license-file or unity-serial: Unity will have no license');
+        if (cfg.returnLicense === 'false') {
+            warning('return-license applies to mode: host only; in mode: docker the container always returns its seat');
+        }
     }
-    else if (licenseGiven) {
-        warning('unity-license-file / unity-serial are used in mode: docker only; the host editor uses its own activation');
+    else {
+        // A .ulf is bound to the machine it was made for; copying it over the machine-wide one could
+        // also replace a license other runners on this machine use.
+        if (cfg.licenseFile) {
+            warning('unity-license-file is used in mode: docker only; in mode: host set unity-serial, unity-email ' +
+                'and unity-password, or activate the runner machine once by hand');
+        }
+        if (cfg.returnLicense === 'true' && !account) {
+            warning('return-license: true needs unity-serial in mode: host; nothing is returned');
+        }
     }
     // Redacted from the log file (Unity echoes its command line at the top of the log).
     const secrets = [
@@ -32212,6 +32413,70 @@ async function run(options = {}) {
         ...unity.secretValues
     ].filter((s) => Boolean(s));
     const state = { attempts: 0, issues: [], totalIssues: 0 };
+    const licenseTemp = ci.runner.temp ?? os$1.tmpdir();
+    /**
+     * Host mode: activate the serial with the editor. `skipIfActive` trusts a
+     * machine-wide license that already holds this serial, only when a license
+     * error can still re-activate (license-retries > 0).
+     */
+    const activate = async (ctx, skipIfActive) => {
+        if (!account)
+            return;
+        if (skipIfActive && cfg.licenseRetries > 0) {
+            const ulf = machineLicenseFile(host);
+            if (ulfHasSerial(host.read(ulf), account.serial)) {
+                info(`${ulf} already holds this serial: activation skipped`);
+                Object.assign(ctx.state, { activationFailed: false, failureKind: undefined });
+                return;
+            }
+        }
+        info('Activating the Unity license (the editor gets the serial and account on its command line)');
+        try {
+            await runLicense({
+                action: 'activate',
+                editor: ctx.state.editor ?? '',
+                account,
+                tempDir: licenseTemp,
+                env: childEnv({}),
+                secrets,
+                signal: ctx.signal
+            });
+        }
+        catch (err) {
+            ctx.state.activationFailed = true;
+            if (err instanceof LicenseError)
+                ctx.state.failureKind = 'license';
+            throw err;
+        }
+        // A failed earlier attempt must not label a later, non-license failure.
+        Object.assign(ctx.state, { activationFailed: false, failureKind: undefined });
+        info('Unity license activated');
+    };
+    const returnLicense = async (ctx) => {
+        if (!account || !ctx.state.editor)
+            return;
+        try {
+            await runLicense({
+                action: 'return',
+                editor: ctx.state.editor,
+                account,
+                tempDir: licenseTemp,
+                env: childEnv({}),
+                secrets,
+                timeoutMs: RETURN_TIMEOUT_MS,
+                signal: ctx.signal
+            });
+            info('Unity license returned');
+        }
+        catch (err) {
+            // Usually nothing to return after a failed activation (still tried, as in docker mode).
+            if (err instanceof LicenseError && ctx.state.activationFailed) {
+                info(err.message);
+                return;
+            }
+            throw err;
+        }
+    };
     const requireHub = () => {
         const hub = cfg.hubPath || findHub(host);
         if (!hub) {
@@ -32312,6 +32577,10 @@ async function run(options = {}) {
     };
     const build = async (ctx) => {
         ctx.state.attempts = ctx.attempt;
+        // Only license errors are retried: activate again (the seat may have been revoked, or
+        // returned by another runner on this machine).
+        if (account && ctx.attempt > 1)
+            await activate(ctx, false);
         let command;
         let args;
         let onKilled;
@@ -32398,19 +32667,32 @@ async function run(options = {}) {
             }
         }
     };
-    const report = await new Pipeline({ name: 'unity-build', state, ci })
+    const licenseRetry = {
+        attempts: cfg.licenseRetries + 1,
+        minDelay: cfg.licenseRetryDelay,
+        maxDelay: '10m',
+        jitter: false // as documented: the delay doubles, a busy license seat needs the wait
+    };
+    const pipeline = new Pipeline({ name: 'unity-build', state, ci })
         .step('clean gradle cache', cleanGradleCache, { if: () => cleanGradle, continueOnError: true })
-        .step(inDocker ? `docker image (Unity ${version})` : `locate Unity ${version}`, inDocker ? prepareImage : resolveEditor)
-        .step(`build (Unity ${version})`, build, {
+        .step(inDocker ? `docker image (Unity ${version})` : `locate Unity ${version}`, inDocker ? prepareImage : resolveEditor);
+    // Added only when used, so the other setups keep their step list.
+    if (account) {
+        pipeline.step('activate Unity license', async (ctx) => activate(ctx, true), {
+            retry: { ...licenseRetry, retryIf: err => err instanceof LicenseError }
+        });
+    }
+    pipeline.step(`build (Unity ${version})`, build, {
         retry: {
-            attempts: cfg.licenseRetries + 1,
-            minDelay: cfg.licenseRetryDelay,
-            maxDelay: '10m',
-            jitter: false, // as documented: the delay doubles, a busy license seat needs the wait
-            retryIf: err => err instanceof UnityBuildError && err.kind === 'license'
+            ...licenseRetry,
+            // LicenseError: the re-activation before a retry failed (host mode only).
+            retryIf: err => (err instanceof UnityBuildError && err.kind === 'license') || err instanceof LicenseError
         }
-    })
-        .run();
+    });
+    if (returnHostLicense) {
+        pipeline.always('return Unity license', returnLicense, { continueOnError: true });
+    }
+    const report = await pipeline.run();
     const failedStep = report.steps.find(s => s.status === 'failure' || s.status === 'cancelled');
     state.error = failedStep?.error;
     for (const issue of state.issues.filter(i => i.kind === 'compile' && i.file).slice(0, 10)) {

@@ -135,11 +135,15 @@ inputs:
     required: false
     default: 'ci-unity-gradle'
   unity-license-file:
-    description: .ulf license file mounted into the container (docker mode).
+    description: >-
+      .ulf license file mounted into the container (docker mode only: a .ulf is bound to the machine
+      it was made for; in host mode use unity-serial).
     required: false
   unity-serial:
     description: >-
-      Unity serial to activate inside the container (docker mode; returned after the build). For a
+      Unity serial to activate before the build. Docker mode: inside the container, returned after
+      the build. Host mode: with the runner's editor (on its command line, with the account),
+      skipped when the machine-wide license already holds this serial; see return-license. For a
       Personal license, the serial that extract-unity-serial reads from the .ulf. Needs unity-email
       and unity-password.
     required: false
@@ -149,6 +153,14 @@ inputs:
   unity-password:
     description: Unity account password for unity-serial (required with it).
     required: false
+  return-license:
+    description: >-
+      Return the unity-serial seat after the build (also after a failure, a timeout or a cancel).
+      auto = docker mode returns, host mode keeps it (the machine persists and other runners on it
+      may be building with the same machine-wide license) | true = return in host mode too | false =
+      keep it in host mode (docker mode always returns).
+    required: false
+    default: 'auto'
   clean-gradle-cache:
     description: >-
       Delete the Gradle cache first: ~/.gradle/caches (host mode) or the docker-gradle-volume (docker
