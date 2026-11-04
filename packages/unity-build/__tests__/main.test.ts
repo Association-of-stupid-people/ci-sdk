@@ -1,5 +1,14 @@
 import * as core from '@actions/core'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync
+} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -20,6 +29,9 @@ vi.mock('@actions/core', async importOriginal => ({
 }))
 
 import type { PipelineReport } from '../../sdk/src/index.js'
+import { machineLicenseFile } from '../src/license.js'
+import { currentHost, type HostEnv } from '../src/locate.js'
+import { ulf } from './fixtures/ulf.js'
 
 const { run } = await import('../src/main.js')
 
@@ -44,7 +56,11 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-const start = async (mode: string, extra: Record<string, string> = {}): Promise<PipelineReport> => {
+const start = async (
+  mode: string,
+  extra: Record<string, string> = {},
+  host?: HostEnv
+): Promise<PipelineReport> => {
   process.env.FAKE_UNITY_MODE = mode
   const values: Record<string, string> = {
     workdir: dir,
@@ -59,7 +75,7 @@ const start = async (mode: string, extra: Record<string, string> = {}): Promise<
     ...extra
   }
   vi.mocked(core.getInput).mockImplementation(name => values[name] ?? '')
-  return run()
+  return run(host ? { host } : {})
 }
 
 describe('unity-build', () => {
@@ -296,6 +312,218 @@ describe.skipIf(process.platform === 'win32')('unity-build with a fake docker CL
     expect(docker()[0]).toBe('volume rm --force g')
     expect(warnings()).toContainEqual(
       expect.stringMatching(/^Gradle cache not cleaned: .*volume is in use/)
+    )
+  })
+})
+
+/** Host mode with a serial: an editor wrapper around fake-unity.mjs that takes Unity's own argv. */
+describe('unity-build host license', () => {
+  const SERIAL = 'SC-1234'
+  const EMAIL = 'ci@example.com'
+  const PASSWORD = 'pw-secret'
+  let calls: string
+  let editor: string
+  const licenseCalls = (): string[] =>
+    existsSync(calls) ? readFileSync(calls, 'utf8').trim().split('\n') : []
+  const buildRuns = (): number =>
+    existsSync(process.env.FAKE_UNITY_STATE ?? '')
+      ? Number(readFileSync(process.env.FAKE_UNITY_STATE ?? '', 'utf8'))
+      : 0
+  const warnings = (): string[] => vi.mocked(core.warning).mock.calls.map(([m]) => String(m))
+  /** The real host, but the machine-wide license file holds `content` (none by default). */
+  const machine = (content?: string): HostEnv => {
+    const real = currentHost()
+    const file = machineLicenseFile(real)
+    return { ...real, read: f => (f === file ? content : real.read(f)) }
+  }
+  const host = (extra: Record<string, string> = {}): Record<string, string> => ({
+    'editor-path': editor,
+    'default-args-override': '-batchmode -logFile -',
+    'unity-serial': SERIAL,
+    'unity-email': EMAIL,
+    'unity-password': PASSWORD,
+    ...extra
+  })
+  const ACTIVATE =
+    /^activate -batchmode -nographics -quit -logFile \S+license\.log -projectPath \S+blank -serial SC-1234 -username ci@example\.com -password pw-secret inputs=0$/
+  const RETURN =
+    /^return -batchmode -nographics -quit -logFile \S+license\.log -projectPath \S+blank -returnlicense -username ci@example\.com -password pw-secret inputs=0$/
+
+  beforeEach(() => {
+    calls = path.join(dir, 'calls.log')
+    process.env.FAKE_UNITY_CALLS = calls
+    process.env.INPUT_UNITY_PASSWORD = PASSWORD
+    const bin = path.join(dir, 'bin')
+    mkdirSync(bin)
+    if (process.platform === 'win32') {
+      editor = path.join(bin, 'Unity.cmd')
+      writeFileSync(editor, `@"${process.execPath}" "${fakeUnity}" %*\r\n`)
+    } else {
+      editor = path.join(bin, 'Unity')
+      writeFileSync(editor, `#!/bin/sh\nexec "${process.execPath}" "${fakeUnity}" "$@"\n`)
+      chmodSync(editor, 0o755)
+    }
+  })
+
+  it('activates before the build, keeps the seat (return-license auto) and cleans up', async () => {
+    const report = await start('ok', host(), machine())
+    expect(report.status).toBe('success')
+    expect(report.steps.map(s => s.name)).toEqual([
+      'clean gradle cache',
+      'locate Unity 2022.3.20f1',
+      'activate Unity license',
+      'build (Unity 2022.3.20f1)'
+    ])
+    expect(licenseCalls()).toEqual([expect.stringMatching(ACTIVATE)])
+    expect(buildRuns()).toBe(1)
+    expect(readdirSync(dir).filter(f => f.startsWith('unity-license-'))).toEqual([])
+    expect(warnings().filter(w => /unity-serial|unity-license-file/.test(w))).toEqual([])
+    for (const s of [SERIAL, EMAIL, PASSWORD]) expect(core.setSecret).toHaveBeenCalledWith(s)
+  })
+
+  it('fails with the redacted license lines of the log, after license-retries', async () => {
+    process.env.FAKE_UNITY_ACTIVATE = 'fail'
+    const report = await start('ok', host({ 'license-retries': '1' }), machine())
+    expect(report.status).toBe('failure')
+    expect(licenseCalls()).toHaveLength(2)
+    expect(buildRuns()).toBe(0)
+    expect(output('failure-kind')).toBe('license')
+    expect(output('attempts')).toBe('0')
+    const message = String(vi.mocked(core.setFailed).mock.calls[0]?.[0])
+    expect(message).toContain('Failed to activate the Unity license (Unity exited with code 1):')
+    expect(message).toContain('Error: Code 400 while processing request for *** (password ***)')
+    expect(message).toContain('Successfully connected to LicensingClient for ***')
+    expect(message).not.toContain('-serial')
+    for (const s of [SERIAL, EMAIL, PASSWORD]) expect(message).not.toContain(s)
+    expect(readdirSync(dir).filter(f => f.startsWith('unity-license-'))).toEqual([])
+  })
+
+  it('skips activation when the machine license already holds the serial', async () => {
+    const report = await start('ok', host(), machine(ulf(SERIAL)))
+    expect(report.status).toBe('success')
+    expect(licenseCalls()).toEqual([])
+    expect(core.info).toHaveBeenCalledWith(
+      expect.stringMatching(/Unity_lic\.ulf already holds this serial: activation skipped$/)
+    )
+  })
+
+  it.each([
+    ['another serial', ulf('SC-9999'), {}],
+    ['an expired license', ulf(SERIAL, '2001-01-01T00:00:00'), {}],
+    ['license-retries: 0 (no way to recover)', ulf(SERIAL), { 'license-retries': '0' }]
+  ])('activates with %s on the machine', async (_name, content, extra) => {
+    await start('ok', host(extra), machine(content))
+    expect(licenseCalls()).toEqual([expect.stringMatching(ACTIVATE)])
+  })
+
+  it('activates again before a license retry of the build', async () => {
+    const report = await start('license-then-ok', host(), machine(ulf(SERIAL)))
+    expect(report.status).toBe('success')
+    expect(output('attempts')).toBe('2')
+    expect(licenseCalls()).toEqual([expect.stringMatching(ACTIVATE)])
+  })
+
+  it('return-license true: returns the seat after a successful build', async () => {
+    const report = await start('ok', host({ 'return-license': 'true' }), machine())
+    expect(report.status).toBe('success')
+    expect(licenseCalls()).toEqual([expect.stringMatching(ACTIVATE), expect.stringMatching(RETURN)])
+  })
+
+  it('return-license true: returns the seat after a failed build', async () => {
+    const report = await start('compile', host({ 'return-license': 'true' }), machine())
+    expect(report.status).toBe('failure')
+    expect(licenseCalls()[1]).toMatch(RETURN)
+  })
+
+  it('return-license true: returns the seat after a timeout', async () => {
+    const report = await start(
+      'hang',
+      host({ 'return-license': 'true', timeout: '400ms', 'idle-timeout': '0' }),
+      machine()
+    )
+    expect(output('failure-kind')).toBe('timeout')
+    expect(report.status).toBe('failure')
+    expect(licenseCalls()[1]).toMatch(RETURN)
+  }, 20_000)
+
+  it('return-license true: a failed return is a redacted warning, not a failure', async () => {
+    process.env.FAKE_UNITY_RETURN = 'fail'
+    const report = await start('ok', host({ 'return-license': 'true' }), machine())
+    expect(report.status).toBe('success')
+    const warning = warnings().find(w => w.includes('Could not return the Unity license'))
+    expect(warning).toContain('Error: Code 400 while processing request for *** (password ***)')
+    for (const s of [SERIAL, EMAIL, PASSWORD]) expect(warning).not.toContain(s)
+  })
+
+  it('return-license true after a failed activation: tries the return, says so only as info', async () => {
+    process.env.FAKE_UNITY_ACTIVATE = 'fail'
+    process.env.FAKE_UNITY_RETURN = 'fail'
+    const report = await start(
+      'ok',
+      host({ 'return-license': 'true', 'license-retries': '0' }),
+      machine()
+    )
+    expect(report.status).toBe('failure')
+    expect(licenseCalls()).toEqual([expect.stringMatching(ACTIVATE), expect.stringMatching(RETURN)])
+    expect(warnings().filter(w => w.includes('return'))).toEqual([])
+    expect(core.info).toHaveBeenCalledWith(
+      expect.stringContaining('Could not return the Unity license')
+    )
+  })
+
+  it('a failed re-activation before a build retry is retried, then fails as a license error', async () => {
+    process.env.FAKE_UNITY_ACTIVATE = 'fail'
+    const report = await start('license', host({ 'license-retries': '2' }), machine(ulf(SERIAL)))
+    expect(report.status).toBe('failure')
+    // Attempt 1 skipped activation and built; attempts 2 and 3 failed to re-activate.
+    expect(buildRuns()).toBe(1)
+    expect(licenseCalls()).toHaveLength(2)
+    expect(output('attempts')).toBe('3')
+    expect(output('failure-kind')).toBe('license')
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to activate the Unity license')
+    )
+  })
+
+  it('return-license false: keeps the seat', async () => {
+    await start('ok', host({ 'return-license': 'false' }), machine())
+    expect(licenseCalls()).toEqual([expect.stringMatching(ACTIVATE)])
+  })
+
+  it('rejects unity-serial without the account', async () => {
+    await expect(
+      start('ok', host({ 'unity-email': '', 'unity-password': '' }), machine())
+    ).rejects.toThrow(
+      /unity-email: is required with unity-serial\n.*unity-password: is required with unity-serial/
+    )
+    await expect(start('ok', host({ 'unity-password': '' }), machine())).rejects.toThrow(
+      /^(?!.*unity-email).*unity-password: is required/s
+    )
+    expect(licenseCalls()).toEqual([])
+  })
+
+  it('warns that unity-license-file is docker-only and that return-license needs a serial', async () => {
+    const report = await start(
+      'ok',
+      host({ 'unity-serial': '', 'unity-license-file': 'x.ulf', 'return-license': 'true' }),
+      machine()
+    )
+    expect(report.status).toBe('success')
+    expect(report.steps.map(s => s.name)).not.toContain('activate Unity license')
+    expect(warnings()).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/^unity-license-file is used in mode: docker only/),
+        'return-license: true needs unity-serial in mode: host; nothing is returned'
+      ])
+    )
+    expect(licenseCalls()).toEqual([])
+  })
+
+  it('docker mode: return-license false is ignored with a warning', async () => {
+    process.env.PATH = dir // no docker CLI in here
+    await start('ok', { mode: 'docker', 'return-license': 'false' })
+    expect(warnings()).toContainEqual(
+      'return-license applies to mode: host only; in mode: docker the container always returns its seat'
     )
   })
 })

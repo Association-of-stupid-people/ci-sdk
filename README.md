@@ -194,6 +194,29 @@ inputs), with:
 - **`mode: host`** (opt-in) **finds Unity on every OS** from `version`, else `UNITY_VER`, else `ProjectVersion.txt`: Hub
   registered editors, Hub secondary install path, default Hub folders (Windows/macOS/Linux),
   `/opt/unity/editors`, `editors-dir`, pre-Hub installs.
+- **Host-mode license** from `unity-serial` + `unity-email` + `unity-password` (all three
+  required), for runners where nobody can sign in to Unity Hub (e.g. a Windows service account):
+  after the editor is found or installed, it runs once against an empty project in `RUNNER_TEMP`
+  (`<editor> -batchmode -nographics -quit -logFile <tmp> -projectPath <blank> -serial <s> -username <e> -password <p>`,
+  as in Unity's
+  [command-line activation](https://docs.unity.com/en-us/engine/6000.0/manual/get-started/install-and-upgrade/licenses-and-activation/managing-your-unity-license)).
+  Unity documents this for paid serials; a Personal serial read from a .ulf with
+  `extract-unity-serial` is activated the same way in docker mode (as GameCI does).
+  - Skipped when the machine-wide license file already holds this serial and has not expired
+    (`%PROGRAMDATA%\Unity\Unity_lic.ulf`, `/Library/Application Support/Unity/Unity_lic.ulf`,
+    `~/.local/share/unity3d/Unity/Unity_lic.ulf`). That file is only a hint (the server may have
+    revoked the seat), so every license retry of the build activates again; with
+    `license-retries: 0` the action always activates.
+  - Failures are retried like license errors (`license-retries`, `license-retry-delay`, 10 min per
+    attempt) and then fail the step with `failure-kind: license` and the license lines of Unity's
+    log, with the serial, email and password replaced by `***`. The log itself (it echoes the
+    command line) and the blank project are deleted.
+  - `return-license: auto` (default) keeps the seat: the machine persists and other runners on it
+    use the same machine-wide license. `true` runs `-returnlicense` after the build, also after a
+    failure, a timeout or a cancel (a cancel leaves about 10 s before the runner kills the action, so
+    the return may not finish). In docker mode the container always returns its seat.
+  - `unity-license-file` stays docker-only: a .ulf is bound to the machine it was made for, and
+    copying one over the machine-wide file would also replace the license of other runners there.
 - **Installs what is missing** with the Unity Hub headless CLI (`install`, `install-modules
 --childModules`); modules come from `-buildTarget` (Android → `android`) or `modules`.
 - **Retries only license errors** (`license-retries`, default 2). A run that also shows compile,
@@ -225,6 +248,33 @@ inputs), with:
   with:
     name: unity-log
     path: ${{ runner.temp }}/unity-build-*.log
+```
+
+Host mode on a self-hosted Windows runner (the editor is found under
+`C:\Program Files\Unity\Hub\Editor\<version>\Editor\Unity.exe`, or installed with Hub):
+
+```yaml
+jobs:
+  build:
+    runs-on: [self-hosted, Windows, runner-windows]
+    steps:
+      - uses: actions/checkout@<sha> # v7
+        with:
+          clean: false # keep Library/ between builds on a persistent runner
+
+      - id: serial
+        uses: <owner>/ci-sdk/.github/actions/extract-unity-serial@runner
+        with:
+          license: ${{ secrets.UNITY_LICENSE }}
+
+      - uses: <owner>/ci-sdk/.github/actions/unity-build@runner
+        with:
+          mode: host
+          args: -buildTarget Android
+          unity-serial: ${{ steps.serial.outputs.serial }}
+          unity-email: ${{ secrets.UNITY_EMAIL }}
+          unity-password: ${{ secrets.UNITY_PASSWORD }}
+          # return-license: true # only if no other runner on this machine shares the license
 ```
 
 The `BuildScript` must read the keystore from the environment (Unity has no built-in flag for it).
@@ -424,6 +474,10 @@ section, so they are idempotent. Needs `permissions: contents: write`.
 - **unity-build**: Hub install on Windows needs the runner service to have admin rights
   (Program Files). Two jobs installing the same version on one machine at once are not locked.
   In Docker mode `-serial` is on the command line _inside_ the container (Unity has no other way).
+  In host mode the serial, email and password are on the editor's command line on the runner
+  itself, visible to other processes of that machine while it activates or returns: use it on a
+  single-tenant self-hosted machine. Two jobs activating the same serial on one machine at once
+  are not locked (both write the same machine-wide license file).
   After a timeout or a hung editor the action stays attached for up to 5 min while the container
   stops Unity (SIGKILL after 30 s), returns the seat and restores file ownership, so the output of
   that (e.g. a seat that could not be returned) still reaches the log; on cancel it only signals

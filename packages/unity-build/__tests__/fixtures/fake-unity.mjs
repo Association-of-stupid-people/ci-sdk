@@ -1,6 +1,41 @@
 // Stand-in for the Unity editor: behaviour is chosen with FAKE_UNITY_MODE, and
 // FAKE_UNITY_STATE counts runs so a test can fail the first attempt only.
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+// License runs (-serial / -returnlicense) are not counted: they append their
+// argv to FAKE_UNITY_CALLS, write a log with the command line echoed (as Unity
+// does) to -logFile, and fail when FAKE_UNITY_ACTIVATE / FAKE_UNITY_RETURN=fail.
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
+
+const argv = process.argv.slice(2)
+const license = argv.includes('-serial')
+  ? 'activate'
+  : argv.includes('-returnlicense')
+    ? 'return'
+    : undefined
+if (license) {
+  if (process.env.FAKE_UNITY_CALLS) {
+    const leaked = Object.keys(process.env).filter(k => /^INPUT_/i.test(k)).length
+    appendFileSync(process.env.FAKE_UNITY_CALLS, `${license} ${argv.join(' ')} inputs=${leaked}\n`)
+  }
+  const failed =
+    process.env[license === 'activate' ? 'FAKE_UNITY_ACTIVATE' : 'FAKE_UNITY_RETURN'] === 'fail'
+  const user = argv[argv.indexOf('-username') + 1]
+  const password = argv[argv.indexOf('-password') + 1]
+  const log = [
+    'COMMAND LINE ARGUMENTS:',
+    ...argv,
+    `[Licensing::Module] Successfully connected to LicensingClient for ${user}`,
+    'Loading project...',
+    ...(failed
+      ? [
+          `[Licensing::Client] Error: Code 400 while processing request for ${user} (password ${password})`,
+          'Error: license activation failed',
+          '-serial was rejected'
+        ]
+      : ['[Licensing::Client] License activated'])
+  ]
+  writeFileSync(argv[argv.indexOf('-logFile') + 1], `${log.join('\n')}\n`)
+  process.exit(failed ? 1 : 0)
+}
 
 const mode = process.env.FAKE_UNITY_MODE ?? 'ok'
 const stateFile = process.env.FAKE_UNITY_STATE
