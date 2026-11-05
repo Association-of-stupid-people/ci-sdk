@@ -1,0 +1,38 @@
+name: team-chat
+description: >-
+  Post a CI run report to a team chat incoming webhook (Slack Block Kit subset): a one-line summary
+  for the notification, then a card with the fields, one table row per build, alerts and the changelog.
+
+inputs:
+  webhook-url:
+    description: Webhook URL (secret, e.g. CHAT_WEBHOOK_URL). Empty = nothing is sent (notice).
+    required: false
+  report:
+    description: Run report as JSON (see the README). Set this or report-file.
+    required: false
+  report-file:
+    description: File with the run report JSON
+    required: false
+  payload-file:
+    description: Also write the webhook body (JSON) to this file, e.g. to preview it
+    required: false
+  dry-run:
+    description: Build the payload (and payload-file) but send nothing
+    required: false
+    default: 'false'
+  attempts:
+    description: Tries in all; only 429 (after Retry-After) and 5xx (5 s, 30 s) are retried
+    required: false
+    default: '3'
+
+outputs:
+  sent:
+    description: '`true` when the webhook answered 2xx'
+  status:
+    description: Last HTTP status
+  text:
+    description: The one-line summary (notification text)
+
+runs:
+  using: node24
+  main: dist/index.js
