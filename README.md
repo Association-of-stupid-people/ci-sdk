@@ -30,6 +30,9 @@ packages/
   unity-build/          NEW: replaces the unity-build composite (Docker by default, or host)
   unity-force-segment/  NEW: force a UA segment in the Adjust SDK for a QA build, then restore
   gdrive-upload/        NEW: upload a file to a Google Shared Drive folder with a service account key
+  unity-android-build-script/ NEW: CI-only Unity build script: signed AAB/APK, version from a tag, then restore
+  aab-to-apk/           NEW: universal APK from an AAB (pinned bundletool), signed with the same keystore
+  team-chat/            NEW: CI run report -> team chat webhook card (Block Kit, escaped, limits, retries)
   compose-deploy/       NEW: SSH deploy of a Compose service (backup, pull, up, health, rollback)
   docker-smoke/         NEW: run a container, wait for health, dump logs, always clean up
   release-gate/         NEW: release waits for a green CI run of the same commit; tag == version
@@ -125,6 +128,7 @@ await runAction(run) // any thrown error -> core.setFailed, exit code 1
 | `writeJobSummary`, `reportToMarkdown`                                            | Results table on the run page                                                                                                                   |
 | `group`, `mask`, `annotate`                                                      | Timed log groups, secret masking (incl. base64/URL forms), file annotations                                                                     |
 | `printUntrusted`, `withoutCommands`                                              | Print or stream untrusted output (container logs, remote scripts) inside `::stop-commands::`, so `::error::`-like lines are shown, not executed |
+| `resolveKeystore`, `generateKeystore`, `removeWrittenKeystore`                   | Android release keystore: secret inputs, else the ProjectSettings or project-root keystore (password = file name); generate one by convention   |
 | `runAction`                                                                      | Entrypoint wrapper                                                                                                                              |
 | `CiError`, `InputError`, `TimeoutError`, `AbortError`, `RetryError`, `ExecError` | Errors with a stable `code`                                                                                                                     |
 
@@ -330,8 +334,9 @@ segments:
 The file is validated strictly (unknown keys, wrong types, duplicate names all fail with a clear
 message). Values are escaped for C# string literals.
 
-`mode: list` reads the file and outputs `segments` (compact JSON array of names, in file order) and
-`count`. The `segment` input filters: empty or `all` = every segment, `none` = `[]`, or a
+`mode: list` reads the file and outputs `segments` (compact JSON array of names, in file order),
+`details` (the same segments as `{name, campaign, network, country}` objects, for a build table)
+and `count`. The `segment` input filters: empty or `all` = every segment, `none` = `[]`, or a
 comma-separated list of names (each must exist; a filter with no name, like `,`, fails). A missing file gives `[]` / `0` with a notice. It
 changes nothing in the project. Typical use: a `list` job feeds
 `strategy.matrix.segment: ${{ fromJSON(needs.segments.outputs.segments) }}`, and each matrix job
@@ -415,6 +420,317 @@ can cost minutes per file.
     name: game_${{ github.run_number }}.apk
 # ${{ steps.drive.outputs.link }}
 ```
+
+## Android release signing (keystore resolution)
+
+`unity-android-build-script` and `aab-to-apk` pick the release keystore the same way
+(`resolveKeystore` in the SDK), so one workflow works for every game without per-game setup:
+
+1. **Keystore inputs**, when any of them is set: `keystore-base64`, `keystore-password`,
+   `keystore-alias`, `keystore-alias-password` (from the secrets `KEYSTORE_BASE64`,
+   `KEYSTORE_PASSWORD`, `KEYSTORE_ALIAS`, `KEYSTORE_ALIAS_PASSWORD`). All four are required
+   together; a partial set fails and names the missing ones (sources are never mixed). The file is
+   written under `$RUNNER_TEMP` (mode 0600) and deleted when the action is done (`aab-to-apk`) or
+   by `mode: restore` (`unity-android-build-script`). The values are masked: GitHub hides a
+   secret's value in every log line and drops a job output holding it, so do not use a common
+   word (an alias like `release`) or the repository name as one. bundletool reads the passwords
+   from files, but takes the alias on its command line.
+2. Otherwise the **project keystore**: `AndroidKeystoreName` (`{inproject}:` resolved against the
+   project) and `AndroidKeyaliasName` from `ProjectSettings/ProjectSettings.asset`, when that file
+   exists.
+3. Otherwise a **keystore at the project root** (`*.keystore` / `*.jks` next to `Assets`), else
+   one **committed anywhere in the project** (`git ls-files`; Android `debug.keystore` files are
+   skipped): the only one, or `<keystore-name>.keystore` (default the repository name) among
+   several. Its alias is the one ProjectSettings gives the same file name, else the convention
+   below.
+4. Otherwise, with `generate-keystore: true` (`unity-android-build-script` only), the keystore of
+   the default branch, or a **new one** committed there (see that action). That mode also checks a
+   keystore of steps 2 and 3 that git does not track against the default branch. Without it, the step
+   **fails before the build** with code `E_NO_KEYSTORE`, explaining the options. A release is never
+   signed with a debug key.
+
+The project convention for 2 to 4: **password = keystore file name without its extension** for the
+store and the key, **alias = that name in lower case** (e.g. `My-Game.keystore` -> password
+`My-Game`, alias `my-game`). The file must be committed (`*.keystore` is often gitignored: add a
+`!/My-Game.keystore` exception).
+
+An unset secret reaches the action as an empty input, so passing all four secrets always is safe.
+A PKCS12 keystore and its password are checked before the build ("wrong store password"); a JKS
+keystore cannot be checked here (warning), the build will tell.
+
+## `unity-android-build-script` action
+
+Adds a CI-only Editor build script to a Unity project for one build (signed AAB or APK, version
+from a tag), then puts the project back byte-exact. The game needs no build script of its own.
+
+Inputs: `mode` (`apply` default, or `restore`), `project-path` (default `.`), `format` (`aab`
+default, or `apk`), `output` (relative to the project, default `Builds/release.<format>`),
+`version` (`vX.Y.Z` or `X.Y.Z`, e.g. `${{ github.ref_name }}`; empty keeps the project's),
+`version-code` (instead of the derived one), `development` (default `false`), `signing`
+(`release` default, or `debug` = Unity debug key), the four keystore inputs above,
+`generate-keystore` (default `false`), `commit-keystore` (default `true`), `keystore-name`
+(default the repository name), `github-token` (default `github.token`) and `editor-path` (Unity
+editor, to find keytool).
+
+**`generate-keystore: true`** handles a project with no keystore at all (step 4 above), so a game
+needs no signing setup before its first release. The **default branch is the reference**, so a
+game never gets a second key. This mode needs a git checkout of the repository it runs for
+(`remote.origin.url` must name `GITHUB_REPOSITORY`) and `github-token`; without them it stops
+rather than guess (one exception below).
+
+- A keystore committed in this commit, or given as secrets, is used as it is (no API call). So is
+  one ProjectSettings points to outside the repository (kept on the runner). Without a git checkout,
+  only a keystore ProjectSettings names by an absolute path outside the project folder is used,
+  unchecked; any other stops the step.
+- A keystore found but **not tracked by git** (one an earlier run generated and never committed,
+  left in a persistent checkout, or one copied by hand; inside the project or elsewhere in the
+  repository) is compared with this game's keystores on the default branch (in the project folder,
+  at that path, or where ProjectSettings points; another game's key in the same repository does not
+  count). The same file there: used. None there: used, and committed like a new one (with a
+  warning when the same file sits outside the project folder, e.g. another game's key). Otherwise
+  the step **fails before the build** (delete that copy, e.g. a run with a clean checkout).
+- No keystore: every `*.keystore` / `*.jks` of the default branch under the project folder is
+  listed (one trees API call; `debug.keystore` is ignored). The file at the path ProjectSettings
+  names (any file name, even outside the project folder), else `<keystore-name>.keystore` at the
+  project root, else the only keystore there when it is at the root, is written into the checkout
+  and used. Any other keystore there stops the step: tag a commit that has it. A tree too large
+  for one call stops the step too.
+- Only when the default branch has none is a new one generated, and only when `project-path` is a
+  Unity project (`Assets` and `ProjectSettings/ProjectSettings.asset`). It uses keytool (the Unity
+  editor's OpenJDK, from `editor-path` or `ProjectVersion.txt`, else `JAVA_HOME`, else the OpenJDK
+  of any installed Unity editor, else PATH): PKCS12, RSA 2048, valid 10000 days, password = its
+  name, alias = its name in lower case (or the alias ProjectSettings gives that file name), at the
+  project root. When ProjectSettings names another keystore that is missing, there is a warning:
+  if Google Play knows that key, find and commit it instead.
+- A keystore that is not on the default branch (only a `*.keystore` / `*.jks` file) is then
+  **committed there** through the contents API with `github-token`, at the path git gives (`Game/`
+  for a project in a subfolder, spelled as on the branch), so every later release signs with it.
+  The job needs `permissions: contents: write`. A refused commit (409/422) is retried while the
+  file is still absent. When another release committed a keystore first, a generated one is
+  dropped for it, and a found one stops the step. A failed commit (a protected branch) is a
+  warning and `keystore-committed: false`: commit the file yourself before the next release.
+- **`commit-keystore: false`** keeps the build job read-only: the action does everything but the
+  commit, and a later job with `contents: write` commits the file to `keystore-repo-path` (upload
+  it as an artifact in between) whenever `keystore-committed` is `false`.
+
+Version mapping: bundleVersion `X.Y.Z`, version code `X*10000 + Y*100 + Z` (`v1.0.2` -> `10002`).
+A version that is not strict `X.Y.Z` (`v1.2`, `v1.2.3-rc1`, `v01.2.3`) or has Y or Z >= 100 fails
+at once.
+
+Outputs: `execute-method` (pass to Unity with `-executeMethod`), `output` (absolute),
+`version-name`, `version-code`, `keystore-path` (absolute), `keystore-source` (`explicit`,
+`project-settings`, `project-file`, `default-branch`, `generated`, or empty for debug),
+`keystore-committed` (for a keystore that is not in this commit: `true` when it is on the
+default branch, `false` when it still has to be committed; empty otherwise),
+`keystore-commit-url`, `keystore-repo-path` (the keystore's path in the repository when it is not
+in this commit) and `patched`.
+The keystore outputs are set as soon as the keystore is ready, so they are there even when the
+step fails afterwards.
+
+What `apply` adds: `Assets/CiSdkBuild/CiSdkAndroidBuild.cs` and an editor-only assembly definition
+next to it (so it compiles in projects with their own asmdefs too). The script builds the scenes
+enabled in Build Settings with `BuildOptions.None` (or `Development`), sets the version for this
+build only, signs with the custom keystore, checks the result and the output file, exits non-zero
+on failure, and restores the PlayerSettings it changed. Keystore values from the secret inputs are
+**not** written into the script: Unity reads them from `UNITY_KEYSTORE_PATH`,
+`UNITY_KEYSTORE_PASS`, `UNITY_KEYALIAS_NAME` and `UNITY_KEYALIAS_PASS`, which the `unity-build`
+`keystore-*` inputs set. A path in the environment always wins (docker mode maps it). The password,
+alias and alias password come as a set: all from the environment when any of them is there, else
+all baked, so two keystores are never mixed; a missing one fails the build by name. The project convention
+values (not secrets) are baked in, so a game that follows it needs no configuration.
+
+`restore` deletes the folder (and its `.meta`), rewrites any saved file byte-exact and deletes a
+keystore written from `keystore-base64`. The state is kept in
+`$RUNNER_TEMP/ci-sdk-unity-android-build-script/state.json`; without it, `restore` still removes a
+generated folder left by a hard-killed job (found by its header) and stray written keystores. An
+`Assets/CiSdkBuild` folder the action did not generate is never touched (`apply` fails). `apply`
+first restores a state left by a job that never restored (self-hosted runners).
+
+```yaml
+- id: script
+  uses: <owner>/ci-sdk/.github/actions/unity-android-build-script@runner
+  with:
+    version: ${{ github.ref_name }}
+    output: Builds/game.aab
+    keystore-base64: ${{ secrets.KEYSTORE_BASE64 }}
+    keystore-password: ${{ secrets.KEYSTORE_PASSWORD }}
+    keystore-alias: ${{ secrets.KEYSTORE_ALIAS }}
+    keystore-alias-password: ${{ secrets.KEYSTORE_ALIAS_PASSWORD }}
+- id: build
+  uses: <owner>/ci-sdk/.github/actions/unity-build@runner
+  with:
+    mode: host
+    default-args-override: -batchmode -nographics -silent-crashes -quit -logFile - -executeMethod ${{ steps.script.outputs.execute-method }}
+    args: -buildTarget Android
+    keystore-path: ${{ steps.script.outputs.keystore-path }}
+    keystore-password: ${{ secrets.KEYSTORE_PASSWORD }}
+    keystore-alias: ${{ secrets.KEYSTORE_ALIAS }}
+    keystore-alias-password: ${{ secrets.KEYSTORE_ALIAS_PASSWORD }}
+- uses: <owner>/ci-sdk/.github/actions/unity-android-build-script@runner
+  if: always()
+  with:
+    mode: restore
+```
+
+## `aab-to-apk` action
+
+Turns an Android App Bundle into one installable universal APK with
+`bundletool build-apks --mode=universal`, signed with the same keystore, so QA installs exactly
+what goes to the store.
+
+Inputs: `aab` (required), `output` (default the `.aab` path with `.apk`), `project-path` (default
+`.`, for the project keystore), `signing` (`release` default, or `debug` = bundletool's
+`~/.android/debug.keystore` when present), the four keystore inputs above, `keystore-name`
+(default the repository name, preferred among several keystores at the project root), `java-path`,
+`editor-path` (the `unity-build` output), `bundletool-version` / `bundletool-sha256`, `timeout`
+(default `20m`). Outputs: `apk-path`, `size`, `java`, `bundletool`.
+
+- **bundletool** is pinned (1.18.3) and downloaded once into the runner tool cache
+  (`$RUNNER_TOOL_CACHE/bundletool/<version>/`). Its sha256 is checked on download and on every
+  use: a bad download fails, a changed cached jar is downloaded again. Another version needs its
+  `bundletool-sha256`.
+- **java**: `java-path`, else `$JAVA_HOME/bin/java`, else the OpenJDK of the Unity editor in
+  `editor-path` (`<Editor>/Data/PlaybackEngines/AndroidPlayer/OpenJDK`), else `java` on PATH. A
+  `java-path` that does not exist fails.
+- Passwords reach bundletool as `--ks-pass=file:` / `--key-pass=file:` files in a private temp
+  folder, never on the command line; the folder and any written keystore are deleted afterwards.
+- `universal.apk` is extracted from the `.apks` with its size and CRC-32 checked.
+
+```yaml
+- id: apk
+  uses: <owner>/ci-sdk/.github/actions/aab-to-apk@runner
+  with:
+    aab: ${{ steps.script.outputs.output }}
+    editor-path: ${{ steps.build.outputs.editor-path }}
+    keystore-base64: ${{ secrets.KEYSTORE_BASE64 }}
+    keystore-password: ${{ secrets.KEYSTORE_PASSWORD }}
+    keystore-alias: ${{ secrets.KEYSTORE_ALIAS }}
+    keystore-alias-password: ${{ secrets.KEYSTORE_ALIAS_PASSWORD }}
+# ${{ steps.apk.outputs.apk-path }}
+```
+
+## `team-chat` action
+
+Posts one CI run report to a team chat incoming webhook (a Slack Block Kit subset). The workflow
+only assembles a `report` JSON from its job results; the action builds the message and sends it.
+
+A webhook message cannot be edited or threaded, so a run posts two messages:
+
+- **START** (`"phase": "start"`), right before the first Unity build: `🛠️ Game · Đang build
+Debug #128 · 7 bản (normal + 6 segment)`, the run's fields (ref, commit, version, game, build,
+  actor, event, runner, start time), the planned builds (`"status": "planned"`) and an `info`
+  alert with the run link.
+- **END** (default), exactly one per run, picked from `jobs` (`needs.<job>.result`) and
+  `status` (`messageVariant`): `✅`/`🚀` success, `⚠️` partial (the run failed but every main
+  build exists: only segments or an upload failed), `❌` failure (the failed step, the log link,
+  what finished) and `🚫` cancelled (duration, the stage it was in, what finished, and "superseded
+  by run #N" when `supersededBy` is set). A cancelled job wins over a failed one. Run the notify
+  job with `if: always()` so a cancelled run still posts its END message; it is posted even when
+  START never was.
+
+Inputs: `webhook-url` (secret; empty = nothing sent, notice), `report` (JSON) or `report-file`,
+`payload-file` (also write the webhook body there, to preview it), `dry-run` (build, write
+`payload-file`, send nothing), `attempts` (default 3). Outputs: `sent`, `status`, `text`.
+
+The message:
+
+- `text`: one line, the push notification and sidebar preview (with `blocks`, only the blocks show
+  in the channel), e.g. `✅ Game · Debug #128 · 7/7 builds OK · 12m34s`,
+  `🚀 Game · Release v1.0.2 (10002) ready`, `❌ Game · Release v1.0.2 failed at Unity build`,
+  `🚫 Game · Debug #128 cancelled after 12m34s · during segment builds · superseded by run #129`.
+- `header`, a `section` of fields (branch/tag/PR, commit, version, duration, game, build, actor,
+  event, runner, start time), a `table` with one row per build (Build, Campaign and Country when
+  there are segments, Status/Result, Link to Drive / the GitHub artifact / the Unity log; no links
+  in START), `alert`s (`info`: START; `success`: all green / a release is ready; `error`: a main
+  build failed, with the log link; `default`: cancelled; `warning`: only segments or uploads
+  failed, files on the artifact fallback, report warnings), the changelog as a bullet list (newest
+  10, then "+N earlier") and a `context` footer (`GitHub Actions · repo · Run #N · ci-sdk vX.Y.Z`).
+- Untrusted text (branch, commit subjects, actor, segment names) goes into `plain_text` or literal
+  `rich_text` elements, or is escaped (`& < >`) in mrkdwn, so it can never form a mention,
+  `<!channel>` or a link. A word joiner (U+2060, invisible) also goes into `://`, after a `.`
+  before a letter and after `@` (mrkdwn, the header, link labels, table cells and the changelog), so the
+  server does not turn a plain URL, a domain or an `@name` into a link. The action itself never
+  writes a mention.
+- Limits: 50 blocks, blocks kept under 14,000 bytes (the server allows 16 kB after normalising),
+  header 150, fields 2,000, alerts 3,000 (name lists and warning lines are kept whole, then
+  "+N more"), table 100 rows / 10,000 characters, lengths in UTF-16 units without splitting an
+  emoji. Over a limit the changelog is shortened first, then table rows (main builds and failures
+  kept, then "+N more (see the run)"), then the table is dropped.
+
+Sending: UTF-8 JSON (`Content-Type: application/json; charset=utf-8`). 429 waits for
+`Retry-After` (at most 2 min), 5xx backs off 5 s then 30 s, at most 3 tries; any other status,
+a redirect (not followed) or a network error stops at once (a POST that may have arrived is not
+sent twice). A 502/504 from a proxy after the server took the message could still post it twice.
+A failure is a warning with the status and the first line of the response body
+(e.g. `HTTP 404 no_active_hooks`), never a failed step. Logs show at most the first 12 characters
+of the `ma=` key, never the URL; the key is masked too, decoded and as written in the URL.
+
+Report (unknown keys are ignored; strings may be untrusted):
+
+```json
+{
+  "name": "BGPZ-005-Gem",
+  "kind": "release",
+  "status": "failure",
+  "failedStep": "AAB to APK",
+  "game": "Gem Blast",
+  "platform": "Android",
+  "clean": false,
+  "project": { "name": "acme/BGPZ-005-Gem", "url": "https://github.com/acme/BGPZ-005-Gem" },
+  "run": { "url": "https://github.com/acme/BGPZ-005-Gem/actions/runs/1", "number": 131 },
+  "ref": { "type": "tag", "name": "v1.0.2" },
+  "commit": { "sha": "abcdef0123", "url": "https://github.com/...", "subject": "chore: release" },
+  "actor": "dev",
+  "durationSeconds": 1800,
+  "version": { "name": "1.0.2", "code": 10002 },
+  "builds": [
+    {
+      "name": "AAB (store)",
+      "kind": "aab",
+      "status": "success",
+      "link": "https://drive...",
+      "size": 167772160
+    },
+    {
+      "name": "APK (QA, universal)",
+      "kind": "apk",
+      "status": "failure",
+      "failedStep": "AAB to APK",
+      "logUrl": "https://..."
+    }
+  ],
+  "changelog": [
+    { "sha": "abcdef0123", "subject": "chore: release", "author": "dev", "url": "https://..." }
+  ],
+  "warnings": [],
+  "logUrl": "https://..."
+}
+```
+
+`kind` is `debug` or `release`; `phase` is `start` or `end` (default); `status` is `success`,
+`failure` or `cancelled` (default `success`; a `cancelled` or `failure` value in `jobs` wins);
+`jobs` maps job names to `needs.<job>.result`; `failedStep` is what failed, or the stage a
+cancelled run was in; `supersededBy` is `{ "number": 129, "url": "..." }`; `event`, `runner` and
+`startedAt` (already formatted) are shown as fields; `ref.type` is `branch`, `tag` or `pr`
+(`title` for a PR); `builds[].kind` is `normal`, `segment`, `aab` or `apk` (only `segment` builds
+are extras); `builds[].status` is `success`, `failure`, `skipped`, `cancelled` or `planned`;
+`fallback: true` marks a link to the GitHub artifact instead of Drive; `campaign: ""` shows as
+`(organic)`. Text fields must be strings (`version.code` and `run.number` may be numbers).
+
+```yaml
+- id: report
+  uses: actions/github-script@<sha>
+  with:
+    script: core.setOutput('json', JSON.stringify({ /* the report */ }))
+- if: always()
+  continue-on-error: true
+  uses: <owner>/ci-sdk/.github/actions/team-chat@runner
+  with:
+    webhook-url: ${{ secrets.CHAT_WEBHOOK_URL }}
+    report: ${{ steps.report.outputs.json }}
+```
+
+Preview without posting: `dry-run: true` with `payload-file: chat.json`.
 
 ## `compose-deploy` action
 
