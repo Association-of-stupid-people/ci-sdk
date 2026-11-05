@@ -1,0 +1,51 @@
+name: unity-force-segment
+description: Temporarily patch the vendored Adjust Unity SDK so every attribution is replaced by a forced UA segment (segment QA builds), then restore the files
+author: _MoonLight_ <moonlight8978@gmail.com>
+
+inputs:
+  mode:
+    description: '`list` prints the segment names of the config, `apply` patches the project, `restore` puts every file back (use it with `if: always()`)'
+    required: false
+    default: apply
+  config:
+    description: Segment file (YAML), relative to `project-path`
+    required: false
+    default: segment-ci.yml
+  segment:
+    description: 'apply: name of the segment, or `none`/empty to do nothing. list: filter, `all` (also when empty), `none` or comma-separated names'
+    required: false
+    default: ''
+  project-path:
+    description: Unity project root
+    required: false
+    default: '.'
+
+outputs:
+  segments:
+    description: 'list: JSON array of segment names, in file order'
+  count:
+    description: 'list: number of segments'
+  enabled:
+    description: '`true` when a segment was applied'
+  name:
+    description: Name of the applied segment
+  campaign:
+    description: Forced campaign
+  network:
+    description: Forced network
+  adgroup:
+    description: Forced adgroup
+  creative:
+    description: Forced creative
+  tracker-name:
+    description: Forced tracker name
+  country:
+    description: Forced IP country (empty when not forced)
+  json:
+    description: Applied segment as compact JSON (name, campaign, network, adgroup, creative, trackerName, country)
+  patched:
+    description: Newline-separated project-relative paths of the files changed or added
+
+runs:
+  using: node24
+  main: dist/index.js
