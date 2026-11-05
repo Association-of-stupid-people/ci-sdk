@@ -105,6 +105,15 @@ describe('list', () => {
     const out = await call({ mode: 'list', segment })
     expect(out['segments']).toBe(JSON.stringify(names))
     expect(out['count']).toBe(String(names.length))
+    expect((JSON.parse(out['details']!) as { name: string }[]).map(d => d.name)).toEqual(names)
+  })
+
+  it('details carry campaign, network and country', async () => {
+    const out = await call({ mode: 'list' })
+    expect(JSON.parse(out['details']!)).toEqual([
+      { name: 'qa', campaign: 'QA_X', network: 'ForcedSegment', country: '' },
+      { name: 'us', campaign: 'QA_US', network: 'ForcedSegment', country: 'US' }
+    ])
   })
 
   it('does not touch the project', async () => {
@@ -118,7 +127,7 @@ describe('list', () => {
 
   it('is empty, not an error, when the file is missing', async () => {
     await rm(path.join(project, 'segment-ci.yml'))
-    expect(await call({ mode: 'list' })).toEqual({ segments: '[]', count: '0' })
+    expect(await call({ mode: 'list' })).toEqual({ segments: '[]', details: '[]', count: '0' })
   })
 
   it('fails on an invalid file', async () => {

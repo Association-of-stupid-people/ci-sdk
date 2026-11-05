@@ -30,6 +30,7 @@ async function restore(projectPath: string, stateFile: string): Promise<void> {
 
 function setNoSegments(): void {
   core.setOutput('segments', '[]')
+  core.setOutput('details', '[]')
   core.setOutput('count', '0')
 }
 
@@ -59,6 +60,12 @@ export async function run(): Promise<void> {
     const names = listSegments(file, cfg.segment)
     core.info(`Segments: ${names.join(', ') || '(none)'}`)
     core.setOutput('segments', JSON.stringify(names))
+    // What a build table needs before any build (e.g. a chat message when the build starts).
+    const details = names.map(name => {
+      const s = file.segments.find(x => x.name === name)!
+      return { name, campaign: s.campaign, network: s.network, country: s.country ?? '' }
+    })
+    core.setOutput('details', JSON.stringify(details))
     core.setOutput('count', String(names.length))
     return
   }

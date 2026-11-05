@@ -23,6 +23,10 @@ inputs:
 outputs:
   segments:
     description: 'list: JSON array of segment names, in file order'
+  details:
+    description: >-
+      list: JSON array of the same segments with what a build table needs:
+      {"name", "campaign", "network", "country"} ("" when unset)
   count:
     description: 'list: number of segments'
   enabled:
