@@ -1,0 +1,69 @@
+name: aab-to-apk
+description: >-
+  Turn an Android App Bundle into one installable universal APK (bundletool build-apks --mode=universal),
+  signed with the same keystore, so QA tests exactly what goes to the store.
+
+inputs:
+  aab:
+    description: The .aab file
+    required: true
+  output:
+    description: APK to write (default the .aab path with .apk)
+    required: false
+  project-path:
+    description: >-
+      Unity project, for the default keystore (the one ProjectSettings names, else the one at the
+      project root; password = keystore file name)
+    required: false
+    default: '.'
+  signing:
+    description: '`release` (keystore required) or `debug` (bundletool debug key)'
+    required: false
+    default: release
+  keystore-base64:
+    description: >-
+      Keystore file, base64 (secret KEYSTORE_BASE64). With keystore-password, keystore-alias and
+      keystore-alias-password: all four, or all empty to use the project keystore.
+    required: false
+  keystore-password:
+    description: Keystore password (secret KEYSTORE_PASSWORD)
+    required: false
+  keystore-alias:
+    description: Key alias (secret KEYSTORE_ALIAS)
+    required: false
+  keystore-alias-password:
+    description: Key password (secret KEYSTORE_ALIAS_PASSWORD)
+    required: false
+  keystore-name:
+    description: Keystore file name without extension, preferred among several at the project root (default the repository name)
+    required: false
+  java-path:
+    description: java executable (default JAVA_HOME, then the OpenJDK of the Unity editor in editor-path, then PATH)
+    required: false
+  editor-path:
+    description: Unity editor executable (unity-build output editor-path), to use its Android OpenJDK
+    required: false
+  bundletool-version:
+    description: bundletool release (default the pinned one; another version needs bundletool-sha256)
+    required: false
+  bundletool-sha256:
+    description: sha256 of bundletool-all-<version>.jar, required with another bundletool-version
+    required: false
+  timeout:
+    description: Limit for bundletool
+    required: false
+    default: 20m
+
+outputs:
+  apk-path:
+    description: Absolute path of the universal APK
+  size:
+    description: APK size in bytes
+  java:
+    description: java used
+  bundletool:
+    description: bundletool jar used
+
+runs:
+  using: node24
+  main: dist/index.js
