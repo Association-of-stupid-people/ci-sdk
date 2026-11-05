@@ -1,0 +1,109 @@
+name: unity-android-build-script
+description: >-
+  Add a CI-only Unity Editor build script (signed AAB or APK, version from a tag) to a project for one build,
+  then put the project back exactly as it was. No build script needed in the game.
+
+inputs:
+  mode:
+    description: '`apply` (add the script, set up the keystore) or `restore` (always run it after the build)'
+    required: false
+    default: apply
+  project-path:
+    description: Unity project folder
+    required: false
+    default: '.'
+  format:
+    description: '`aab` (store) or `apk`'
+    required: false
+    default: aab
+  output:
+    description: Build output, relative to the project (default Builds/release.aab or Builds/release.apk)
+    required: false
+  version:
+    description: >-
+      Release version `vX.Y.Z` or `X.Y.Z` (e.g. the tag). Sets bundleVersion X.Y.Z and version code
+      X*10000+Y*100+Z for this build only. Empty keeps the project's values.
+    required: false
+  version-code:
+    description: Version code for this build only, instead of the one derived from `version`
+    required: false
+  development:
+    description: Development build
+    required: false
+    default: 'false'
+  signing:
+    description: '`release` (keystore required, see below) or `debug` (Unity debug key)'
+    required: false
+    default: release
+  keystore-base64:
+    description: >-
+      Keystore file, base64 (secret KEYSTORE_BASE64). With keystore-password, keystore-alias and
+      keystore-alias-password: all four, or all empty to use the project keystore (the one
+      ProjectSettings names, else the one at the project root, else the one committed in the
+      project; password = keystore file name).
+    required: false
+  keystore-password:
+    description: Keystore password (secret KEYSTORE_PASSWORD)
+    required: false
+  keystore-alias:
+    description: Key alias (secret KEYSTORE_ALIAS)
+    required: false
+  keystore-alias-password:
+    description: Key password (secret KEYSTORE_ALIAS_PASSWORD)
+    required: false
+  generate-keystore:
+    description: >-
+      `true`: the default branch is the reference (needs a git checkout and github-token). A
+      keystore git does not track is checked against it. With no keystore, the default branch's is
+      used, else one is generated (keytool, PKCS12, password = its name, alias = its name in lower
+      case, or the alias ProjectSettings gives that file name) and committed there (the job needs
+      `contents: write`). Never a second key: a different keystore on the default branch stops the
+      step. A failed commit is a warning (keystore-committed false).
+    required: false
+    default: 'false'
+  commit-keystore:
+    description: >-
+      `false`: do not commit a keystore that is not on the default branch here (keystore-committed
+      false); a later job with `contents: write` commits it to keystore-repo-path, so the build job
+      can stay read-only
+    required: false
+    default: 'true'
+  keystore-name:
+    description: Keystore file name without extension, preferred among several and used to generate one (default the repository name)
+    required: false
+  github-token:
+    description: Token to check the default branch and commit a keystore (generate-keystore); read access is enough with commit-keystore false
+    required: false
+    default: ${{ github.token }}
+  editor-path:
+    description: Unity editor executable, for keytool (default the editor of ProjectVersion.txt, found like unity-build; else JAVA_HOME, else any installed editor)
+    required: false
+
+outputs:
+  execute-method:
+    description: Pass to Unity with -executeMethod
+  output:
+    description: Absolute path of the build output
+  version-name:
+    description: bundleVersion of the build (empty = the project's)
+  version-code:
+    description: Version code of the build (empty = the project's)
+  keystore-path:
+    description: Keystore file used (pass to unity-build keystore-path)
+  keystore-source:
+    description: >-
+      `explicit` (inputs), `project-settings`, `project-file` (found at the project root or
+      committed in the project), `default-branch` (taken from the default branch), `generated`, or
+      empty (debug signing). The keystore outputs are set before the build script is added.
+  keystore-committed:
+    description: For a keystore not in this commit (generated, untracked, or from the default branch), `true` when it is on the default branch, `false` when it still has to be committed; empty otherwise
+  keystore-commit-url:
+    description: The commit that added the keystore (commit-keystore true)
+  keystore-repo-path:
+    description: The keystore's path in the repository (e.g. `Game/My-Game.keystore`) when it was taken from or is meant for the default branch
+  patched:
+    description: Project-relative paths added or changed, one per line
+
+runs:
+  using: node24
+  main: dist/index.js
