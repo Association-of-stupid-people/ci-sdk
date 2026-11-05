@@ -55,3 +55,17 @@ export {
   type GitHubResponse,
   type Query
 } from './github.js'
+export {
+  resolveKeystore,
+  removeWrittenKeystore,
+  verifyKeystore,
+  readProjectKeystoreSettings,
+  resolveProjectKeystorePath,
+  conventionalPassword,
+  conventionalAlias,
+  generateKeystore,
+  type GenerateKeystoreOptions,
+  type KeystoreInputs,
+  type ResolvedKeystore,
+  type ResolveKeystoreOptions
+} from './android-keystore.js'
