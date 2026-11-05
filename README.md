@@ -29,6 +29,7 @@ packages/
   run/                  NEW: run commands with retries, timeouts and a job summary
   unity-build/          NEW: replaces the unity-build composite (Docker by default, or host)
   unity-force-segment/  NEW: force a UA segment in the Adjust SDK for a QA build, then restore
+  gdrive-upload/        NEW: upload a file to a Google Shared Drive folder with a service account key
   compose-deploy/       NEW: SSH deploy of a Compose service (backup, pull, up, health, rollback)
   docker-smoke/         NEW: run a container, wait for health, dump logs, always clean up
   release-gate/         NEW: release waits for a green CI run of the same commit; tag == version
@@ -380,6 +381,39 @@ written atomically; one that cannot be read, or whose project folder is gone, is
   if: always()
   with:
     mode: restore
+```
+
+## `gdrive-upload` action
+
+Uploads one file (an APK, a build zip) into a folder of a Google **Shared Drive** with a service
+account key, and outputs `id`, `link` (webViewLink), `name` and `size`. No gcloud, no credentials
+file on the runner and no IAM role: the access token is minted from the key itself (OAuth 2.0 JWT
+bearer grant, signed RS256), and registered with the log masker.
+
+Inputs: `service-account-key` (JSON key, required), `folder-id` (required), `file` (required),
+`name` (default the local file name), `mime-type` (default from the extension), `attempts`
+(default 3).
+
+- The folder must be inside a Shared Drive that has the service account as a member (Content
+  manager). A My Drive folder shared with the service account fails with `storageQuotaExceeded`
+  (a service account has no storage of its own); the error says so, and it is not retried.
+- Resumable upload, streamed from disk (never held in memory). 429, 5xx and network errors are
+  retried with backoff; other 4xx errors (bad folder, auth, quota) fail at once.
+
+Upload from the job that built the file: a self-hosted runner often downloads GitHub artifacts
+far slower than it uploads, so a separate job that downloads every artifact to upload it again
+can cost minutes per file.
+
+```yaml
+- id: drive
+  if: env.HAVE_DRIVE == 'true'
+  uses: <owner>/ci-sdk/.github/actions/gdrive-upload@runner
+  with:
+    service-account-key: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY }}
+    folder-id: ${{ secrets.GDRIVE_FOLDER_ID }}
+    file: Builds/game.apk
+    name: game_${{ github.run_number }}.apk
+# ${{ steps.drive.outputs.link }}
 ```
 
 ## `compose-deploy` action
