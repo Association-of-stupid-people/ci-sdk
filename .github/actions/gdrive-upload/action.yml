@@ -1,0 +1,37 @@
+name: gdrive-upload
+description: Upload a file to a Google Shared Drive folder with a service account key (no gcloud, no IAM role)
+
+inputs:
+  service-account-key:
+    description: JSON key of a service account that is a member (Content manager) of the Shared Drive
+    required: true
+  folder-id:
+    description: Target folder id, inside a Shared Drive (a service account has no My Drive storage)
+    required: true
+  file:
+    description: Local file to upload
+    required: true
+  name:
+    description: File name on Drive (default the local file name)
+    required: false
+  mime-type:
+    description: MIME type (default from the extension; application/octet-stream when unknown)
+    required: false
+  attempts:
+    description: Upload attempts on network or server errors
+    required: false
+    default: '3'
+
+outputs:
+  id:
+    description: Drive file id
+  link:
+    description: Drive web link (webViewLink)
+  name:
+    description: File name on Drive
+  size:
+    description: Size in bytes
+
+runs:
+  using: node24
+  main: dist/index.js
