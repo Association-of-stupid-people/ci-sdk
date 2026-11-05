@@ -41,12 +41,12 @@ const segment = (name: string, ok = true, extra: Partial<Build> = {}): Build => 
 
 function debugReport(over: Partial<Report> = {}): Report {
   return {
-    name: 'BGPZ-005-Gem',
+    name: 'My-Game',
     kind: 'debug',
     status: 'success',
-    game: 'Gem Blast',
+    game: 'My Game',
     platform: 'Android',
-    project: { name: 'acme/BGPZ-005-Gem', url: 'https://github.com/acme/BGPZ-005-Gem' },
+    project: { name: 'acme/My-Game', url: 'https://github.com/acme/My-Game' },
     run: { url: RUN, number: 128 },
     ref: { type: 'branch', name: 'main' },
     commit: {
@@ -82,7 +82,7 @@ function debugReport(over: Partial<Report> = {}): Report {
 
 function releaseReport(over: Partial<Report> = {}): Report {
   return {
-    name: 'BGPZ-005-Gem',
+    name: 'My-Game',
     kind: 'release',
     status: 'success',
     platform: 'Android',
@@ -286,10 +286,10 @@ describe('hardening', () => {
 describe('buildPayload', () => {
   it('debug all green', () => {
     const p = buildPayload(debugReport(), { sdkVersion: '3.4.0' })
-    expect(p.text).toBe('✅ BGPZ-005-Gem · Debug #128 · 3/3 builds OK · 12m34s')
+    expect(p.text).toBe('✅ My-Game · Debug #128 · 3/3 builds OK · 12m34s')
     expect(find(p, 'header')[0]!.text).toEqual({
       type: 'plain_text',
-      text: '✅ BGPZ-005-Gem · Debug #128'
+      text: '✅ My-Game · Debug #128'
     })
     const fields = find(p, 'section')[0]!.fields!.map(f => f.text)
     expect(fields).toEqual([
@@ -297,7 +297,7 @@ describe('buildPayload', () => {
       '*Commit*\n<https://github.com/acme/Game/commit/abcdef0|abcdef0> feat: new level',
       '*Version*\n1.0.9 (19)',
       '*Duration*\n12m34s',
-      '*Game*\nGem Blast',
+      '*Game*\nMy Game',
       '*Build*\nAndroid · Debug',
       '*Triggered by*\ndev'
     ])
@@ -321,7 +321,7 @@ describe('buildPayload', () => {
       { type: 'alert', level: 'success', text: { type: 'mrkdwn', text: 'All 3 builds OK.' } }
     ])
     expect(find(p, 'context')[0]!.elements[0]!.text).toBe(
-      `GitHub Actions · <https://github.com/acme/BGPZ-005-Gem|acme/BGPZ-005-Gem> · <${RUN}|Run #128> · ci-sdk v3.4.0`
+      `GitHub Actions · <https://github.com/acme/My-Game|acme/My-Game> · <${RUN}|Run #128> · ci-sdk v3.4.0`
     )
     expect(checkLimits(p)).toEqual([])
   })
@@ -335,7 +335,7 @@ describe('buildPayload', () => {
       })
     )
     expect(p.text).toBe(
-      '⚠️ BGPZ-005-Gem · Debug #128 failed at segment organic-us · 2/3 builds OK · 12m34s'
+      '⚠️ My-Game · Debug #128 failed at segment organic-us · 2/3 builds OK · 12m34s'
     )
     const [alert] = find(p, 'alert')
     expect(alert!.level).toBe('warning')
@@ -354,7 +354,7 @@ describe('buildPayload', () => {
         builds: [{ name: 'Normal', kind: 'normal', status: 'failure', failedStep: 'Unity build' }]
       })
     )
-    expect(p.text.startsWith('❌ BGPZ-005-Gem · Debug #128 failed at Unity build')).toBe(true)
+    expect(p.text.startsWith('❌ My-Game · Debug #128 failed at Unity build')).toBe(true)
     const [alert] = find(p, 'alert')
     expect(alert!.level).toBe('error')
     expect(alert!.text.text).toBe(
@@ -366,8 +366,8 @@ describe('buildPayload', () => {
 
   it('release ready', () => {
     const p = buildPayload(releaseReport())
-    expect(p.text).toBe('🚀 BGPZ-005-Gem · Release v1.0.2 (10002) ready')
-    expect(find(p, 'header')[0]!.text.text).toBe('🚀 BGPZ-005-Gem · Release v1.0.2 (10002)')
+    expect(p.text).toBe('🚀 My-Game · Release v1.0.2 (10002) ready')
+    expect(find(p, 'header')[0]!.text.text).toBe('🚀 My-Game · Release v1.0.2 (10002)')
     const [alert] = find(p, 'alert')
     expect(alert).toEqual({
       type: 'alert',
@@ -392,7 +392,7 @@ describe('buildPayload', () => {
         ]
       })
     )
-    expect(failed.text).toBe('❌ BGPZ-005-Gem · Release v1.0.2 (10002) failed at AAB to APK')
+    expect(failed.text).toBe('❌ My-Game · Release v1.0.2 (10002) failed at AAB to APK')
     expect(find(failed, 'alert').map(a => a.level)).toEqual(['error'])
 
     const fallback = buildPayload(
@@ -413,7 +413,7 @@ describe('buildPayload', () => {
       })
     )
     expect(fallback.text).toBe(
-      '⚠️ BGPZ-005-Gem · Release v1.0.2 (10002) built · Upload to Drive (release APK) failed'
+      '⚠️ My-Game · Release v1.0.2 (10002) built · Upload to Drive (release APK) failed'
     )
     const [alert] = find(fallback, 'alert')
     expect(alert!.level).toBe('warning')
@@ -444,7 +444,7 @@ describe('buildPayload', () => {
       })
     )
     expect(p.text).toBe(
-      '❌ BGPZ-005-Gem · Release v1.2 failed at Release setup (tag vX.Y.Z or keystore)'
+      '❌ My-Game · Release v1.2 failed at Release setup (tag vX.Y.Z or keystore)'
     )
     expect(find(p, 'section')[0]!.fields!.some(f => f.text.startsWith('*Version*'))).toBe(false)
   })
@@ -513,9 +513,7 @@ describe('buildPayload', () => {
     )
     expect(find(p, 'table')).toEqual([])
     expect(find(p, 'alert')[0]!.level).toBe('error')
-    expect(p.text).toBe(
-      '❌ BGPZ-005-Gem · Debug #128 failed at Unity license · 0/0 builds OK · 12m34s'
-    )
+    expect(p.text).toBe('❌ My-Game · Debug #128 failed at Unity license · 0/0 builds OK · 12m34s')
     expect(checkLimits(p)).toEqual([])
   })
 })
@@ -604,8 +602,8 @@ describe('message lifecycle', () => {
 
   it('START (debug): planned outputs, info alert, no links or duration', () => {
     const p = buildPayload(debugStart())
-    expect(p.text).toBe('🛠️ BGPZ-005-Gem · Đang build Debug #128 · 7 bản (normal + 6 segment)')
-    expect(find(p, 'header')[0]!.text.text).toBe('🛠️ BGPZ-005-Gem · Đang build Debug #128')
+    expect(p.text).toBe('🛠️ My-Game · Đang build Debug #128 · 7 bản (normal + 6 segment)')
+    expect(find(p, 'header')[0]!.text.text).toBe('🛠️ My-Game · Đang build Debug #128')
     const fields = find(p, 'section')[0]!.fields!.map(f => f.text.split('\n')[0])
     expect(fields).toEqual([
       '*Branch*',
@@ -641,7 +639,7 @@ describe('message lifecycle', () => {
         status: 'planned' as const
       }))
     })
-    expect(p.text).toBe('🛠️ BGPZ-005-Gem · Đang build Release v1.0.2 (10002)')
+    expect(p.text).toBe('🛠️ My-Game · Đang build Release v1.0.2 (10002)')
     expect(find(p, 'table')[0]!.rows.map(r => r.map(cellText))).toEqual([
       ['Build', 'Status'],
       ['AAB (store)', '⏳ planned'],
@@ -664,7 +662,7 @@ describe('message lifecycle', () => {
       })
     )
     expect(p.text).toBe(
-      '🚫 BGPZ-005-Gem · Debug #128 cancelled after 12m34s · during segment builds · superseded by run #129'
+      '🚫 My-Game · Debug #128 cancelled after 12m34s · during segment builds · superseded by run #129'
     )
     const [alert] = find(p, 'alert')
     expect(alert!.level).toBe('default')
@@ -686,14 +684,14 @@ describe('message lifecycle', () => {
         builds: []
       })
     )
-    expect(p.text).toBe('🚫 BGPZ-005-Gem · Debug #128 cancelled')
+    expect(p.text).toBe('🚫 My-Game · Debug #128 cancelled')
     expect(find(p, 'alert')[0]!.text.text).toContain('Nothing finished before the cancel.')
   })
 })
 
 describe('parseReport', () => {
   it('accepts a report and ignores unknown keys', () => {
-    expect(parseReport(JSON.stringify({ ...debugReport(), extra: 1 })).name).toBe('BGPZ-005-Gem')
+    expect(parseReport(JSON.stringify({ ...debugReport(), extra: 1 })).name).toBe('My-Game')
   })
   it('lists every problem', () => {
     expect(() => parseReport('nope')).toThrow(/not valid JSON/)
@@ -883,7 +881,7 @@ describe('run', () => {
     expect(fetchImpl).not.toHaveBeenCalled()
     expect(out).toMatchObject({
       sent: 'false',
-      text: '🚀 BGPZ-005-Gem · Release v1.0.2 (10002) ready'
+      text: '🚀 My-Game · Release v1.0.2 (10002) ready'
     })
     const payload = JSON.parse(await readFile(payloadFile, 'utf8')) as Payload
     expect(checkLimits(payload)).toEqual([])

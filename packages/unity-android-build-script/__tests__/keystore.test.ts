@@ -462,13 +462,13 @@ describe('setupKeystore: no keystore in the project', () => {
     const asset = path.join(root, 'ProjectSettings', 'ProjectSettings.asset')
     await writeFile(
       asset,
-      "PlayerSettings:\n  AndroidKeystoreName: '{inproject}: blackgems.keystore'\n  AndroidKeyaliasName: blackgems\n"
+      "PlayerSettings:\n  AndroidKeystoreName: '{inproject}: old-key.keystore'\n  AndroidKeyaliasName: old-key\n"
     )
     const setup = await setupKeystore(options({ fetch: fakeGitHub().fetch }))
     expect(generated[0]?.alias).toBeUndefined()
     expect(setup.keystore.alias).toBe('my-game')
     expect(warnings()).toMatch(
-      /ProjectSettings\.asset names \{inproject\}: blackgems\.keystore, which is neither in this commit nor on main/
+      /ProjectSettings\.asset names \{inproject\}: old-key\.keystore, which is neither in this commit nor on main/
     )
     await rm(path.join(root, 'My-Game.keystore'))
     stdout.mockClear()

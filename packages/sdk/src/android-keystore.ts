@@ -22,8 +22,8 @@ import { exec } from './exec.js'
  *    must keep it, e.g. commit it: a key that is not kept breaks store updates).
  *
  * For 2 and 3, store password = key password = the keystore file name without its extension, and
- * the conventional alias is that name in lower case (`BGPZ-005-Gem.keystore`, password
- * `BGPZ-005-Gem`, alias `bgpz-005-gem`).
+ * the conventional alias is that name in lower case (`My-Game.keystore`, password
+ * `My-Game`, alias `my-game`).
  */
 export interface KeystoreInputs {
   /** The keystore file, base64 (e.g. the KEYSTORE_BASE64 secret). */
@@ -84,7 +84,7 @@ const CONVENTION =
   'password = <name>, alias = <name> in lower case; ' +
   'or set all of KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEYSTORE_ALIAS, KEYSTORE_ALIAS_PASSWORD.'
 
-/** A keystore file name that is safe as a password, an alias and a path: `BGPZ-005-Gem`. */
+/** A keystore file name that is safe as a password, an alias and a path: `My-Game`. */
 const KEYSTORE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/
 
 /** Unquote a YAML scalar as Unity writes it (`'a ''b'''`, `"a"`, or plain). */

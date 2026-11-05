@@ -669,15 +669,15 @@ Report (unknown keys are ignored; strings may be untrusted):
 
 ```json
 {
-  "name": "BGPZ-005-Gem",
+  "name": "My-Game",
   "kind": "release",
   "status": "failure",
   "failedStep": "AAB to APK",
-  "game": "Gem Blast",
+  "game": "My Game",
   "platform": "Android",
   "clean": false,
-  "project": { "name": "acme/BGPZ-005-Gem", "url": "https://github.com/acme/BGPZ-005-Gem" },
-  "run": { "url": "https://github.com/acme/BGPZ-005-Gem/actions/runs/1", "number": 131 },
+  "project": { "name": "acme/My-Game", "url": "https://github.com/acme/My-Game" },
+  "run": { "url": "https://github.com/acme/My-Game/actions/runs/1", "number": 131 },
   "ref": { "type": "tag", "name": "v1.0.2" },
   "commit": { "sha": "abcdef0123", "url": "https://github.com/...", "subject": "chore: release" },
   "actor": "dev",

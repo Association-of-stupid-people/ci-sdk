@@ -81,7 +81,7 @@ describe('ProjectSettings keystore fields', () => {
   })
 
   it('takes the file name without extension as the password', () => {
-    expect(conventionalPassword('/p/BGPZ-005-Gem.keystore')).toBe('BGPZ-005-Gem')
+    expect(conventionalPassword('/p/My-Game.keystore')).toBe('My-Game')
     expect(conventionalPassword('/p/release.v2.jks')).toBe('release.v2')
     expect(conventionalPassword('/p/noext')).toBe('noext')
   })
@@ -133,10 +133,10 @@ describe('resolveKeystore: project default', () => {
   })
 
   it('fails early when the file is missing, explaining the convention', async () => {
-    await writeSettings(settings("'{inproject}: blackgems.keystore'", 'blackgems'))
+    await writeSettings(settings("'{inproject}: old-key.keystore'", 'old-key'))
     await expect(
       resolveKeystore({ projectPath: project, inputs: {}, tempDir: temp })
-    ).rejects.toThrow(/blackgems\.keystore, which does not exist.*Convention: commit/)
+    ).rejects.toThrow(/old-key\.keystore, which does not exist.*Convention: commit/)
   })
 
   it('fails when ProjectSettings has no keystore', async () => {
@@ -158,7 +158,7 @@ describe('resolveKeystore: project default', () => {
 describe('resolveKeystore: a keystore at the project root', () => {
   it('uses the only one when ProjectSettings points to a missing file, with the conventional alias', async () => {
     await copyFile(PKCS12, path.join(project, 'My-Game.keystore'))
-    await writeSettings(settings("'{inproject}: blackgems.keystore'", 'blackgems'))
+    await writeSettings(settings("'{inproject}: old-key.keystore'", 'old-key'))
     const ks = await resolveKeystore({ projectPath: project, inputs: {}, tempDir: temp })
     expect(ks).toEqual({
       source: 'project-file',
@@ -220,7 +220,7 @@ describe('resolveKeystore: a keystore committed deeper in the project', () => {
       ['Keys/My-Game.keystore', 'Assets/Plugins/Android/debug.keystore'],
       ['Temp/Other.keystore']
     )
-    await writeSettings(settings("'{inproject}: blackgems.keystore'", 'blackgems'))
+    await writeSettings(settings("'{inproject}: old-key.keystore'", 'old-key'))
     expect(
       await resolveKeystore({ projectPath: project, inputs: {}, tempDir: temp })
     ).toMatchObject({
