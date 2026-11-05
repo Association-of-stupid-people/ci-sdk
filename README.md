@@ -28,6 +28,7 @@ packages/
   unity-project-info/   read ProjectSettings.asset (company, name, version, web size)
   run/                  NEW: run commands with retries, timeouts and a job summary
   unity-build/          NEW: replaces the unity-build composite (Docker by default, or host)
+  unity-force-segment/  NEW: force a UA segment in the Adjust SDK for a QA build, then restore
   compose-deploy/       NEW: SSH deploy of a Compose service (backup, pull, up, health, rollback)
   docker-smoke/         NEW: run a container, wait for health, dump logs, always clean up
   release-gate/         NEW: release waits for a green CI run of the same commit; tag == version
@@ -299,6 +300,87 @@ PlayerSettings.Android.keyaliasPass = Arg("-keystoreAliasPassword", "UNITY_KEYAL
 
 Also make the build method call `EditorApplication.Exit(1)` on failure; the action additionally
 fails on `Build Finished, Result: Failure` when Unity exits 0.
+
+## `unity-force-segment` action
+
+Builds a "segment QA" player, one build per segment of the segment file: `mode: list` returns the
+segment names (a matrix input), `mode: apply` temporarily patches the vendored Adjust Unity SDK (v5,
+namespace `AdjustSdk`) so every attribution Adjust calls back with is replaced by the forced one,
+and optionally the IP-country source; `mode: restore` puts every file back. Game code is never
+changed in the repository, so any game can test a UA segment. The patched files are for the CI
+build only and must never be committed.
+
+Inputs: `mode` (`apply` default, `restore` or `list`), `config` (segment file relative to
+`project-path`, default `segment-ci.yml`), `segment` (`apply`: a segment `name`, or `none`/empty to
+do nothing; `list`: a filter, see below), `project-path` (default `.`).
+
+```yaml
+# segment-ci.yml
+segments:
+  - name: iaproas-us # required, [a-z0-9][a-z0-9-]{0,39}, unique ("all" and "none" are reserved)
+    campaign: QA_IAPROAS # required key, may be "" (organic), max 200 chars
+    network: ForcedSegment # optional, default ForcedSegment
+    adgroup: '' # optional
+    creative: '' # optional
+    tracker-name: '' # optional, default "<network>::<campaign>"
+    country: US # optional ISO 3166-1 alpha-2; forces the IP country source too
+```
+
+The file is validated strictly (unknown keys, wrong types, duplicate names all fail with a clear
+message). Values are escaped for C# string literals.
+
+`mode: list` reads the file and outputs `segments` (compact JSON array of names, in file order) and
+`count`. The `segment` input filters: empty or `all` = every segment, `none` = `[]`, or a
+comma-separated list of names (each must exist; a filter with no name, like `,`, fails). A missing file gives `[]` / `0` with a notice. It
+changes nothing in the project. Typical use: a `list` job feeds
+`strategy.matrix.segment: ${{ fromJSON(needs.segments.outputs.segments) }}`, and each matrix job
+applies one segment. A matrix over `[]` fails the workflow, so guard the matrix job with
+`if: needs.<job>.outputs.count != '0'`.
+
+Outputs of `apply`: `enabled` (`true` when a segment was applied), `name`, `campaign`, `network`,
+`adgroup`, `creative`, `tracker-name`, `country`, `json` (the segment as one compact JSON object:
+`name`, `campaign`, `network`, `adgroup`, `creative`, `trackerName`, `country`, `""` when unset) and
+`patched` (newline-separated project-relative paths of the files changed or added). `enabled` is
+`false` (with a notice, not an error) when the segment is `none`/empty. A missing file or an unknown
+name fails.
+
+What `apply` changes:
+
+1. The single `*.cs` under `Assets` that declares `public static void InitSdk(AdjustConfig ...)`
+   inside `class Adjust` (normally `Assets/Adjust/Scripts/Adjust.cs`; the platform layers
+   `AdjustAndroid`/`AdjustiOS` are not it; `Library`, `Temp`, `obj`, hidden and `~` folders are
+   skipped; commented-out code never matches): the first statement of `InitSdk`, `GetAttribution` and, when present,
+   `GetAttributionWithTimeout` wraps the callback with `AdjustCiForcedSegment.Wrap` (in `InitSdk`
+   guarded by a null check, as the SDK's own check comes after). Each inserted
+   line ends with `// ci-sdk unity-force-segment`. `InitSdk` and `GetAttribution` are required
+   ("Adjust SDK layout not supported" otherwise), and so is a readable `GetAttributionWithTimeout`
+   when the file declares one. A file that already has the marker fails with
+   "already patched; run mode: restore first".
+2. A new `AdjustCiForcedSegment.cs` next to it (the forced values; the real attribution is replaced
+   even when Adjust answered nothing). An existing `.meta` is kept.
+3. With `country`: every `*.cs` with `public static [async] Task<string> GetIpCountryCodeAsync()` (the
+   Databuckets tracker) returns the country first. No such method fails the step.
+
+Line endings and the BOM of every edited file are kept. Before the first change the original bytes
+are saved to `$RUNNER_TEMP/ci-sdk-unity-force-segment/state.json` (OS temp dir when unset), so
+`restore` is byte-exact, also after an `apply` that died half way, and deletes the added file and
+its `.meta`. Without a state (e.g. a fresh `RUNNER_TEMP`), `restore` still deletes a generated
+`AdjustCiForcedSegment.cs` (and `.meta`) left under `Assets` by a hard-killed job, found by its
+header; when nothing is found it is a no-op notice. Call it before the first build too. `apply`
+first restores a state left by a job that never restored (self-hosted runners). The state is
+written atomically; one that cannot be read, or whose project folder is gone, is dropped.
+
+```yaml
+- uses: <owner>/ci-sdk/.github/actions/unity-force-segment@runner
+  with:
+    segment: ${{ inputs.segment }}
+- uses: <owner>/ci-sdk/.github/actions/unity-build@runner
+  # ...
+- uses: <owner>/ci-sdk/.github/actions/unity-force-segment@runner
+  if: always()
+  with:
+    mode: restore
+```
 
 ## `compose-deploy` action
 
