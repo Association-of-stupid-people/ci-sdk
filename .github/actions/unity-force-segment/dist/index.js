@@ -39061,6 +39061,7 @@ async function restore(projectPath, stateFile) {
 }
 function setNoSegments() {
     setOutput('segments', '[]');
+    setOutput('details', '[]');
     setOutput('count', '0');
 }
 async function run() {
@@ -39086,6 +39087,12 @@ async function run() {
         const names = listSegments(file, cfg.segment);
         info(`Segments: ${names.join(', ') || '(none)'}`);
         setOutput('segments', JSON.stringify(names));
+        // What a build table needs before any build (e.g. a chat message when the build starts).
+        const details = names.map(name => {
+            const s = file.segments.find(x => x.name === name);
+            return { name, campaign: s.campaign, network: s.network, country: s.country ?? '' };
+        });
+        setOutput('details', JSON.stringify(details));
         setOutput('count', String(names.length));
         return;
     }

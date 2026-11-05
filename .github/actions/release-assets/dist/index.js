@@ -38,8 +38,8 @@ import 'node:child_process';
 import { createHash } from 'node:crypto';
 import * as fs$1 from 'node:fs/promises';
 import { mkdtemp, writeFile as writeFile$1, rm as rm$1, readFile } from 'node:fs/promises';
-import os$1 from 'node:os';
 import path$1 from 'node:path';
+import os$1 from 'node:os';
 
 /** Base class for every error raised by the SDK. `code` is stable and safe to branch on. */
 class CiError extends Error {
