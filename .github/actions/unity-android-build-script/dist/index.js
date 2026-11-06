@@ -15,14 +15,14 @@ import require$$6 from 'util';
 import require$$0$1 from 'node:assert';
 import require$$0$3 from 'node:net';
 import require$$2 from 'node:http';
-import require$$0$2 from 'node:stream';
+import require$$0$2, { Transform, Readable } from 'node:stream';
 import require$$0 from 'node:buffer';
 import require$$0$4 from 'node:util';
 import require$$7 from 'node:querystring';
 import require$$8 from 'node:events';
 import require$$0$5 from 'node:diagnostics_channel';
 import require$$5, { createSecureContext } from 'node:tls';
-import require$$1$2 from 'node:zlib';
+import require$$1$2, { crc32, createInflateRaw } from 'node:zlib';
 import require$$5$1 from 'node:perf_hooks';
 import require$$8$1 from 'node:util/types';
 import require$$1$1 from 'node:worker_threads';
@@ -33,10 +33,11 @@ import require$$1$5 from 'node:dns';
 import require$$5$3 from 'string_decoder';
 import child from 'child_process';
 import 'timers';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync, readFileSync, readdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
-import { rm as rm$1, mkdir as mkdir$1, writeFile as writeFile$1, readFile, access as access$1, readdir as readdir$1, rename as rename$1, stat as stat$1 } from 'node:fs/promises';
+import { open as open$1, rm as rm$1, mkdir as mkdir$1, writeFile as writeFile$1, readFile, access as access$1, readdir as readdir$1, stat as stat$1, rename as rename$1, chmod as chmod$1, copyFile as copyFile$1 } from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
 import path$1 from 'node:path';
 import os$1 from 'node:os';
 
@@ -30215,6 +30216,152 @@ async function runAction(main) {
     }
 }
 
+const EOCD = 0x06054b50;
+const ZIP64_LOCATOR = 0x07064b50;
+const ZIP64_EOCD = 0x06064b50;
+const CENTRAL = 0x02014b50;
+const LOCAL = 0x04034b50;
+const MAX32 = 0xffffffff;
+const fail = (message) => {
+    throw new CiError('E_ZIP', message);
+};
+/** Central directory of a zip (zip64 included), read from the end of the file. */
+async function readEntries(file) {
+    const fh = await open$1(file, 'r');
+    try {
+        const { size: fileSize } = await fh.stat();
+        const tailSize = Math.min(fileSize, 22 + 0xffff);
+        const tail = Buffer.alloc(tailSize);
+        await fh.read(tail, 0, tailSize, fileSize - tailSize);
+        let eocd = -1;
+        for (let i = tailSize - 22; i >= 0; i--) {
+            if (tail.readUInt32LE(i) === EOCD) {
+                eocd = i;
+                break;
+            }
+        }
+        if (eocd < 0)
+            fail(`${file} is not a zip file`);
+        let count = tail.readUInt16LE(eocd + 10);
+        let cdSize = tail.readUInt32LE(eocd + 12);
+        let cdOffset = tail.readUInt32LE(eocd + 16);
+        if (count === 0xffff || cdSize === MAX32 || cdOffset === MAX32) {
+            const locator = eocd - 20;
+            if (locator < 0 || tail.readUInt32LE(locator) !== ZIP64_LOCATOR)
+                fail(`${file}: bad zip64`);
+            const z64Offset = Number(tail.readBigUInt64LE(locator + 8));
+            const z64 = Buffer.alloc(56);
+            await fh.read(z64, 0, 56, z64Offset);
+            if (z64.readUInt32LE(0) !== ZIP64_EOCD)
+                fail(`${file}: bad zip64 end record`);
+            count = Number(z64.readBigUInt64LE(32));
+            cdSize = Number(z64.readBigUInt64LE(40));
+            cdOffset = Number(z64.readBigUInt64LE(48));
+        }
+        const cd = Buffer.alloc(cdSize);
+        await fh.read(cd, 0, cdSize, cdOffset);
+        const entries = [];
+        let p = 0;
+        for (let n = 0; n < count; n++) {
+            if (cd.readUInt32LE(p) !== CENTRAL)
+                fail(`${file}: bad central directory`);
+            const nameLength = cd.readUInt16LE(p + 28);
+            const extraLength = cd.readUInt16LE(p + 30);
+            const commentLength = cd.readUInt16LE(p + 32);
+            const entry = {
+                flags: cd.readUInt16LE(p + 8),
+                method: cd.readUInt16LE(p + 10),
+                crc: cd.readUInt32LE(p + 16),
+                compressedSize: cd.readUInt32LE(p + 20),
+                size: cd.readUInt32LE(p + 24),
+                localOffset: cd.readUInt32LE(p + 42),
+                name: cd.toString('utf8', p + 46, p + 46 + nameLength)
+            };
+            // zip64 extra field: the 0xFFFFFFFF values follow in this order.
+            let e = p + 46 + nameLength;
+            const extraEnd = e + extraLength;
+            while (e + 4 <= extraEnd) {
+                const id = cd.readUInt16LE(e);
+                const len = cd.readUInt16LE(e + 2);
+                if (id === 0x0001) {
+                    let q = e + 4;
+                    const next = () => {
+                        const value = Number(cd.readBigUInt64LE(q));
+                        q += 8;
+                        return value;
+                    };
+                    if (entry.size === MAX32)
+                        entry.size = next();
+                    if (entry.compressedSize === MAX32)
+                        entry.compressedSize = next();
+                    if (entry.localOffset === MAX32)
+                        entry.localOffset = next();
+                }
+                e += 4 + len;
+            }
+            entries.push(entry);
+            p = extraEnd + commentLength;
+        }
+        return entries;
+    }
+    finally {
+        await fh.close();
+    }
+}
+/**
+ * Extract one entry of a zip to `dest`, streamed (stored or deflated), and check its size and
+ * CRC-32. A partial `dest` is removed on failure.
+ */
+async function extractZipEntry(file, name, dest) {
+    const entry = (await readEntries(file)).find(e => e.name === name);
+    if (!entry)
+        return fail(`${file} has no ${name}`);
+    if (entry.flags & 0x1)
+        fail(`${file}: ${name} is encrypted`);
+    if (entry.method !== 0 && entry.method !== 8) {
+        fail(`${file}: ${name} uses compression method ${entry.method}`);
+    }
+    const fh = await open$1(file, 'r');
+    let dataStart;
+    try {
+        const local = Buffer.alloc(30);
+        await fh.read(local, 0, 30, entry.localOffset);
+        if (local.readUInt32LE(0) !== LOCAL)
+            fail(`${file}: bad local header for ${name}`);
+        dataStart = entry.localOffset + 30 + local.readUInt16LE(26) + local.readUInt16LE(28);
+    }
+    finally {
+        await fh.close();
+    }
+    let crc = 0;
+    let size = 0;
+    const check = new Transform({
+        transform(chunk, _encoding, done) {
+            crc = crc32(chunk, crc);
+            size += chunk.length;
+            done(null, chunk);
+        }
+    });
+    const source = entry.compressedSize === 0
+        ? Readable.from([])
+        : createReadStream(file, { start: dataStart, end: dataStart + entry.compressedSize - 1 });
+    try {
+        if (entry.method === 8)
+            await pipeline(source, createInflateRaw(), check, createWriteStream(dest));
+        else
+            await pipeline(source, check, createWriteStream(dest));
+        if (size !== entry.size)
+            fail(`${file}: ${name} is corrupt (${size} bytes, expected ${entry.size})`);
+        if (crc >>> 0 !== entry.crc >>> 0)
+            fail(`${file}: ${name} is corrupt (CRC-32 mismatch)`);
+    }
+    catch (err) {
+        await rm$1(dest, { force: true });
+        throw err;
+    }
+    return size;
+}
+
 /** A GitHub REST call returned a non-2xx status. `status` is the HTTP status code. */
 class GitHubApiError extends CiError {
     status;
@@ -30355,7 +30502,7 @@ const CONVENTION = 'Convention: commit <name>.keystore (PKCS12) at the project r
     'Publishing Settings: ProjectSettings.asset AndroidKeystoreName / AndroidKeyaliasName), store and key ' +
     'password = <name>, alias = <name> in lower case; ' +
     'or set all of KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEYSTORE_ALIAS, KEYSTORE_ALIAS_PASSWORD.';
-/** A keystore file name that is safe as a password, an alias and a path: `BGPZ-005-Gem`. */
+/** A keystore file name that is safe as a password, an alias and a path: `My-Game`. */
 const KEYSTORE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 /** Unquote a YAML scalar as Unity writes it (`'a ''b'''`, `"a"`, or plain). */
 function yamlScalar(raw) {
@@ -31104,6 +31251,105 @@ async function setupKeystore(o) {
     return commit(file, repoPath, keystore, 'generated');
 }
 
+/**
+ * Pinned release: https://www.nuget.org/packages/Obfuscar/2.2.38 (the nupkg's sha256). The console
+ * exe inside it targets .NET Framework 4.6.2, so Unity's bundled Mono (MonoBleedingEdge) runs it in
+ * the build without a separate .NET install.
+ */
+const PINNED_OBFUSCAR = {
+    version: '2.2.38',
+    sha256: 'b4c90a7cba01d2b86b85b2f3b285b63e09731b3030f7e9fe7cfc6297f9b720fa'
+};
+/** The entry to extract from the nupkg (a zip), and the name it is cached and copied under. */
+const OBFUSCAR_ENTRY = 'tools/Obfuscar.Console.exe';
+const OBFUSCAR_EXE = 'Obfuscar.Console.exe';
+const obfuscarUrl = (version) => `https://api.nuget.org/v3-flatcontainer/obfuscar/${version.toLowerCase()}/obfuscar.${version.toLowerCase()}.nupkg`;
+async function sha256File(file) {
+    const hash = createHash('sha256');
+    for await (const chunk of createReadStream(file))
+        hash.update(chunk);
+    return hash.digest('hex');
+}
+/**
+ * The Obfuscar console exe from the tool cache, its nupkg downloaded once per version. The nupkg's
+ * sha256 is checked on download and again on every reuse (a persistent runner's cache could have
+ * been changed), and the exe is always re-extracted from the verified nupkg — so the file that runs
+ * under Unity's Mono is never trusted blindly, even if it was tampered with in place. The zip reader
+ * verifies the entry's size and CRC-32 on extraction.
+ * @returns the exe path.
+ */
+async function ensureObfuscar(options) {
+    const { version } = options;
+    const expected = options.sha256.toLowerCase();
+    const log = options.log ?? (() => undefined);
+    const dir = path$1.join(options.toolCache || path$1.join(os$1.tmpdir(), 'ci-sdk-tool-cache'), 'obfuscar', version);
+    const nupkg = path$1.join(dir, `obfuscar.${version}.nupkg`);
+    const exe = path$1.join(dir, OBFUSCAR_EXE);
+    // Make sure a nupkg matching the pinned sha256 is cached, downloading it if missing or changed.
+    let valid = false;
+    try {
+        await stat$1(nupkg);
+        if ((await sha256File(nupkg)) === expected)
+            valid = true;
+        else {
+            log(`Cached ${nupkg} does not match its sha256: downloading it again`);
+            await rm$1(nupkg, { force: true });
+        }
+    }
+    catch {
+        // not cached yet
+    }
+    if (!valid) {
+        const url = obfuscarUrl(version);
+        log(`Download ${url}`);
+        // A stalled download must not hang the release job until the workflow's hard timeout.
+        let bytes;
+        try {
+            const res = await (options.fetchImpl ?? fetch)(url, {
+                signal: AbortSignal.timeout(5 * 60_000)
+            });
+            if (!res.ok)
+                throw new CiError('E_OBFUSCAR', `Obfuscar download failed: ${res.status} ${url}`);
+            bytes = Buffer.from(await res.arrayBuffer());
+        }
+        catch (err) {
+            if (err instanceof DOMException &&
+                (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+                throw new CiError('E_OBFUSCAR', `Obfuscar download timed out after 5 minutes: ${url}`);
+            }
+            throw err;
+        }
+        const actual = createHash('sha256').update(bytes).digest('hex');
+        if (actual !== expected) {
+            throw new CiError('E_OBFUSCAR', `Obfuscar ${version} sha256 mismatch: expected ${expected}, got ${actual} (${url})`);
+        }
+        await mkdir$1(dir, { recursive: true });
+        const nupkgPart = `${nupkg}.${process.pid}.part`;
+        try {
+            await writeFile$1(nupkgPart, bytes);
+            await rename$1(nupkgPart, nupkg);
+        }
+        catch (err) {
+            await rm$1(nupkgPart, { force: true });
+            throw err;
+        }
+    }
+    // Always derive the exe from the verified nupkg (write-then-replace, cleaning a partial).
+    const part = `${exe}.${process.pid}.part`;
+    try {
+        await extractZipEntry(nupkg, OBFUSCAR_ENTRY, part);
+        // Harmless on Windows; lets the file be read as a tool on POSIX runners.
+        await chmod$1(part, 0o755).catch(() => undefined);
+        await rm$1(exe, { force: true });
+        await rename$1(part, exe);
+    }
+    catch (err) {
+        await rm$1(part, { force: true });
+        throw err;
+    }
+    return exe;
+}
+
 const GENERATED_HEADER = 'Generated by ci-sdk unity-android-build-script';
 /** Folder under Assets that holds the generated script (its own editor-only assembly). */
 const GENERATED_DIR = 'Assets/CiSdkBuild';
@@ -31127,6 +31373,10 @@ function csLiteral(value) {
         throw new Error('control characters cannot go in a C# string');
     return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
 }
+/** A C# `new string[] { ... }` literal. */
+function csStringArray(values) {
+    return `new string[] { ${values.map(v => csLiteral(v)).join(', ')} }`;
+}
 function asmdefSource() {
     return `${JSON.stringify({
         name: 'CiSdkBuild.Editor',
@@ -31134,7 +31384,10 @@ function asmdefSource() {
         includePlatforms: ['Editor'],
         excludePlatforms: [],
         allowUnsafeCode: false,
-        overrideReferences: false,
+        // Reference no precompiled plugin DLLs: a game plugin that exposes a global-namespace type
+        // named Debug, Path, File or Environment would otherwise shadow the script's `using`-resolved
+        // types and break its compilation. The script needs only UnityEngine, UnityEditor and the BCL.
+        overrideReferences: true,
         precompiledReferences: [],
         autoReferenced: false,
         defineConstraints: [],
@@ -31142,10 +31395,16 @@ function asmdefSource() {
         noEngineReferences: false
     }, null, 4)}\n`;
 }
+const IL2CPP_CONFIG = {
+    release: 'Il2CppCompilerConfiguration.Release',
+    debug: 'Il2CppCompilerConfiguration.Debug',
+    master: 'Il2CppCompilerConfiguration.Master'
+};
 /** The editor script: one static method that builds, signs and exits non-zero on failure. */
 function buildScriptSource(o) {
     const b = (v) => (v ? 'true' : 'false');
     const k = o.keystore;
+    const obf = o.obfuscate;
     return `// ${GENERATED_HEADER}. CI build only, never commit.
 using System;
 using System.Collections.Generic;
@@ -31170,6 +31429,8 @@ namespace CiSdk.Build
         private static readonly string KeystorePass = ${csLiteral(k.password)};
         private static readonly string KeyaliasName = ${csLiteral(k.alias)};
         private static readonly string KeyaliasPass = ${csLiteral(k.aliasPassword)};
+        // "" keeps the project's scripting backend; "il2cpp"/"mono2x" force it for this build only.
+        private static readonly string ScriptingBackend = ${csLiteral(o.scriptingBackend)};
 
         public static void Build()
         {
@@ -31213,6 +31474,9 @@ namespace CiSdk.Build
             var oldKeyaliasName = PlayerSettings.Android.keyaliasName;
             var oldAppBundle = EditorUserBuildSettings.buildAppBundle;
             var oldExport = EditorUserBuildSettings.exportAsGoogleAndroidProject;
+            var oldBackend = PlayerSettings.GetScriptingBackend(BuildTargetGroup.Android);
+            var oldIl2CppConfig = PlayerSettings.GetIl2CppCompilerConfiguration(BuildTargetGroup.Android);
+            var oldArchitectures = PlayerSettings.Android.targetArchitectures;
             try
             {
                 if (VersionName.Length > 0)
@@ -31225,6 +31489,24 @@ namespace CiSdk.Build
                 }
                 EditorUserBuildSettings.buildAppBundle = AppBundle;
                 EditorUserBuildSettings.exportAsGoogleAndroidProject = false;
+
+                if (ScriptingBackend == "il2cpp")
+                {
+                    PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, ScriptingImplementation.IL2CPP);
+                    PlayerSettings.SetIl2CppCompilerConfiguration(BuildTargetGroup.Android, ${IL2CPP_CONFIG[o.il2cppConfiguration]});
+                    // The Play Store requires a 64-bit variant: add ARM64 if the project lacks it.
+                    if ((PlayerSettings.Android.targetArchitectures & AndroidArchitecture.ARM64) == 0)
+                    {
+                        PlayerSettings.Android.targetArchitectures = oldArchitectures | AndroidArchitecture.ARM64;
+                        Debug.Log("[ci-sdk] IL2CPP: added ARM64 to the Android target architectures for this build");
+                    }
+                    Debug.Log("[ci-sdk] Scripting backend forced to IL2CPP (" + ${csLiteral(o.il2cppConfiguration)} + ")");
+                }
+                else if (ScriptingBackend == "mono2x")
+                {
+                    PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, ScriptingImplementation.Mono2x);
+                    Debug.Log("[ci-sdk] Scripting backend forced to Mono2x");
+                }
 
                 if (ReleaseSigning)
                 {
@@ -31305,15 +31587,265 @@ namespace CiSdk.Build
                 PlayerSettings.Android.keyaliasPass = "";
                 EditorUserBuildSettings.buildAppBundle = oldAppBundle;
                 EditorUserBuildSettings.exportAsGoogleAndroidProject = oldExport;
+                PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, oldBackend);
+                PlayerSettings.SetIl2CppCompilerConfiguration(BuildTargetGroup.Android, oldIl2CppConfig);
+                PlayerSettings.Android.targetArchitectures = oldArchitectures;
             }
         }
     }
+${obf.mode === 'off' ? '' : obfuscateHookSource(obf)}}
+`;
 }
+/**
+ * The `IPostBuildPlayerScriptDLLs` hook that obfuscates the game's managed assemblies after Unity
+ * compiles them and before IL2CPP turns them into C++, so renamed symbols and hidden strings end
+ * up in the native library and `global-metadata.dat`. It runs Obfuscar with Unity's own Mono, so no
+ * .NET install is needed.
+ *
+ * `full` renames too; its auto-generated config keeps the public API and skips every type Unity
+ * binds by name — those deriving from `UnityEngine.Object` (MonoBehaviour, ScriptableObject, ...),
+ * `[Serializable]` types and enums — so serialized fields and lifecycle methods are never renamed.
+ * Reflection or string-based lookups (`Type.GetType`, `AddComponent("Name")`, `SendMessage`) are
+ * out of reach of this analysis: validate a `full` build before shipping, and add exclusions with
+ * `obfuscate-config` when needed. `strings` only hides string literals and renames nothing.
+ */
+function obfuscateHookSource(obf) {
+    return `
+    public class CiSdkObfuscate : UnityEditor.Build.IPostBuildPlayerScriptDLLs
+    {
+        private const string Mode = ${csLiteral(obf.mode)};
+        // Project-relative; resolved against the project root (docker maps it to /project).
+        private const string ExeRelative = ${csLiteral(obf.exe)};
+        private const string ExtraRulesRelative = ${csLiteral(obf.config)};
+        private static readonly string[] Assemblies = ${csStringArray(obf.assemblies)};
+
+        public int callbackOrder { get { return 0; } }
+
+        public void OnPostBuildPlayerScriptDLLs(BuildReport report)
+        {
+            if (Mode == "off") return;
+            try
+            {
+                Obfuscate();
+            }
+            catch (Exception e)
+            {
+                throw new UnityEditor.Build.BuildFailedException("[ci-sdk] Obfuscation failed: " + e.Message);
+            }
+        }
+
+        private static void Obfuscate()
+        {
+            var root = Path.GetDirectoryName(Application.dataPath);
+            var exe = Path.GetFullPath(Path.Combine(root, ExeRelative));
+            if (!File.Exists(exe))
+                throw new FileNotFoundException("Obfuscar exe not found: " + exe);
+
+            var managed = FindManagedDir(root);
+            foreach (var name in Assemblies)
+            {
+                if (!File.Exists(Path.Combine(managed, name + ".dll")))
+                    throw new FileNotFoundException("assembly to obfuscate not found in the staging area: "
+                        + name + ".dll in " + managed);
+            }
+
+            var outDir = Path.Combine(root, "Temp", "ci-sdk-obfuscar-out");
+            if (Directory.Exists(outDir)) Directory.Delete(outDir, true);
+            Directory.CreateDirectory(outDir);
+
+            var configPath = Path.Combine(outDir, "ci-sdk-obfuscar.xml");
+            File.WriteAllText(configPath, GenerateConfig(managed, outDir, root));
+
+            var mono = FindMono();
+            Debug.Log("[ci-sdk] Obfuscating " + string.Join(", ", Assemblies) + " (mode " + Mode
+                + ") in " + managed);
+            var exit = RunProcess(mono, Quote(exe) + " " + Quote(configPath), root);
+            if (exit != 0)
+                throw new Exception("Obfuscar exited with code " + exit + " (see the log above)");
+
+            foreach (var name in Assemblies)
+            {
+                var obfuscated = Path.Combine(outDir, name + ".dll");
+                if (!File.Exists(obfuscated))
+                    throw new FileNotFoundException("Obfuscar did not produce " + obfuscated);
+                File.Copy(obfuscated, Path.Combine(managed, name + ".dll"), true);
+                Debug.Log("[ci-sdk] Obfuscated " + name + ".dll");
+            }
+        }
+
+        private static bool HasAll(string dir)
+        {
+            foreach (var name in Assemblies)
+                if (!File.Exists(Path.Combine(dir, name + ".dll"))) return false;
+            return true;
+        }
+
+        private static string FindManagedDir(string root)
+        {
+            var known = new List<string>
+            {
+                Path.Combine(root, "Temp", "StagingArea", "Data", "Managed"),
+                Path.Combine(root, "Temp", "StagingArea", "assets", "bin", "Data", "Managed"),
+            };
+            foreach (var dir in known)
+                if (Directory.Exists(dir) && HasAll(dir)) return dir;
+
+            var temp = Path.Combine(root, "Temp");
+            if (Directory.Exists(temp))
+            {
+                var hit = Directory.GetDirectories(temp, "*", SearchOption.AllDirectories)
+                    .Where(HasAll)
+                    .OrderByDescending(d => Directory.GetLastWriteTimeUtc(d))
+                    .FirstOrDefault();
+                if (hit != null) return hit;
+            }
+            throw new DirectoryNotFoundException(
+                "could not find the compiled player assemblies under " + temp
+                + " (looked for " + string.Join(", ", Assemblies.Select(a => a + ".dll").ToArray()) + ")");
+        }
+
+        private static string FindMono()
+        {
+            var data = EditorApplication.applicationContentsPath;
+            var isWindows = Application.platform == RuntimePlatform.WindowsEditor;
+            var exe = isWindows ? "mono.exe" : "mono";
+            var candidates = new[]
+            {
+                Path.Combine(data, "MonoBleedingEdge", "bin", exe),
+                Path.Combine(data, "Mono", "bin", exe),
+            };
+            foreach (var candidate in candidates)
+                if (File.Exists(candidate)) return candidate;
+            return exe; // fall back to PATH
+        }
+
+        // A double-quote, built from its code point so the generated source needs no escaping.
+        private static readonly string Q = ((char)34).ToString();
+
+        private static string Xml(string value)
+        {
+            return value
+                .Replace("&", "&amp;")
+                .Replace("<", "&lt;")
+                .Replace(">", "&gt;")
+                .Replace(Q, "&quot;");
+        }
+
+        private static string Attr(string name, string value)
+        {
+            return " " + name + "=" + Q + Xml(value) + Q;
+        }
+
+        private static string Quote(string value)
+        {
+            return Q + value + Q;
+        }
+
+        private static string GenerateConfig(string managed, string outDir, string root)
+        {
+            var full = Mode == "full";
+            var extra = "";
+            if (!string.IsNullOrEmpty(ExtraRulesRelative))
+            {
+                var rulesPath = Path.GetFullPath(Path.Combine(root, ExtraRulesRelative));
+                if (!File.Exists(rulesPath))
+                    throw new FileNotFoundException("obfuscate-config not found: " + rulesPath);
+                extra = File.ReadAllText(rulesPath);
+            }
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("<?xml version=" + Q + "1.0" + Q + " encoding=" + Q + "utf-8" + Q + "?>");
+            sb.AppendLine("<Obfuscator>");
+            sb.AppendLine("  <Var" + Attr("name", "InPath") + Attr("value", managed) + " />");
+            sb.AppendLine("  <Var" + Attr("name", "OutPath") + Attr("value", outDir) + " />");
+            sb.AppendLine("  <Var" + Attr("name", "KeepPublicApi") + Attr("value", "true") + " />");
+            sb.AppendLine("  <Var" + Attr("name", "HidePrivateApi") + Attr("value", full ? "true" : "false") + " />");
+            sb.AppendLine("  <Var" + Attr("name", "RenameProperties") + Attr("value", full ? "true" : "false") + " />");
+            sb.AppendLine("  <Var" + Attr("name", "RenameEvents") + Attr("value", full ? "true" : "false") + " />");
+            sb.AppendLine("  <Var" + Attr("name", "ReuseNames") + Attr("value", "true") + " />");
+            sb.AppendLine("  <Var" + Attr("name", "UseUnicodeNames") + Attr("value", "false") + " />");
+            sb.AppendLine("  <Var" + Attr("name", "HideStrings") + Attr("value", "true") + " />");
+            sb.AppendLine("  <Var" + Attr("name", "SuppressIldasm") + Attr("value", "true") + " />");
+            sb.AppendLine("  <AssemblySearchPath" + Attr("path", managed) + " />");
+            foreach (var name in Assemblies)
+            {
+                sb.AppendLine("  <Module" + Attr("file", Path.Combine(managed, name + ".dll")) + ">");
+                if (full)
+                {
+                    foreach (var typeName in RiskyTypeNames(name))
+                        sb.AppendLine("    <SkipType" + Attr("name", typeName) + Attr("skipMethods", "true") + Attr("skipFields", "true") + Attr("skipProperties", "true") + Attr("skipEvents", "true") + " />");
+                }
+                if (!string.IsNullOrEmpty(extra))
+                    sb.AppendLine(extra);
+                sb.AppendLine("  </Module>");
+            }
+            sb.AppendLine("</Obfuscator>");
+            return sb.ToString();
+        }
+
+        // Types Unity binds by name. A bare SkipType only keeps the type name; with HidePrivateApi the
+        // private fields and methods would still be renamed, so the config also sets skipMethods,
+        // skipFields, skipProperties and skipEvents. String hiding still applies inside them.
+        // Types declared under #if !UNITY_EDITOR are not seen in the editor domain, so they are not
+        // auto-skipped: validate a full build and add obfuscate-config exclusions when needed.
+        private static IEnumerable<string> RiskyTypeNames(string assemblyName)
+        {
+            var assembly = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => a.GetName().Name == assemblyName);
+            if (assembly == null) yield break;
+            Type[] types;
+            try
+            {
+                types = assembly.GetTypes();
+            }
+            catch (System.Reflection.ReflectionTypeLoadException ex)
+            {
+                types = ex.Types.Where(t => t != null).ToArray();
+            }
+            var unityObject = typeof(UnityEngine.Object);
+            foreach (var type in types)
+            {
+                if (type == null) continue;
+                var risky = unityObject.IsAssignableFrom(type) || type.IsEnum || type.IsSerializable;
+                if (risky)
+                    yield return type.FullName.Replace('+', '/');
+            }
+        }
+
+        private static int RunProcess(string file, string arguments, string workingDir)
+        {
+            var info = new System.Diagnostics.ProcessStartInfo(file, arguments)
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                WorkingDirectory = workingDir,
+            };
+            using (var process = new System.Diagnostics.Process())
+            {
+                process.StartInfo = info;
+                process.OutputDataReceived += (s, e) => { if (e.Data != null) Debug.Log("[Obfuscar] " + e.Data); };
+                process.ErrorDataReceived += (s, e) => { if (e.Data != null) Debug.LogWarning("[Obfuscar] " + e.Data); };
+                process.Start();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+                process.WaitForExit();
+                return process.ExitCode;
+            }
+        }
+    }
 `;
 }
 
 /** Unity rewrites it when the build script changes PlayerSettings: saved and put back byte-exact. */
 const PROJECT_SETTINGS = 'ProjectSettings/ProjectSettings.asset';
+/**
+ * Project-root dot-folder for the Obfuscar exe (Unity ignores `.`-folders, so it is never imported;
+ * under the project so docker mode, which mounts only the project, sees it). The path baked into the
+ * build script is `${OBFUSCAR_DIR}/${OBFUSCAR_EXE}`.
+ */
+const OBFUSCAR_DIR = '.ci-sdk-obfuscar';
+const obfuscarExeRelative = `${OBFUSCAR_DIR}/${OBFUSCAR_EXE}`;
 function workDir(env = process.env) {
     return path$1.join(env['RUNNER_TEMP'] || os$1.tmpdir(), 'ci-sdk-unity-android-build-script');
 }
@@ -31338,9 +31870,25 @@ async function generatedDirIsOurs(root) {
         return false;
     }
 }
+// Retries: on Windows an EBUSY/EPERM from Unity or an AV scanner can fail an otherwise fine remove.
 async function removeWithMeta(target) {
-    await rm$1(target, { recursive: true, force: true });
-    await rm$1(`${target}.meta`, { force: true });
+    await rm$1(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    await rm$1(`${target}.meta`, { force: true, maxRetries: 5, retryDelay: 200 });
+}
+/** writeFile with the Windows EBUSY/EPERM retries that rm has built in (writeFile has none). */
+async function writeFileRetry(file, data) {
+    for (let attempt = 0;; attempt++) {
+        try {
+            await writeFile$1(file, data);
+            return;
+        }
+        catch (err) {
+            const code = err.code;
+            if (attempt >= 5 || (code !== 'EBUSY' && code !== 'EPERM' && code !== 'EACCES'))
+                throw err;
+            await new Promise(resolve => setTimeout(resolve, 200));
+        }
+    }
 }
 /**
  * Add the generated build script. The project settings are saved first (Unity rewrites them during
@@ -31371,7 +31919,7 @@ async function applyPatch(options) {
         version: 1,
         root,
         files: [{ path: PROJECT_SETTINGS, original: settings.toString('base64') }],
-        added: [GENERATED_DIR],
+        added: options.obfuscarExeSrc ? [GENERATED_DIR, OBFUSCAR_DIR] : [GENERATED_DIR],
         keystore: options.writtenKeystore
     };
     await mkdir$1(path$1.dirname(options.stateFile), { recursive: true });
@@ -31381,7 +31929,21 @@ async function applyPatch(options) {
     await mkdir$1(dir, { recursive: true });
     await writeFile$1(path$1.join(dir, SCRIPT_FILE), buildScriptSource(options.script), 'utf8');
     await writeFile$1(path$1.join(dir, ASMDEF_FILE), asmdefSource(), 'utf8');
-    return [`${GENERATED_DIR}/${SCRIPT_FILE}`, `${GENERATED_DIR}/${ASMDEF_FILE}`, PROJECT_SETTINGS];
+    const added = [
+        `${GENERATED_DIR}/${SCRIPT_FILE}`,
+        `${GENERATED_DIR}/${ASMDEF_FILE}`,
+        PROJECT_SETTINGS
+    ];
+    // Always clear a stale Obfuscar folder (ours by name, Unity-ignored, never committed), e.g. one
+    // left by a killed obfuscate job whose state is gone; recreate it only when obfuscating now.
+    const obfuscarDir = path$1.join(root, OBFUSCAR_DIR);
+    await removeWithMeta(obfuscarDir);
+    if (options.obfuscarExeSrc) {
+        await mkdir$1(obfuscarDir, { recursive: true });
+        await copyFile$1(options.obfuscarExeSrc, path$1.join(root, obfuscarExeRelative));
+        added.push(obfuscarExeRelative);
+    }
+    return added;
 }
 /**
  * Put the saved files back, remove the added ones (with their `.meta`) and the written keystore.
@@ -31411,7 +31973,7 @@ async function restorePatch(stateFile) {
     try {
         if (await exists(state.root)) {
             for (const saved of state.files) {
-                await writeFile$1(path$1.join(state.root, saved.path), Buffer.from(saved.original, 'base64'));
+                await writeFileRetry(path$1.join(state.root, saved.path), Buffer.from(saved.original, 'base64'));
             }
             for (const added of state.added)
                 await removeWithMeta(path$1.join(state.root, added));
@@ -31447,6 +32009,11 @@ async function removeStale(projectRoot, keysDir) {
     if (await generatedDirIsOurs(root)) {
         await removeWithMeta(path$1.join(root, GENERATED_DIR));
         removed.push(GENERATED_DIR);
+    }
+    // The Obfuscar dot-folder is ours by name (only this action creates it).
+    if (await exists(path$1.join(root, OBFUSCAR_DIR))) {
+        await removeWithMeta(path$1.join(root, OBFUSCAR_DIR));
+        removed.push(OBFUSCAR_DIR);
     }
     let keys = [];
     try {
@@ -31495,6 +32062,21 @@ function parseVersionCode(raw) {
     return code;
 }
 
+/** Split a comma/newline list of assembly names, drop a trailing `.dll`, and validate. */
+function parseAssemblies(raw) {
+    const names = raw
+        .split(/\r?\n|,/)
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(s => (s.toLowerCase().endsWith('.dll') ? s.slice(0, -4) : s));
+    if (names.length === 0)
+        throw new Error('must name at least one assembly');
+    for (const name of names) {
+        if (/[\\/]/.test(name))
+            throw new Error(`assembly name must not contain a path separator: ${name}`);
+    }
+    return [...new Set(names)];
+}
 const choice = (...values) => (raw) => {
     const value = raw.trim().toLowerCase();
     if (!values.includes(value))
@@ -31519,7 +32101,14 @@ async function run() {
         commitKeystore: input.boolean({ name: 'commit-keystore', default: true }),
         keystoreName: input.string({ name: 'keystore-name' }),
         githubToken: input.string({ name: 'github-token', secret: true }),
-        editorPath: input.string({ name: 'editor-path' })
+        editorPath: input.string({ name: 'editor-path' }),
+        scriptingBackend: input.string({ name: 'scripting-backend', default: '' }),
+        il2cppConfiguration: input.string({ name: 'il2cpp-configuration', default: 'release' }),
+        obfuscate: input.string({ default: 'off' }),
+        obfuscateAssemblies: input.string({ name: 'obfuscate-assemblies', default: 'Assembly-CSharp' }),
+        obfuscateConfig: input.string({ name: 'obfuscate-config' }),
+        obfuscarVersion: input.string({ name: 'obfuscar-version', default: PINNED_OBFUSCAR.version }),
+        obfuscarSha256: input.string({ name: 'obfuscar-sha256', default: PINNED_OBFUSCAR.sha256 })
     });
     const issues = [];
     const pick = (name, raw, parse) => {
@@ -31534,6 +32123,13 @@ async function run() {
     const mode = pick('mode', cfg.mode, choice('apply', 'restore'));
     const format = pick('format', cfg.format, choice('aab', 'apk'));
     const signing = pick('signing', cfg.signing, choice('release', 'debug'));
+    const scriptingBackend = pick('scripting-backend', cfg.scriptingBackend, choice('', 'il2cpp', 'mono2x'));
+    const il2cppConfiguration = pick('il2cpp-configuration', cfg.il2cppConfiguration, choice('release', 'debug', 'master'));
+    const obfuscate = pick('obfuscate', cfg.obfuscate, choice('off', 'strings', 'full'));
+    // Only validated when obfuscating: the value is unused (and the default stands in) when off.
+    const assemblies = obfuscate === 'off'
+        ? ['Assembly-CSharp']
+        : pick('obfuscate-assemblies', cfg.obfuscateAssemblies, parseAssemblies);
     if (issues.length > 0)
         throw new InputError(issues);
     const projectRoot = path$1.resolve(cfg.projectPath);
@@ -31594,6 +32190,30 @@ async function run() {
     setOutput('keystore-committed', setup?.committed === undefined ? '' : String(setup.committed));
     setOutput('keystore-commit-url', setup?.commitUrl ?? '');
     setOutput('keystore-repo-path', setup?.repoPath ?? '');
+    // Obfuscation (optional): pin and fetch the Obfuscar console exe, then copy it under the project
+    // so the Unity build (docker included, which mounts only the project) runs it with Unity's Mono.
+    let obfuscarExeSrc;
+    let obfuscateConfigRel = null;
+    if (obfuscate !== 'off') {
+        if (cfg.obfuscateConfig) {
+            const configPath = path$1.resolve(projectRoot, cfg.obfuscateConfig);
+            if (!existsSync(configPath)) {
+                throw new InputError([
+                    { input: 'obfuscate-config', message: `file not found: ${configPath}` }
+                ]);
+            }
+            obfuscateConfigRel = cfg.obfuscateConfig;
+        }
+        obfuscarExeSrc = await ensureObfuscar({
+            version: cfg.obfuscarVersion,
+            sha256: cfg.obfuscarSha256,
+            toolCache: process.env['RUNNER_TOOL_CACHE'],
+            log: message => info(message)
+        });
+        if (obfuscate === 'full') {
+            warning('obfuscate: full renames symbols. The auto-exclude keeps the public API and skips UnityEngine.Object-derived types, [Serializable] types and enums, but reflection or string-based lookups (Type.GetType, AddComponent("Name"), SendMessage) can still break: test the build before shipping, and add exclusions with obfuscate-config.');
+        }
+    }
     // Values from secrets are not written into the script: Unity reads them from the environment.
     const fromSecret = keystore?.source === 'explicit';
     const script = {
@@ -31610,7 +32230,15 @@ async function run() {
                 alias: fromSecret ? null : keystore.alias,
                 aliasPassword: fromSecret ? null : keystore.aliasPassword
             }
-            : { path: null, password: null, alias: null, aliasPassword: null }
+            : { path: null, password: null, alias: null, aliasPassword: null },
+        scriptingBackend: scriptingBackend,
+        il2cppConfiguration: il2cppConfiguration,
+        obfuscate: {
+            mode: obfuscate,
+            assemblies: assemblies,
+            exe: obfuscate !== 'off' ? obfuscarExeRelative : null,
+            config: obfuscateConfigRel
+        }
     };
     let patched;
     try {
@@ -31618,7 +32246,8 @@ async function run() {
             projectRoot,
             stateFile,
             script,
-            writtenKeystore: keystore?.written ? keystore.path : undefined
+            writtenKeystore: keystore?.written ? keystore.path : undefined,
+            obfuscarExeSrc
         });
     }
     catch (err) {
@@ -31633,12 +32262,20 @@ async function run() {
         `  version ${version?.name ?? '(project)'} (${versionCode ?? 'project code'})`,
         keystore
             ? `  signed with ${keystore.source === 'explicit' ? 'the keystore inputs' : `${keystore.projectRelativePath ?? keystore.path} (${setup?.origin}, alias ${keystore.alias})`}`
-            : '  signed with the Unity debug key'
+            : '  signed with the Unity debug key',
+        scriptingBackend
+            ? `  scripting backend forced to ${scriptingBackend === 'il2cpp' ? `IL2CPP (${il2cppConfiguration})` : 'Mono2x'}`
+            : '  scripting backend: the project default',
+        obfuscate === 'off'
+            ? '  obfuscation: off'
+            : `  obfuscation: ${obfuscate} on ${assemblies.join(', ')}${obfuscateConfigRel ? ` (+ ${obfuscateConfigRel})` : ''}`
     ].join('\n'));
     setOutput('execute-method', EXECUTE_METHOD);
     setOutput('output', outputPath);
     setOutput('version-name', version?.name ?? '');
     setOutput('version-code', versionCode === undefined ? '' : String(versionCode));
+    setOutput('scripting-backend', scriptingBackend ?? '');
+    setOutput('obfuscate', obfuscate ?? 'off');
     setOutput('patched', patched.join('\n'));
 }
 

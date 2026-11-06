@@ -37,6 +37,7 @@ import 'node:fs';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readFile, mkdtemp, writeFile as writeFile$1, chmod as chmod$1, rm as rm$1 } from 'node:fs/promises';
+import 'node:stream/promises';
 import path$1 from 'node:path';
 import { tmpdir } from 'node:os';
 

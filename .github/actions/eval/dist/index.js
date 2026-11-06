@@ -37,6 +37,7 @@ import { readFileSync } from 'node:fs';
 import 'node:child_process';
 import 'node:crypto';
 import 'node:fs/promises';
+import 'node:stream/promises';
 import 'node:path';
 
 /** Base class for every error raised by the SDK. `code` is stable and safe to branch on. */

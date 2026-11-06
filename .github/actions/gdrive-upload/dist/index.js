@@ -38,6 +38,7 @@ import { createReadStream } from 'node:fs';
 import 'node:child_process';
 import { sign } from 'node:crypto';
 import { stat as stat$1 } from 'node:fs/promises';
+import 'node:stream/promises';
 import path$1 from 'node:path';
 
 /** Base class for every error raised by the SDK. `code` is stable and safe to branch on. */

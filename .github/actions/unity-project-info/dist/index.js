@@ -38,6 +38,7 @@ import 'node:fs';
 import 'node:child_process';
 import 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import 'node:stream/promises';
 import path$1 from 'node:path';
 import require$$0$6 from 'process';
 import require$$0$7 from 'buffer';

@@ -37,6 +37,7 @@ import 'node:fs';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import 'node:fs/promises';
+import 'node:stream/promises';
 import 'node:path';
 
 // We use any as a valid input type

@@ -37,6 +37,7 @@ import 'node:fs';
 import 'node:child_process';
 import 'node:crypto';
 import { mkdir as mkdir$1, writeFile as writeFile$1, rename as rename$1, readFile, rm as rm$1, readdir as readdir$1 } from 'node:fs/promises';
+import 'node:stream/promises';
 import path$1 from 'node:path';
 import os$1 from 'node:os';
 import require$$0$6 from 'process';
