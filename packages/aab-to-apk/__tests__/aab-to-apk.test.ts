@@ -169,7 +169,7 @@ describe('ensureBundletool', () => {
     })
     expect(jar).toBe(path.join(temp, 'bundletool', '9.9.9', 'bundletool-all-9.9.9.jar'))
     expect(await readFile(jar)).toEqual(jarBytes)
-    expect(fetchImpl).toHaveBeenCalledWith(bundletoolUrl('9.9.9'))
+    expect(fetchImpl).toHaveBeenCalledWith(bundletoolUrl('9.9.9'), expect.anything())
     await ensureBundletool({
       version: '9.9.9',
       sha256: jarSha.toUpperCase(),
@@ -214,6 +214,38 @@ describe('ensureBundletool', () => {
         fetchImpl: fakeFetch(Buffer.from('not found'), 404)
       })
     ).rejects.toThrow(/download failed: 404 https:\/\/github.com\/google\/bundletool/)
+  })
+
+  it('a body that stalls past the timeout is a clear E_BUNDLETOOL error', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new DOMException('The operation timed out', 'TimeoutError'))
+            }
+          }),
+          { status: 200 }
+        )
+    )
+    await expect(
+      ensureBundletool({ version: '9.9.9', sha256: jarSha, toolCache: temp, fetchImpl })
+    ).rejects.toMatchObject({
+      code: 'E_BUNDLETOOL',
+      message: expect.stringContaining('download timed out after 5 minutes') as string
+    })
+  })
+
+  it('a timed-out download is a clear E_BUNDLETOOL error', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new DOMException('The operation timed out', 'TimeoutError')
+    })
+    await expect(
+      ensureBundletool({ version: '9.9.9', sha256: jarSha, toolCache: temp, fetchImpl })
+    ).rejects.toMatchObject({
+      code: 'E_BUNDLETOOL',
+      message: expect.stringContaining('download timed out after 5 minutes') as string
+    })
   })
 })
 

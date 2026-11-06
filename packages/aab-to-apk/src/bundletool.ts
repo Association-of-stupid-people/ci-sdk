@@ -58,9 +58,19 @@ export async function ensureBundletool(options: BundletoolOptions): Promise<stri
 
   const url = bundletoolUrl(version)
   log(`Download ${url}`)
-  const res = await (options.fetchImpl ?? fetch)(url)
-  if (!res.ok) throw new CiError('E_BUNDLETOOL', `bundletool download failed: ${res.status} ${url}`)
-  const bytes = Buffer.from(await res.arrayBuffer())
+  // A stalled download must not hang the release job until the workflow's hard timeout.
+  let bytes: Buffer
+  try {
+    const res = await (options.fetchImpl ?? fetch)(url, { signal: AbortSignal.timeout(5 * 60_000) })
+    if (!res.ok)
+      throw new CiError('E_BUNDLETOOL', `bundletool download failed: ${res.status} ${url}`)
+    bytes = Buffer.from(await res.arrayBuffer())
+  } catch (err) {
+    if (err instanceof DOMException && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      throw new CiError('E_BUNDLETOOL', `bundletool download timed out after 5 minutes: ${url}`)
+    }
+    throw err
+  }
   const actual = createHash('sha256').update(bytes).digest('hex')
   if (actual !== expected) {
     throw new CiError(
