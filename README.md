@@ -130,6 +130,7 @@ await runAction(run) // any thrown error -> core.setFailed, exit code 1
 | `printUntrusted`, `withoutCommands`                                              | Print or stream untrusted output (container logs, remote scripts) inside `::stop-commands::`, so `::error::`-like lines are shown, not executed |
 | `resolveKeystore`, `generateKeystore`, `removeWrittenKeystore`                   | Android release keystore: secret inputs, else the ProjectSettings or project-root keystore (password = file name); generate one by convention   |
 | `runAction`                                                                      | Entrypoint wrapper                                                                                                                              |
+| `listZip`, `extractZipEntry`                                                     | Read a zip's entries, or extract one (stored/deflated, zip64), size and CRC-32 checked                                                          |
 | `CiError`, `InputError`, `TimeoutError`, `AbortError`, `RetryError`, `ExecError` | Errors with a stable `code`                                                                                                                     |
 
 ## `run` action
@@ -458,6 +459,15 @@ An unset secret reaches the action as an empty input, so passing all four secret
 A PKCS12 keystore and its password are checked before the build ("wrong store password"); a JKS
 keystore cannot be checked here (warning), the build will tell.
 
+> **Persistent self-hosted runners and the keystore passwords.** When the keystore comes from the
+> inputs (secrets), Unity's generated Gradle project under `Library/Bee/Android` can keep the store
+> and key passwords in plain text. A hosted or ephemeral runner discards this with the machine, but
+> a persistent self-hosted runner that keeps `Library/` between builds (`clean: false`) leaves them
+> on disk. Delete `Library/Bee/Android` after the build (e.g. an `always()` cleanup step, gated on
+> the secrets path), or build on an ephemeral runner, so the passwords do not linger. The
+> `mode: restore` step deliberately does not touch `Library/` — it only restores the project
+> byte-exact — so this cleanup is the workflow's to do.
+
 ## `unity-android-build-script` action
 
 Adds a CI-only Editor build script to a Unity project for one build (signed AAB or APK, version
@@ -469,8 +479,10 @@ default, or `apk`), `output` (relative to the project, default `Builds/release.<
 `version-code` (instead of the derived one), `development` (default `false`), `signing`
 (`release` default, or `debug` = Unity debug key), the four keystore inputs above,
 `generate-keystore` (default `false`), `commit-keystore` (default `true`), `keystore-name`
-(default the repository name), `github-token` (default `github.token`) and `editor-path` (Unity
-editor, to find keytool).
+(default the repository name), `github-token` (default `github.token`), `editor-path` (Unity
+editor, to find keytool) and the code-protection inputs `scripting-backend`,
+`il2cpp-configuration`, `obfuscate`, `obfuscate-assemblies`, `obfuscate-config`, `obfuscar-version`
+and `obfuscar-sha256` (see "Protecting the code" below).
 
 **`generate-keystore: true`** handles a project with no keystore at all (step 4 above), so a game
 needs no signing setup before its first release. The **default branch is the reference**, so a
@@ -518,7 +530,8 @@ A version that is not strict `X.Y.Z` (`v1.2`, `v1.2.3-rc1`, `v01.2.3`) or has Y 
 at once.
 
 Outputs: `execute-method` (pass to Unity with `-executeMethod`), `output` (absolute),
-`version-name`, `version-code`, `keystore-path` (absolute), `keystore-source` (`explicit`,
+`version-name`, `version-code`, `scripting-backend` (the backend forced, or empty), `obfuscate`
+(the mode applied), `keystore-path` (absolute), `keystore-source` (`explicit`,
 `project-settings`, `project-file`, `default-branch`, `generated`, or empty for debug),
 `keystore-committed` (for a keystore that is not in this commit: `true` when it is on the
 default branch, `false` when it still has to be committed; empty otherwise),
@@ -572,6 +585,51 @@ first restores a state left by a job that never restored (self-hosted runners).
     mode: restore
 ```
 
+### Protecting the code
+
+In a release build there is no "source code"; what ships is the game's compiled C#. With the
+**Mono** backend that is managed IL (`Assembly-CSharp.dll`), which decompiles back to near-original
+C#. Two independent, build-only options harden it (both restored afterwards, nothing committed):
+
+- **`scripting-backend: il2cpp`** compiles C# to C++ and ships native `libil2cpp.so` with no managed
+  IL, so it cannot be decompiled back to C#. `il2cpp-configuration` is `release` (default), `debug`
+  or `master` (strips the most). ARM64 is added for this build if the project lacks it (the Play
+  Store needs a 64-bit variant). The Android module brings IL2CPP and the NDK, so the GameCI
+  `android` image (docker mode) and a runner with that module (host mode) need nothing extra.
+- **`obfuscate`** runs [Obfuscar](https://github.com/obfuscar/obfuscar) (pinned, downloaded once,
+  sha256-checked, run with Unity's own Mono) on the game's managed assemblies in the
+  `IPostBuildPlayerScriptDLLs` hook — after Unity compiles them and **before** IL2CPP turns them
+  into C++ — so renamed symbols and hidden strings end up in the native library and
+  `global-metadata.dat`:
+  - `strings` hides string literals only (URLs, keys, messages) and renames nothing, so it is safe
+    for any game.
+  - `full` also renames. Its auto-generated config keeps the public API and skips every type Unity
+    binds by name — those deriving from `UnityEngine.Object` (MonoBehaviour, ScriptableObject, ...),
+    `[Serializable]` types and enums — so serialized fields and lifecycle methods keep their names.
+    Reflection and string-based lookups (`Type.GetType`, `AddComponent("Name")`, `SendMessage`) are
+    out of reach of that analysis, so **test a `full` build before shipping** and add exclusions
+    with `obfuscate-config` (a snippet of Obfuscar `Skip*`/`Force*` rules, no `<Module>` wrapper,
+    spliced into each module). A build fails if obfuscation fails — a release is never shipped
+    half-obfuscated.
+
+  `obfuscate-assemblies` (default `Assembly-CSharp`) selects which assemblies to process; the
+  engine and third-party assemblies are left alone. The two features compose: `il2cpp` + `full` is
+  the strongest, and obfuscation also helps a Mono build (where the IL actually ships).
+
+```yaml
+- id: script
+  uses: <owner>/ci-sdk/.github/actions/unity-android-build-script@runner
+  with:
+    version: ${{ github.ref_name }}
+    output: Builds/game.aab
+    scripting-backend: il2cpp
+    obfuscate: full # or: strings
+    keystore-base64: ${{ secrets.KEYSTORE_BASE64 }}
+    keystore-password: ${{ secrets.KEYSTORE_PASSWORD }}
+    keystore-alias: ${{ secrets.KEYSTORE_ALIAS }}
+    keystore-alias-password: ${{ secrets.KEYSTORE_ALIAS_PASSWORD }}
+```
+
 ## `aab-to-apk` action
 
 Turns an Android App Bundle into one installable universal APK with
@@ -616,46 +674,46 @@ only assembles a `report` JSON from its job results; the action builds the messa
 
 A webhook message cannot be edited or threaded, so a run posts two messages:
 
-- **START** (`"phase": "start"`), right before the first Unity build: `🛠️ Game · Đang build
-Debug #128 · 7 bản (normal + 6 segment)`, the run's fields (ref, commit, version, game, build,
-  actor, event, runner, start time), the planned builds (`"status": "planned"`) and an `info`
-  alert with the run link.
+- **START** (`"phase": "start"`), right before the first Unity build: `🛠️ My Game · Đang build
+Debug #128`, an ETA from the previous successful run and the planned builds.
 - **END** (default), exactly one per run, picked from `jobs` (`needs.<job>.result`) and
   `status` (`messageVariant`): `✅`/`🚀` success, `⚠️` partial (the run failed but every main
-  build exists: only segments or an upload failed), `❌` failure (the failed step, the log link,
-  what finished) and `🚫` cancelled (duration, the stage it was in, what finished, and "superseded
-  by run #N" when `supersededBy` is set). A cancelled job wins over a failed one. Run the notify
-  job with `if: always()` so a cancelled run still posts its END message; it is posted even when
-  START never was.
+  build exists: only segments or an upload failed), `❌` failure (the failed step and the log
+  link) and `🚫` cancelled (the stage it was in and "superseded by #N" when `supersededBy` is
+  set). A cancelled job wins over a failed one. Run the notify job with `if: always()` so a
+  cancelled run still posts its END message; it is posted even when START never was.
 
 Inputs: `webhook-url` (secret; empty = nothing sent, notice), `report` (JSON) or `report-file`,
 `payload-file` (also write the webhook body there, to preview it), `dry-run` (build, write
 `payload-file`, send nothing), `attempts` (default 3). Outputs: `sent`, `status`, `text`.
 
-The message:
+The message is a **compact card**: a short push `text` and exactly two blocks (an `alert` and a
+grey `context` line). It uses the Unity productName (`game`), not the repo name.
 
-- `text`: one line, the push notification and sidebar preview (with `blocks`, only the blocks show
-  in the channel), e.g. `✅ Game · Debug #128 · 7/7 builds OK · 12m34s`,
-  `🚀 Game · Release v1.0.2 (10002) ready`, `❌ Game · Release v1.0.2 failed at Unity build`,
-  `🚫 Game · Debug #128 cancelled after 12m34s · during segment builds · superseded by run #129`.
-- `header`, a `section` of fields (branch/tag/PR, commit, version, duration, game, build, actor,
-  event, runner, start time), a `table` with one row per build (Build, Campaign and Country when
-  there are segments, Status/Result, Link to Drive / the GitHub artifact / the Unity log; no links
-  in START), `alert`s (`info`: START; `success`: all green / a release is ready; `error`: a main
-  build failed, with the log link; `default`: cancelled; `warning`: only segments or uploads
-  failed, files on the artifact fallback, report warnings), the changelog as a bullet list (newest
-  10, then "+N earlier") and a `context` footer (`GitHub Actions · repo · Run #N · ci-sdk vX.Y.Z`).
-- Untrusted text (branch, commit subjects, actor, segment names) goes into `plain_text` or literal
-  `rich_text` elements, or is escaped (`& < >`) in mrkdwn, so it can never form a mention,
-  `<!channel>` or a link. A word joiner (U+2060, invisible) also goes into `://`, after a `.`
-  before a letter and after `@` (mrkdwn, the header, link labels, table cells and the changelog), so the
-  server does not turn a plain URL, a domain or an `@name` into a link. The action itself never
-  writes a mention.
+- `text`: one short line (~40 chars), the push notification and sidebar preview (with `blocks`,
+  only the blocks show in the channel), e.g. `✅ My Game · Debug #128 · 7/7 OK · 35m`,
+  `🚀 My Game · Release v1.0.2 ready`, `❌ My Game · Release v1.0.2 failed: AAB to APK`,
+  `🚫 My Game · Debug #128 cancelled`.
+- One `alert` (`info` START, `success`, `warning` partial, `error` failure, `default` cancelled)
+  with exactly three short lines:
+  1. `*<emoji> <productName> · Debug #N | Release vX.Y.Z (code) · <result>*` — the result is
+     `7/7 OK`, `cancelled` or `failed`; START says `Đang build …` with no result.
+  2. `⏱ <duration> · <one key fact>`: START shows `ETA ~36m (~18:58)` from the previous
+     successful run (omitted when there is none) then the version or `🔑 <keystore>`; success the
+     version (debug) or `🔑 <keystore>` (release); partial/failure `❌ <name>: <step> (<log>)`
+     (`+N more` after two); cancelled `during <stage> · superseded by <#N>`.
+  3. `📦 <Name (81.2 MB)>` links for every finished build (size in MB, `+N more` when many), or on
+     START the plan `🎯 Normal + 6 segment: …` / `🎯 AAB + APK (universal)`.
+- One grey `context` line: `<ref> · <commit sha7> <subject> · <actor> · <Drive folder> · <Run #N>`
+  (the `Drive` link is dropped when no folder is given).
+- Untrusted text (branch, commit subjects, actor, build names, product name) is escaped (`& < >`)
+  in mrkdwn, so it can never form a mention, `<!channel>` or a link; link labels are escaped too. A
+  word joiner (U+2060, invisible) also goes into `://`, after a `.` before a letter and after `@`,
+  so the server does not turn a plain URL, a domain or an `@name` into a link. The action itself
+  never writes a mention, and keystore passwords are never in the report.
 - Limits: 50 blocks, blocks kept under 14,000 bytes (the server allows 16 kB after normalising),
-  header 150, fields 2,000, alerts 3,000 (name lists and warning lines are kept whole, then
-  "+N more"), table 100 rows / 10,000 characters, lengths in UTF-16 units without splitting an
-  emoji. Over a limit the changelog is shortened first, then table rows (main builds and failures
-  kept, then "+N more (see the run)"), then the table is dropped.
+  alert 3,000 characters (links and failed-build lines are kept whole, then "+N more"), lengths in
+  UTF-16 units without splitting an emoji.
 
 Sending: UTF-8 JSON (`Content-Type: application/json; charset=utf-8`). 429 waits for
 `Retry-After` (at most 2 min), 5xx backs off 5 s then 30 s, at most 3 tries; any other status,
@@ -674,9 +732,8 @@ Report (unknown keys are ignored; strings may be untrusted):
   "status": "failure",
   "failedStep": "AAB to APK",
   "game": "My Game",
-  "platform": "Android",
-  "clean": false,
-  "project": { "name": "acme/My-Game", "url": "https://github.com/acme/My-Game" },
+  "keystore": "My-Game.keystore",
+  "driveFolderUrl": "https://drive.google.com/drive/folders/...",
   "run": { "url": "https://github.com/acme/My-Game/actions/runs/1", "number": 131 },
   "ref": { "type": "tag", "name": "v1.0.2" },
   "commit": { "sha": "abcdef0123", "url": "https://github.com/...", "subject": "chore: release" },
@@ -699,10 +756,6 @@ Report (unknown keys are ignored; strings may be untrusted):
       "logUrl": "https://..."
     }
   ],
-  "changelog": [
-    { "sha": "abcdef0123", "subject": "chore: release", "author": "dev", "url": "https://..." }
-  ],
-  "warnings": [],
   "logUrl": "https://..."
 }
 ```
@@ -710,12 +763,16 @@ Report (unknown keys are ignored; strings may be untrusted):
 `kind` is `debug` or `release`; `phase` is `start` or `end` (default); `status` is `success`,
 `failure` or `cancelled` (default `success`; a `cancelled` or `failure` value in `jobs` wins);
 `jobs` maps job names to `needs.<job>.result`; `failedStep` is what failed, or the stage a
-cancelled run was in; `supersededBy` is `{ "number": 129, "url": "..." }`; `event`, `runner` and
-`startedAt` (already formatted) are shown as fields; `ref.type` is `branch`, `tag` or `pr`
+cancelled run was in; `supersededBy` is `{ "number": 129, "url": "..." }`; `game` is the Unity
+productName shown on the card; `eta` (START only, already formatted, e.g. `~36m (~18:58)`) is the
+estimate from the previous successful run; `keystore` is the signing key file name (release, never
+a password); `driveFolderUrl` adds the `Drive` link; `ref.type` is `branch`, `tag` or `pr`
 (`title` for a PR); `builds[].kind` is `normal`, `segment`, `aab` or `apk` (only `segment` builds
 are extras); `builds[].status` is `success`, `failure`, `skipped`, `cancelled` or `planned`;
-`fallback: true` marks a link to the GitHub artifact instead of Drive; `campaign: ""` shows as
-`(organic)`. Text fields must be strings (`version.code` and `run.number` may be numbers).
+`builds[].size` (bytes) is shown next to the download link. Text fields must be strings
+(`version.code` and `run.number` may be numbers). `event`, `runner`, `startedAt`, `project`,
+`clean`, `campaign`, `country`, `warnings` and `changelog` are still accepted but no longer shown
+in the compact card.
 
 ```yaml
 - id: report
