@@ -78,6 +78,41 @@ inputs:
   editor-path:
     description: Unity editor executable, for keytool (default the editor of ProjectVersion.txt, found like unity-build; else JAVA_HOME, else any installed editor)
     required: false
+  scripting-backend:
+    description: >-
+      Scripting backend for this build only: empty keeps the project's, `il2cpp` compiles C# to
+      native (no managed IL ships; the Android module brings IL2CPP and the NDK), `mono2x` forces Mono.
+      Restored after the build.
+    required: false
+    default: ''
+  il2cpp-configuration:
+    description: 'IL2CPP C++ compiler configuration when scripting-backend is il2cpp: `release` (default), `debug` or `master`'
+    required: false
+    default: release
+  obfuscate:
+    description: >-
+      Obfuscate the game's managed assemblies with Obfuscar before IL2CPP conversion: `off`
+      (default), `strings` (hide string literals only, renames nothing, safe for any game) or `full`
+      (also rename, keeping the public API and skipping UnityEngine.Object-derived types,
+      [Serializable] types and enums; reflection or string-based lookups can still break — test the
+      build and add exclusions with obfuscate-config).
+    required: false
+    default: 'off'
+  obfuscate-assemblies:
+    description: Comma/newline list of assembly names to obfuscate, no `.dll` (default `Assembly-CSharp`)
+    required: false
+    default: Assembly-CSharp
+  obfuscate-config:
+    description: >-
+      Project-relative path to an extra Obfuscar rules snippet (Skip*/Force* elements, no <Module>
+      wrapper) spliced into each generated module, to tune a `full` build
+    required: false
+  obfuscar-version:
+    description: Obfuscar NuGet version (default the pinned one)
+    required: false
+  obfuscar-sha256:
+    description: sha256 of the Obfuscar nupkg (checked on download; default matches the pinned version)
+    required: false
 
 outputs:
   execute-method:
@@ -88,6 +123,10 @@ outputs:
     description: bundleVersion of the build (empty = the project's)
   version-code:
     description: Version code of the build (empty = the project's)
+  scripting-backend:
+    description: The scripting backend forced for this build (`il2cpp`, `mono2x`, or empty for the project default)
+  obfuscate:
+    description: The obfuscation mode applied (`off`, `strings` or `full`)
   keystore-path:
     description: Keystore file used (pass to unity-build keystore-path)
   keystore-source:

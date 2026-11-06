@@ -1,7 +1,8 @@
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { CiError } from '../../sdk/src/index.js'
+import { OBFUSCAR_EXE } from './obfuscar.js'
 import {
   ASMDEF_FILE,
   GENERATED_DIR,
@@ -14,6 +15,14 @@ import {
 
 /** Unity rewrites it when the build script changes PlayerSettings: saved and put back byte-exact. */
 export const PROJECT_SETTINGS = 'ProjectSettings/ProjectSettings.asset'
+
+/**
+ * Project-root dot-folder for the Obfuscar exe (Unity ignores `.`-folders, so it is never imported;
+ * under the project so docker mode, which mounts only the project, sees it). The path baked into the
+ * build script is `${OBFUSCAR_DIR}/${OBFUSCAR_EXE}`.
+ */
+export const OBFUSCAR_DIR = '.ci-sdk-obfuscar'
+export const obfuscarExeRelative = `${OBFUSCAR_DIR}/${OBFUSCAR_EXE}`
 
 interface SavedFile {
   /** Relative to `root`, forward slashes. */
@@ -59,9 +68,24 @@ async function generatedDirIsOurs(root: string): Promise<boolean> {
   }
 }
 
+// Retries: on Windows an EBUSY/EPERM from Unity or an AV scanner can fail an otherwise fine remove.
 async function removeWithMeta(target: string): Promise<void> {
-  await rm(target, { recursive: true, force: true })
-  await rm(`${target}.meta`, { force: true })
+  await rm(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
+  await rm(`${target}.meta`, { force: true, maxRetries: 5, retryDelay: 200 })
+}
+
+/** writeFile with the Windows EBUSY/EPERM retries that rm has built in (writeFile has none). */
+async function writeFileRetry(file: string, data: Buffer): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await writeFile(file, data)
+      return
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (attempt >= 5 || (code !== 'EBUSY' && code !== 'EPERM' && code !== 'EACCES')) throw err
+      await new Promise(resolve => setTimeout(resolve, 200))
+    }
+  }
 }
 
 export interface ApplyOptions {
@@ -70,6 +94,8 @@ export interface ApplyOptions {
   script: BuildScriptOptions
   /** A keystore written from base64: recorded so restore deletes it. */
   writtenKeystore: string | undefined
+  /** The cached Obfuscar exe to copy under the project (obfuscation on); removed on restore. */
+  obfuscarExeSrc?: string | undefined
 }
 
 /**
@@ -105,7 +131,7 @@ export async function applyPatch(options: ApplyOptions): Promise<string[]> {
     version: 1,
     root,
     files: [{ path: PROJECT_SETTINGS, original: settings.toString('base64') }],
-    added: [GENERATED_DIR],
+    added: options.obfuscarExeSrc ? [GENERATED_DIR, OBFUSCAR_DIR] : [GENERATED_DIR],
     keystore: options.writtenKeystore
   }
   await mkdir(path.dirname(options.stateFile), { recursive: true })
@@ -116,7 +142,22 @@ export async function applyPatch(options: ApplyOptions): Promise<string[]> {
   await mkdir(dir, { recursive: true })
   await writeFile(path.join(dir, SCRIPT_FILE), buildScriptSource(options.script), 'utf8')
   await writeFile(path.join(dir, ASMDEF_FILE), asmdefSource(), 'utf8')
-  return [`${GENERATED_DIR}/${SCRIPT_FILE}`, `${GENERATED_DIR}/${ASMDEF_FILE}`, PROJECT_SETTINGS]
+  const added = [
+    `${GENERATED_DIR}/${SCRIPT_FILE}`,
+    `${GENERATED_DIR}/${ASMDEF_FILE}`,
+    PROJECT_SETTINGS
+  ]
+
+  // Always clear a stale Obfuscar folder (ours by name, Unity-ignored, never committed), e.g. one
+  // left by a killed obfuscate job whose state is gone; recreate it only when obfuscating now.
+  const obfuscarDir = path.join(root, OBFUSCAR_DIR)
+  await removeWithMeta(obfuscarDir)
+  if (options.obfuscarExeSrc) {
+    await mkdir(obfuscarDir, { recursive: true })
+    await copyFile(options.obfuscarExeSrc, path.join(root, obfuscarExeRelative))
+    added.push(obfuscarExeRelative)
+  }
+  return added
 }
 
 /**
@@ -145,7 +186,10 @@ export async function restorePatch(stateFile: string): Promise<boolean> {
   try {
     if (await exists(state.root)) {
       for (const saved of state.files) {
-        await writeFile(path.join(state.root, saved.path), Buffer.from(saved.original, 'base64'))
+        await writeFileRetry(
+          path.join(state.root, saved.path),
+          Buffer.from(saved.original, 'base64')
+        )
       }
       for (const added of state.added) await removeWithMeta(path.join(state.root, added))
     }
@@ -177,6 +221,11 @@ export async function removeStale(projectRoot: string, keysDir: string): Promise
   if (await generatedDirIsOurs(root)) {
     await removeWithMeta(path.join(root, GENERATED_DIR))
     removed.push(GENERATED_DIR)
+  }
+  // The Obfuscar dot-folder is ours by name (only this action creates it).
+  if (await exists(path.join(root, OBFUSCAR_DIR))) {
+    await removeWithMeta(path.join(root, OBFUSCAR_DIR))
+    removed.push(OBFUSCAR_DIR)
   }
   let keys: string[] = []
   try {

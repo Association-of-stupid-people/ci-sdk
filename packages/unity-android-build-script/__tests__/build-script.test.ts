@@ -1,11 +1,21 @@
+import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { run } from '../src/main.js'
-import { PROJECT_SETTINGS, applyPatch, removeStale, restorePatch } from '../src/patch.js'
+import { crc32 } from 'node:zlib'
+import { parseAssemblies, run } from '../src/main.js'
+import { OBFUSCAR_ENTRY, ensureObfuscar, obfuscarUrl } from '../src/obfuscar.js'
+import {
+  OBFUSCAR_DIR,
+  PROJECT_SETTINGS,
+  applyPatch,
+  obfuscarExeRelative,
+  removeStale,
+  restorePatch
+} from '../src/patch.js'
 import {
   ASMDEF_FILE,
   EXECUTE_METHOD,
@@ -13,9 +23,51 @@ import {
   SCRIPT_FILE,
   buildScriptSource,
   csLiteral,
+  csStringArray,
   type BuildScriptOptions
 } from '../src/script.js'
 import { MAX_VERSION_CODE, parseReleaseVersion, parseVersionCode } from '../src/version.js'
+
+/** A minimal stored (uncompressed) zip, enough to stand in for an Obfuscar nupkg. */
+function makeZip(entries: { name: string; data: Buffer }[]): Buffer {
+  const locals: Buffer[] = []
+  const centrals: Buffer[] = []
+  let offset = 0
+  for (const e of entries) {
+    const name = Buffer.from(e.name, 'utf8')
+    const crc = crc32(e.data)
+    const body = e.data
+    const local = Buffer.alloc(30)
+    local.writeUInt32LE(0x04034b50, 0)
+    local.writeUInt16LE(20, 4)
+    local.writeUInt16LE(0, 8)
+    local.writeUInt32LE(crc, 14)
+    local.writeUInt32LE(body.length, 18)
+    local.writeUInt32LE(e.data.length, 22)
+    local.writeUInt16LE(name.length, 26)
+    const central = Buffer.alloc(46)
+    central.writeUInt32LE(0x02014b50, 0)
+    central.writeUInt16LE(20, 4)
+    central.writeUInt16LE(20, 6)
+    central.writeUInt16LE(0, 10)
+    central.writeUInt32LE(crc, 16)
+    central.writeUInt32LE(body.length, 20)
+    central.writeUInt32LE(e.data.length, 24)
+    central.writeUInt16LE(name.length, 28)
+    central.writeUInt32LE(offset, 42)
+    locals.push(local, name, body)
+    centrals.push(central, name)
+    offset += local.length + name.length + body.length
+  }
+  const cd = Buffer.concat(centrals)
+  const eocd = Buffer.alloc(22)
+  eocd.writeUInt32LE(0x06054b50, 0)
+  eocd.writeUInt16LE(entries.length, 8)
+  eocd.writeUInt16LE(entries.length, 10)
+  eocd.writeUInt32LE(cd.length, 12)
+  eocd.writeUInt32LE(offset, 16)
+  return Buffer.concat([...locals, cd, eocd])
+}
 
 // keytool -genkeypair -storetype PKCS12 -alias my-game -keystore My-Game.keystore -storepass My-Game
 const KEYSTORE = path.join(
@@ -84,7 +136,10 @@ describe('generated script', () => {
       password: 'My-Game',
       alias: 'my-game',
       aliasPassword: 'My-Game'
-    }
+    },
+    scriptingBackend: '',
+    il2cppConfiguration: 'release',
+    obfuscate: { mode: 'off', assemblies: ['Assembly-CSharp'], exe: null, config: null }
   }
 
   it('bakes the build settings and the conventional keystore', () => {
@@ -121,6 +176,89 @@ describe('generated script', () => {
     expect(csLiteral(null)).toBe('null')
     expect(() => csLiteral('a\nb')).toThrow(/control characters/)
   })
+
+  it('builds a C# string array literal', () => {
+    expect(csStringArray(['A', 'B.c'])).toBe('new string[] { "A", "B.c" }')
+  })
+
+  it('keeps the project scripting backend and emits no obfuscation hook by default', () => {
+    const src = buildScriptSource(base)
+    expect(src).toContain('ScriptingBackend = "";')
+    expect(src).not.toContain('CiSdkObfuscate')
+  })
+
+  it('forces IL2CPP with the chosen compiler configuration and ensures ARM64', () => {
+    const src = buildScriptSource({
+      ...base,
+      scriptingBackend: 'il2cpp',
+      il2cppConfiguration: 'master'
+    })
+    expect(src).toContain('ScriptingBackend = "il2cpp";')
+    expect(src).toContain(
+      'SetScriptingBackend(BuildTargetGroup.Android, ScriptingImplementation.IL2CPP)'
+    )
+    expect(src).toContain(
+      'SetIl2CppCompilerConfiguration(BuildTargetGroup.Android, Il2CppCompilerConfiguration.Master)'
+    )
+    expect(src).toContain('AndroidArchitecture.ARM64')
+    // Always restored.
+    expect(src).toContain(
+      'PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, oldBackend)'
+    )
+  })
+
+  it('emits the obfuscation hook with the baked mode, assemblies and paths (full)', () => {
+    const src = buildScriptSource({
+      ...base,
+      obfuscate: {
+        mode: 'full',
+        assemblies: ['Assembly-CSharp', 'Game.Core'],
+        exe: obfuscarExeRelative,
+        config: 'obf/rules.xml'
+      }
+    })
+    expect(src).toContain('class CiSdkObfuscate : UnityEditor.Build.IPostBuildPlayerScriptDLLs')
+    expect(src).toContain('Mode = "full";')
+    expect(src).toContain('ExeRelative = ".ci-sdk-obfuscar/Obfuscar.Console.exe";')
+    expect(src).toContain('ExtraRulesRelative = "obf/rules.xml";')
+    expect(src).toContain('Assemblies = new string[] { "Assembly-CSharp", "Game.Core" };')
+    expect(src).toContain('RiskyTypeNames')
+    // A risky type keeps its members too, not only its name.
+    for (const attr of ['skipMethods', 'skipFields', 'skipProperties', 'skipEvents']) {
+      expect(src).toContain(`Attr("${attr}", "true")`)
+    }
+    // The generated C# must have no stray backslash outside escaped C# string literals.
+    const hook = src.slice(src.indexOf('class CiSdkObfuscate'))
+    expect(hook.includes('\\')).toBe(false)
+  })
+
+  it('emits the hook in strings mode with no extra-rules path', () => {
+    const src = buildScriptSource({
+      ...base,
+      obfuscate: {
+        mode: 'strings',
+        assemblies: ['Assembly-CSharp'],
+        exe: obfuscarExeRelative,
+        config: null
+      }
+    })
+    expect(src).toContain('Mode = "strings";')
+    expect(src).toContain('ExtraRulesRelative = null;')
+  })
+})
+
+describe('parseAssemblies', () => {
+  it('splits, trims, strips .dll and dedups', () => {
+    expect(parseAssemblies('Assembly-CSharp')).toEqual(['Assembly-CSharp'])
+    expect(parseAssemblies('A.dll, B\nA')).toEqual(['A', 'B'])
+    expect(parseAssemblies(' Game.Core.DLL ')).toEqual(['Game.Core'])
+  })
+
+  it('rejects an empty list and path separators', () => {
+    expect(() => parseAssemblies('   ')).toThrow(/at least one/)
+    expect(() => parseAssemblies('a/b')).toThrow(/path separator/)
+    expect(() => parseAssemblies('a\\b')).toThrow(/path separator/)
+  })
 })
 
 let root: string
@@ -136,6 +274,7 @@ beforeEach(async () => {
 })
 afterEach(async () => {
   vi.unstubAllEnvs()
+  vi.unstubAllGlobals()
   vi.restoreAllMocks()
   await rm(root, { recursive: true, force: true })
   await rm(temp, { recursive: true, force: true })
@@ -148,7 +287,10 @@ const script: BuildScriptOptions = {
   versionCode: 0,
   development: false,
   releaseSigning: false,
-  keystore: { path: null, password: null, alias: null, aliasPassword: null }
+  keystore: { path: null, password: null, alias: null, aliasPassword: null },
+  scriptingBackend: '',
+  il2cppConfiguration: 'release',
+  obfuscate: { mode: 'off', assemblies: ['Assembly-CSharp'], exe: null, config: null }
 }
 
 describe('apply / restore', () => {
@@ -366,5 +508,182 @@ describe('run', () => {
 
   it('rejects unknown choices', async () => {
     await expect(call({ format: 'ipa', signing: 'none' })).rejects.toThrow(/format.*signing/s)
+  })
+
+  it('downloads Obfuscar, copies it under the project, bakes the full hook, then restore removes it', async () => {
+    await copyFile(KEYSTORE, path.join(root, 'My-Game.keystore'))
+    const nupkg = makeZip([
+      { name: 'tools/Obfuscar.Console.exe', data: Buffer.from('MZ-fake-obfuscar') }
+    ])
+    const sha = createHash('sha256').update(nupkg).digest('hex')
+    const fetchMock = vi.fn(async () => new Response(nupkg, { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubEnv('RUNNER_TOOL_CACHE', path.join(temp, 'tool-cache'))
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+
+    const out = await call({
+      version: 'v1.0.2',
+      obfuscate: 'full',
+      'scripting-backend': 'il2cpp',
+      'obfuscar-sha256': sha
+    })
+    expect(out.obfuscate).toBe('full')
+    expect(out['scripting-backend']).toBe('il2cpp')
+    expect(fetchMock).toHaveBeenCalledOnce()
+    const exe = path.join(root, obfuscarExeRelative)
+    expect(existsSync(exe)).toBe(true)
+    expect(await readFile(exe, 'utf8')).toBe('MZ-fake-obfuscar')
+    const src = await readFile(path.join(root, GENERATED_DIR, SCRIPT_FILE), 'utf8')
+    expect(src).toContain('class CiSdkObfuscate')
+    expect(src).toContain('Mode = "full";')
+    expect(write.mock.calls.join('')).toContain('::warning::obfuscate: full')
+
+    await call({ mode: 'restore' })
+    expect(existsSync(path.join(root, OBFUSCAR_DIR))).toBe(false)
+    expect(existsSync(exe)).toBe(false)
+  })
+
+  it('rejects an obfuscate-config that does not exist', async () => {
+    await copyFile(KEYSTORE, path.join(root, 'My-Game.keystore'))
+    vi.stubEnv('RUNNER_TOOL_CACHE', path.join(temp, 'tool-cache'))
+    await expect(
+      call({ version: 'v1.0.2', obfuscate: 'strings', 'obfuscate-config': 'missing/rules.xml' })
+    ).rejects.toThrow(/obfuscate-config: file not found/)
+    expect(existsSync(path.join(root, GENERATED_DIR))).toBe(false)
+  })
+})
+
+describe('ensureObfuscar', () => {
+  let cache: string
+  beforeEach(async () => {
+    cache = await mkdtemp(path.join(os.tmpdir(), 'ci-sdk-obfuscar-cache-'))
+  })
+  afterEach(async () => {
+    await rm(cache, { recursive: true, force: true })
+  })
+
+  const nupkg = makeZip([{ name: OBFUSCAR_ENTRY, data: Buffer.from('MZ-fake-obfuscar') }])
+  const sha = createHash('sha256').update(nupkg).digest('hex')
+
+  it('builds the flatcontainer URL (lower-cased)', () => {
+    expect(obfuscarUrl('2.2.38')).toBe(
+      'https://api.nuget.org/v3-flatcontainer/obfuscar/2.2.38/obfuscar.2.2.38.nupkg'
+    )
+  })
+
+  it('verifies the sha256, extracts the exe, then serves it from the cache', async () => {
+    const fetchImpl = vi.fn(async () => new Response(nupkg, { status: 200 }))
+    const exe = await ensureObfuscar({
+      version: '2.2.38',
+      sha256: sha,
+      toolCache: cache,
+      fetchImpl
+    })
+    expect(await readFile(exe, 'utf8')).toBe('MZ-fake-obfuscar')
+    const again = await ensureObfuscar({
+      version: '2.2.38',
+      sha256: sha,
+      toolCache: cache,
+      fetchImpl
+    })
+    expect(again).toBe(exe)
+    expect(fetchImpl).toHaveBeenCalledOnce()
+  })
+
+  it('re-extracts the exe from the cached nupkg when the exe is missing, without re-downloading', async () => {
+    const fetchImpl = vi.fn(async () => new Response(nupkg, { status: 200 }))
+    const exe = await ensureObfuscar({
+      version: '2.2.38',
+      sha256: sha,
+      toolCache: cache,
+      fetchImpl
+    })
+    await rm(exe, { force: true })
+    const again = await ensureObfuscar({
+      version: '2.2.38',
+      sha256: sha,
+      toolCache: cache,
+      fetchImpl
+    })
+    expect(again).toBe(exe)
+    expect(await readFile(exe, 'utf8')).toBe('MZ-fake-obfuscar')
+    expect(fetchImpl).toHaveBeenCalledOnce()
+  })
+
+  it('re-downloads when the cached nupkg no longer matches its sha256', async () => {
+    const fetchImpl = vi.fn(async () => new Response(nupkg, { status: 200 }))
+    const exe = await ensureObfuscar({
+      version: '2.2.38',
+      sha256: sha,
+      toolCache: cache,
+      fetchImpl
+    })
+    // Tamper with the cached nupkg (a persistent runner's cache could be changed).
+    await writeFile(path.join(cache, 'obfuscar', '2.2.38', 'obfuscar.2.2.38.nupkg'), 'tampered')
+    const again = await ensureObfuscar({
+      version: '2.2.38',
+      sha256: sha,
+      toolCache: cache,
+      fetchImpl
+    })
+    expect(again).toBe(exe)
+    expect(await readFile(exe, 'utf8')).toBe('MZ-fake-obfuscar')
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+  })
+
+  it('fails on a sha256 mismatch', async () => {
+    const fetchImpl = vi.fn(async () => new Response(nupkg, { status: 200 }))
+    await expect(
+      ensureObfuscar({
+        version: '2.2.38',
+        sha256: 'deadbeef',
+        toolCache: cache,
+        fetchImpl
+      })
+    ).rejects.toThrow(/sha256 mismatch/)
+  })
+
+  it('fails on a non-ok response', async () => {
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 404 }))
+    await expect(
+      ensureObfuscar({
+        version: '2.2.38',
+        sha256: sha,
+        toolCache: cache,
+        fetchImpl
+      })
+    ).rejects.toThrow(/download failed: 404/)
+  })
+
+  it('a body that stalls past the timeout is a clear E_OBFUSCAR error', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new DOMException('The operation timed out', 'TimeoutError'))
+            }
+          }),
+          { status: 200 }
+        )
+    )
+    await expect(
+      ensureObfuscar({ version: '2.2.38', sha256: sha, toolCache: cache, fetchImpl })
+    ).rejects.toMatchObject({
+      code: 'E_OBFUSCAR',
+      message: expect.stringContaining('download timed out after 5 minutes') as string
+    })
+  })
+
+  it('a timed-out download is a clear E_OBFUSCAR error', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new DOMException('The operation timed out', 'TimeoutError')
+    })
+    await expect(
+      ensureObfuscar({ version: '2.2.38', sha256: sha, toolCache: cache, fetchImpl })
+    ).rejects.toMatchObject({
+      code: 'E_OBFUSCAR',
+      message: expect.stringContaining('download timed out after 5 minutes') as string
+    })
   })
 })

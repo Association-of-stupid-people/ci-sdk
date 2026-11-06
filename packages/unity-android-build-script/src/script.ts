@@ -5,6 +5,20 @@ export const SCRIPT_FILE = 'CiSdkAndroidBuild.cs'
 export const ASMDEF_FILE = 'CiSdkBuild.Editor.asmdef'
 export const EXECUTE_METHOD = 'CiSdk.Build.CiSdkAndroidBuild.Build'
 
+export type ScriptingBackend = '' | 'il2cpp' | 'mono2x'
+export type Il2CppConfiguration = 'release' | 'debug' | 'master'
+export type ObfuscateMode = 'off' | 'strings' | 'full'
+
+export interface ObfuscateOptions {
+  mode: ObfuscateMode
+  /** Assembly simple names to obfuscate (no `.dll`), e.g. `Assembly-CSharp`. */
+  assemblies: string[]
+  /** Project-relative path to the Obfuscar exe (under the project so docker mode mounts it). */
+  exe: string | null
+  /** Project-relative path to an extra Obfuscar rules snippet, or `null` to auto-generate only. */
+  config: string | null
+}
+
 export interface BuildScriptOptions {
   format: 'aab' | 'apk'
   /** Relative to the project, or absolute. */
@@ -28,6 +42,11 @@ export interface BuildScriptOptions {
     alias: string | null
     aliasPassword: string | null
   }
+  /** `''` keeps the project's scripting backend; `il2cpp` compiles C# to native (no managed IL ships). */
+  scriptingBackend: ScriptingBackend
+  /** C++ compiler configuration when the backend is forced to IL2CPP. */
+  il2cppConfiguration: Il2CppConfiguration
+  obfuscate: ObfuscateOptions
 }
 
 // C0/C1 controls and the Unicode line separators cannot go in a C# regular string literal.
@@ -46,6 +65,11 @@ export function csLiteral(value: string | null): string {
   return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`
 }
 
+/** A C# `new string[] { ... }` literal. */
+export function csStringArray(values: string[]): string {
+  return `new string[] { ${values.map(v => csLiteral(v)).join(', ')} }`
+}
+
 export function asmdefSource(): string {
   return `${JSON.stringify(
     {
@@ -54,7 +78,10 @@ export function asmdefSource(): string {
       includePlatforms: ['Editor'],
       excludePlatforms: [],
       allowUnsafeCode: false,
-      overrideReferences: false,
+      // Reference no precompiled plugin DLLs: a game plugin that exposes a global-namespace type
+      // named Debug, Path, File or Environment would otherwise shadow the script's `using`-resolved
+      // types and break its compilation. The script needs only UnityEngine, UnityEditor and the BCL.
+      overrideReferences: true,
       precompiledReferences: [],
       autoReferenced: false,
       defineConstraints: [],
@@ -66,10 +93,17 @@ export function asmdefSource(): string {
   )}\n`
 }
 
+const IL2CPP_CONFIG: Record<Il2CppConfiguration, string> = {
+  release: 'Il2CppCompilerConfiguration.Release',
+  debug: 'Il2CppCompilerConfiguration.Debug',
+  master: 'Il2CppCompilerConfiguration.Master'
+}
+
 /** The editor script: one static method that builds, signs and exits non-zero on failure. */
 export function buildScriptSource(o: BuildScriptOptions): string {
   const b = (v: boolean): string => (v ? 'true' : 'false')
   const k = o.keystore
+  const obf = o.obfuscate
   return `// ${GENERATED_HEADER}. CI build only, never commit.
 using System;
 using System.Collections.Generic;
@@ -94,6 +128,8 @@ namespace CiSdk.Build
         private static readonly string KeystorePass = ${csLiteral(k.password)};
         private static readonly string KeyaliasName = ${csLiteral(k.alias)};
         private static readonly string KeyaliasPass = ${csLiteral(k.aliasPassword)};
+        // "" keeps the project's scripting backend; "il2cpp"/"mono2x" force it for this build only.
+        private static readonly string ScriptingBackend = ${csLiteral(o.scriptingBackend)};
 
         public static void Build()
         {
@@ -137,6 +173,9 @@ namespace CiSdk.Build
             var oldKeyaliasName = PlayerSettings.Android.keyaliasName;
             var oldAppBundle = EditorUserBuildSettings.buildAppBundle;
             var oldExport = EditorUserBuildSettings.exportAsGoogleAndroidProject;
+            var oldBackend = PlayerSettings.GetScriptingBackend(BuildTargetGroup.Android);
+            var oldIl2CppConfig = PlayerSettings.GetIl2CppCompilerConfiguration(BuildTargetGroup.Android);
+            var oldArchitectures = PlayerSettings.Android.targetArchitectures;
             try
             {
                 if (VersionName.Length > 0)
@@ -149,6 +188,24 @@ namespace CiSdk.Build
                 }
                 EditorUserBuildSettings.buildAppBundle = AppBundle;
                 EditorUserBuildSettings.exportAsGoogleAndroidProject = false;
+
+                if (ScriptingBackend == "il2cpp")
+                {
+                    PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, ScriptingImplementation.IL2CPP);
+                    PlayerSettings.SetIl2CppCompilerConfiguration(BuildTargetGroup.Android, ${IL2CPP_CONFIG[o.il2cppConfiguration]});
+                    // The Play Store requires a 64-bit variant: add ARM64 if the project lacks it.
+                    if ((PlayerSettings.Android.targetArchitectures & AndroidArchitecture.ARM64) == 0)
+                    {
+                        PlayerSettings.Android.targetArchitectures = oldArchitectures | AndroidArchitecture.ARM64;
+                        Debug.Log("[ci-sdk] IL2CPP: added ARM64 to the Android target architectures for this build");
+                    }
+                    Debug.Log("[ci-sdk] Scripting backend forced to IL2CPP (" + ${csLiteral(o.il2cppConfiguration)} + ")");
+                }
+                else if (ScriptingBackend == "mono2x")
+                {
+                    PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, ScriptingImplementation.Mono2x);
+                    Debug.Log("[ci-sdk] Scripting backend forced to Mono2x");
+                }
 
                 if (ReleaseSigning)
                 {
@@ -229,9 +286,253 @@ namespace CiSdk.Build
                 PlayerSettings.Android.keyaliasPass = "";
                 EditorUserBuildSettings.buildAppBundle = oldAppBundle;
                 EditorUserBuildSettings.exportAsGoogleAndroidProject = oldExport;
+                PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, oldBackend);
+                PlayerSettings.SetIl2CppCompilerConfiguration(BuildTargetGroup.Android, oldIl2CppConfig);
+                PlayerSettings.Android.targetArchitectures = oldArchitectures;
             }
         }
     }
+${obf.mode === 'off' ? '' : obfuscateHookSource(obf)}}
+`
 }
+
+/**
+ * The `IPostBuildPlayerScriptDLLs` hook that obfuscates the game's managed assemblies after Unity
+ * compiles them and before IL2CPP turns them into C++, so renamed symbols and hidden strings end
+ * up in the native library and `global-metadata.dat`. It runs Obfuscar with Unity's own Mono, so no
+ * .NET install is needed.
+ *
+ * `full` renames too; its auto-generated config keeps the public API and skips every type Unity
+ * binds by name — those deriving from `UnityEngine.Object` (MonoBehaviour, ScriptableObject, ...),
+ * `[Serializable]` types and enums — so serialized fields and lifecycle methods are never renamed.
+ * Reflection or string-based lookups (`Type.GetType`, `AddComponent("Name")`, `SendMessage`) are
+ * out of reach of this analysis: validate a `full` build before shipping, and add exclusions with
+ * `obfuscate-config` when needed. `strings` only hides string literals and renames nothing.
+ */
+function obfuscateHookSource(obf: ObfuscateOptions): string {
+  return `
+    public class CiSdkObfuscate : UnityEditor.Build.IPostBuildPlayerScriptDLLs
+    {
+        private const string Mode = ${csLiteral(obf.mode)};
+        // Project-relative; resolved against the project root (docker maps it to /project).
+        private const string ExeRelative = ${csLiteral(obf.exe)};
+        private const string ExtraRulesRelative = ${csLiteral(obf.config)};
+        private static readonly string[] Assemblies = ${csStringArray(obf.assemblies)};
+
+        public int callbackOrder { get { return 0; } }
+
+        public void OnPostBuildPlayerScriptDLLs(BuildReport report)
+        {
+            if (Mode == "off") return;
+            try
+            {
+                Obfuscate();
+            }
+            catch (Exception e)
+            {
+                throw new UnityEditor.Build.BuildFailedException("[ci-sdk] Obfuscation failed: " + e.Message);
+            }
+        }
+
+        private static void Obfuscate()
+        {
+            var root = Path.GetDirectoryName(Application.dataPath);
+            var exe = Path.GetFullPath(Path.Combine(root, ExeRelative));
+            if (!File.Exists(exe))
+                throw new FileNotFoundException("Obfuscar exe not found: " + exe);
+
+            var managed = FindManagedDir(root);
+            foreach (var name in Assemblies)
+            {
+                if (!File.Exists(Path.Combine(managed, name + ".dll")))
+                    throw new FileNotFoundException("assembly to obfuscate not found in the staging area: "
+                        + name + ".dll in " + managed);
+            }
+
+            var outDir = Path.Combine(root, "Temp", "ci-sdk-obfuscar-out");
+            if (Directory.Exists(outDir)) Directory.Delete(outDir, true);
+            Directory.CreateDirectory(outDir);
+
+            var configPath = Path.Combine(outDir, "ci-sdk-obfuscar.xml");
+            File.WriteAllText(configPath, GenerateConfig(managed, outDir, root));
+
+            var mono = FindMono();
+            Debug.Log("[ci-sdk] Obfuscating " + string.Join(", ", Assemblies) + " (mode " + Mode
+                + ") in " + managed);
+            var exit = RunProcess(mono, Quote(exe) + " " + Quote(configPath), root);
+            if (exit != 0)
+                throw new Exception("Obfuscar exited with code " + exit + " (see the log above)");
+
+            foreach (var name in Assemblies)
+            {
+                var obfuscated = Path.Combine(outDir, name + ".dll");
+                if (!File.Exists(obfuscated))
+                    throw new FileNotFoundException("Obfuscar did not produce " + obfuscated);
+                File.Copy(obfuscated, Path.Combine(managed, name + ".dll"), true);
+                Debug.Log("[ci-sdk] Obfuscated " + name + ".dll");
+            }
+        }
+
+        private static bool HasAll(string dir)
+        {
+            foreach (var name in Assemblies)
+                if (!File.Exists(Path.Combine(dir, name + ".dll"))) return false;
+            return true;
+        }
+
+        private static string FindManagedDir(string root)
+        {
+            var known = new List<string>
+            {
+                Path.Combine(root, "Temp", "StagingArea", "Data", "Managed"),
+                Path.Combine(root, "Temp", "StagingArea", "assets", "bin", "Data", "Managed"),
+            };
+            foreach (var dir in known)
+                if (Directory.Exists(dir) && HasAll(dir)) return dir;
+
+            var temp = Path.Combine(root, "Temp");
+            if (Directory.Exists(temp))
+            {
+                var hit = Directory.GetDirectories(temp, "*", SearchOption.AllDirectories)
+                    .Where(HasAll)
+                    .OrderByDescending(d => Directory.GetLastWriteTimeUtc(d))
+                    .FirstOrDefault();
+                if (hit != null) return hit;
+            }
+            throw new DirectoryNotFoundException(
+                "could not find the compiled player assemblies under " + temp
+                + " (looked for " + string.Join(", ", Assemblies.Select(a => a + ".dll").ToArray()) + ")");
+        }
+
+        private static string FindMono()
+        {
+            var data = EditorApplication.applicationContentsPath;
+            var isWindows = Application.platform == RuntimePlatform.WindowsEditor;
+            var exe = isWindows ? "mono.exe" : "mono";
+            var candidates = new[]
+            {
+                Path.Combine(data, "MonoBleedingEdge", "bin", exe),
+                Path.Combine(data, "Mono", "bin", exe),
+            };
+            foreach (var candidate in candidates)
+                if (File.Exists(candidate)) return candidate;
+            return exe; // fall back to PATH
+        }
+
+        // A double-quote, built from its code point so the generated source needs no escaping.
+        private static readonly string Q = ((char)34).ToString();
+
+        private static string Xml(string value)
+        {
+            return value
+                .Replace("&", "&amp;")
+                .Replace("<", "&lt;")
+                .Replace(">", "&gt;")
+                .Replace(Q, "&quot;");
+        }
+
+        private static string Attr(string name, string value)
+        {
+            return " " + name + "=" + Q + Xml(value) + Q;
+        }
+
+        private static string Quote(string value)
+        {
+            return Q + value + Q;
+        }
+
+        private static string GenerateConfig(string managed, string outDir, string root)
+        {
+            var full = Mode == "full";
+            var extra = "";
+            if (!string.IsNullOrEmpty(ExtraRulesRelative))
+            {
+                var rulesPath = Path.GetFullPath(Path.Combine(root, ExtraRulesRelative));
+                if (!File.Exists(rulesPath))
+                    throw new FileNotFoundException("obfuscate-config not found: " + rulesPath);
+                extra = File.ReadAllText(rulesPath);
+            }
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("<?xml version=" + Q + "1.0" + Q + " encoding=" + Q + "utf-8" + Q + "?>");
+            sb.AppendLine("<Obfuscator>");
+            sb.AppendLine("  <Var" + Attr("name", "InPath") + Attr("value", managed) + " />");
+            sb.AppendLine("  <Var" + Attr("name", "OutPath") + Attr("value", outDir) + " />");
+            sb.AppendLine("  <Var" + Attr("name", "KeepPublicApi") + Attr("value", "true") + " />");
+            sb.AppendLine("  <Var" + Attr("name", "HidePrivateApi") + Attr("value", full ? "true" : "false") + " />");
+            sb.AppendLine("  <Var" + Attr("name", "RenameProperties") + Attr("value", full ? "true" : "false") + " />");
+            sb.AppendLine("  <Var" + Attr("name", "RenameEvents") + Attr("value", full ? "true" : "false") + " />");
+            sb.AppendLine("  <Var" + Attr("name", "ReuseNames") + Attr("value", "true") + " />");
+            sb.AppendLine("  <Var" + Attr("name", "UseUnicodeNames") + Attr("value", "false") + " />");
+            sb.AppendLine("  <Var" + Attr("name", "HideStrings") + Attr("value", "true") + " />");
+            sb.AppendLine("  <Var" + Attr("name", "SuppressIldasm") + Attr("value", "true") + " />");
+            sb.AppendLine("  <AssemblySearchPath" + Attr("path", managed) + " />");
+            foreach (var name in Assemblies)
+            {
+                sb.AppendLine("  <Module" + Attr("file", Path.Combine(managed, name + ".dll")) + ">");
+                if (full)
+                {
+                    foreach (var typeName in RiskyTypeNames(name))
+                        sb.AppendLine("    <SkipType" + Attr("name", typeName) + Attr("skipMethods", "true") + Attr("skipFields", "true") + Attr("skipProperties", "true") + Attr("skipEvents", "true") + " />");
+                }
+                if (!string.IsNullOrEmpty(extra))
+                    sb.AppendLine(extra);
+                sb.AppendLine("  </Module>");
+            }
+            sb.AppendLine("</Obfuscator>");
+            return sb.ToString();
+        }
+
+        // Types Unity binds by name. A bare SkipType only keeps the type name; with HidePrivateApi the
+        // private fields and methods would still be renamed, so the config also sets skipMethods,
+        // skipFields, skipProperties and skipEvents. String hiding still applies inside them.
+        // Types declared under #if !UNITY_EDITOR are not seen in the editor domain, so they are not
+        // auto-skipped: validate a full build and add obfuscate-config exclusions when needed.
+        private static IEnumerable<string> RiskyTypeNames(string assemblyName)
+        {
+            var assembly = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => a.GetName().Name == assemblyName);
+            if (assembly == null) yield break;
+            Type[] types;
+            try
+            {
+                types = assembly.GetTypes();
+            }
+            catch (System.Reflection.ReflectionTypeLoadException ex)
+            {
+                types = ex.Types.Where(t => t != null).ToArray();
+            }
+            var unityObject = typeof(UnityEngine.Object);
+            foreach (var type in types)
+            {
+                if (type == null) continue;
+                var risky = unityObject.IsAssignableFrom(type) || type.IsEnum || type.IsSerializable;
+                if (risky)
+                    yield return type.FullName.Replace('+', '/');
+            }
+        }
+
+        private static int RunProcess(string file, string arguments, string workingDir)
+        {
+            var info = new System.Diagnostics.ProcessStartInfo(file, arguments)
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                WorkingDirectory = workingDir,
+            };
+            using (var process = new System.Diagnostics.Process())
+            {
+                process.StartInfo = info;
+                process.OutputDataReceived += (s, e) => { if (e.Data != null) Debug.Log("[Obfuscar] " + e.Data); };
+                process.ErrorDataReceived += (s, e) => { if (e.Data != null) Debug.LogWarning("[Obfuscar] " + e.Data); };
+                process.Start();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+                process.WaitForExit();
+                return process.ExitCode;
+            }
+        }
+    }
 `
 }
