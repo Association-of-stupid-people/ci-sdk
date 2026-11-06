@@ -38516,7 +38516,8 @@ const KEYS = new Set([
     'adgroup',
     'creative',
     'tracker-name',
-    'country'
+    'country',
+    'debug'
 ]);
 // Reserved: they are the special values of the `segment` input.
 const RESERVED = new Set(['all', 'none']);
@@ -38530,7 +38531,9 @@ function csString(value) {
     return value.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
 }
 /**
- * Parse and strictly validate the segment file.
+ * Parse and strictly validate the segment file. No segment is valid: an empty file (or only
+ * comments), no `segments` key, `segments:` with nothing under it and `segments: []` all give
+ * `{ segments: [] }`.
  * @throws {InputError} listing every problem found.
  */
 function parseSegmentFile(text, source = 'segment file') {
@@ -38547,6 +38550,9 @@ function parseSegmentFile(text, source = 'segment file') {
             { input: 'config', message: `${source}: invalid YAML: ${errorMessage(err)}` }
         ]);
     }
+    // An empty document (every segment commented out, `segments:` included) is no segment.
+    if (doc === null || doc === undefined)
+        return { segments: [] };
     if (!isRecord(doc)) {
         throw new InputError([{ input: 'config', message: `${source}: must be a YAML mapping` }]);
     }
@@ -38556,8 +38562,9 @@ function parseSegmentFile(text, source = 'segment file') {
     }
     const segments = [];
     const rawSegments = doc['segments'];
-    if (!Array.isArray(rawSegments) || rawSegments.length === 0) {
-        fail('"segments" must be a non-empty list');
+    if (rawSegments === undefined || rawSegments === null) ;
+    else if (!Array.isArray(rawSegments)) {
+        fail('"segments" must be a list');
     }
     else {
         const seen = new Set();
@@ -38628,7 +38635,17 @@ function parseSegment(raw, index, seen, fail) {
             bad(`${at('country')} must be an ISO 3166-1 alpha-2 code such as "US"`);
         }
     }
-    return ok ? { name, campaign, network, adgroup, creative, trackerName, country } : undefined;
+    const debugRaw = raw['debug'];
+    let debug = false;
+    if (debugRaw !== undefined && debugRaw !== null) {
+        if (typeof debugRaw === 'boolean')
+            debug = debugRaw;
+        else
+            bad(`${at('debug')} must be true or false`);
+    }
+    return ok
+        ? { name, campaign, network, adgroup, creative, trackerName, country, debug }
+        : undefined;
 }
 /**
  * Pick the segment a `segment` input asks for. `undefined` means "nothing to apply"
@@ -38644,10 +38661,10 @@ function resolveSegment(file, selector) {
 function findSegment(file, name) {
     const found = file.segments.find(s => s.name === name);
     if (!found) {
-        const known = file.segments.map(s => s.name).join(', ');
-        throw new InputError([
-            { input: 'segment', message: `unknown segment "${name}" (known: ${known})` }
-        ]);
+        const known = file.segments.length
+            ? `known: ${file.segments.map(s => s.name).join(', ')}`
+            : 'the file has no segments';
+        throw new InputError([{ input: 'segment', message: `unknown segment "${name}" (${known})` }]);
     }
     return found;
 }
@@ -39091,7 +39108,13 @@ async function run() {
         // What a build table needs before any build (e.g. a chat message when the build starts).
         const details = names.map(name => {
             const s = file.segments.find(x => x.name === name);
-            return { name, campaign: s.campaign, network: s.network, country: s.country ?? '' };
+            return {
+                name,
+                campaign: s.campaign,
+                network: s.network,
+                country: s.country ?? '',
+                debug: s.debug
+            };
         });
         setOutput('details', JSON.stringify(details));
         setOutput('count', String(names.length));
@@ -39109,7 +39132,8 @@ async function run() {
     if (!segment)
         throw new Error('unreachable: a named segment always resolves');
     const patched = await applyPatch({ projectRoot, segment, stateFile: defaultStateFile() });
-    info(`Forcing segment "${segment.name}" (campaign "${segment.campaign}")`);
+    const kind = segment.debug ? ', development build' : '';
+    info(`Forcing segment "${segment.name}" (campaign "${segment.campaign}"${kind})`);
     for (const changed of patched)
         info(`  patched ${changed}`);
     setOutput('enabled', 'true');
@@ -39120,6 +39144,7 @@ async function run() {
     setOutput('creative', segment.creative);
     setOutput('tracker-name', segment.trackerName);
     setOutput('country', segment.country ?? '');
+    setOutput('debug', String(segment.debug));
     setOutput('json', JSON.stringify({ ...segment, country: segment.country ?? '' }));
     setOutput('patched', patched.join('\n'));
 }
