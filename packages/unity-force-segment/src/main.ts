@@ -63,7 +63,13 @@ export async function run(): Promise<void> {
     // What a build table needs before any build (e.g. a chat message when the build starts).
     const details = names.map(name => {
       const s = file.segments.find(x => x.name === name)!
-      return { name, campaign: s.campaign, network: s.network, country: s.country ?? '' }
+      return {
+        name,
+        campaign: s.campaign,
+        network: s.network,
+        country: s.country ?? '',
+        debug: s.debug
+      }
     })
     core.setOutput('details', JSON.stringify(details))
     core.setOutput('count', String(names.length))
@@ -82,7 +88,8 @@ export async function run(): Promise<void> {
   if (!segment) throw new Error('unreachable: a named segment always resolves')
 
   const patched = await applyPatch({ projectRoot, segment, stateFile: defaultStateFile() })
-  core.info(`Forcing segment "${segment.name}" (campaign "${segment.campaign}")`)
+  const kind = segment.debug ? ', development build' : ''
+  core.info(`Forcing segment "${segment.name}" (campaign "${segment.campaign}"${kind})`)
   for (const changed of patched) core.info(`  patched ${changed}`)
 
   core.setOutput('enabled', 'true')
@@ -93,6 +100,7 @@ export async function run(): Promise<void> {
   core.setOutput('creative', segment.creative)
   core.setOutput('tracker-name', segment.trackerName)
   core.setOutput('country', segment.country ?? '')
+  core.setOutput('debug', String(segment.debug))
   core.setOutput('json', JSON.stringify({ ...segment, country: segment.country ?? '' }))
   core.setOutput('patched', patched.join('\n'))
 }

@@ -330,14 +330,21 @@ segments:
     creative: '' # optional
     tracker-name: '' # optional, default "<network>::<campaign>"
     country: US # optional ISO 3166-1 alpha-2; forces the IP country source too
+    debug: false # optional true/false, default false: the segment wants a development build
 ```
 
 The file is validated strictly (unknown keys, wrong types, duplicate names all fail with a clear
-message). Values are escaped for C# string literals.
+message). Values are escaped for C# string literals. No segment at all is valid, not an error: an
+empty file or one with only comments, no `segments` key, `segments:` with every entry commented
+out, and `segments: []` all list `[]`.
+
+`debug` changes nothing in the patch: the action only reports it (`debug` output of `apply`, and
+in `details`), and the workflow's build step decides what it means, e.g. a development build for
+that segment while the others build with the project's own settings.
 
 `mode: list` reads the file and outputs `segments` (compact JSON array of names, in file order),
-`details` (the same segments as `{name, campaign, network, country}` objects, for a build table)
-and `count`. The `segment` input filters: empty or `all` = every segment, `none` = `[]`, or a
+`details` (the same segments as `{name, campaign, network, country, debug}` objects, for a build
+table) and `count`. The `segment` input filters: empty or `all` = every segment, `none` = `[]`, or a
 comma-separated list of names (each must exist; a filter with no name, like `,`, fails). A missing file gives `[]` / `0` with a notice. It
 changes nothing in the project. Typical use: a `list` job feeds
 `strategy.matrix.segment: ${{ fromJSON(needs.segments.outputs.segments) }}`, and each matrix job
@@ -345,8 +352,9 @@ applies one segment. A matrix over `[]` fails the workflow, so guard the matrix 
 `if: needs.<job>.outputs.count != '0'`.
 
 Outputs of `apply`: `enabled` (`true` when a segment was applied), `name`, `campaign`, `network`,
-`adgroup`, `creative`, `tracker-name`, `country`, `json` (the segment as one compact JSON object:
-`name`, `campaign`, `network`, `adgroup`, `creative`, `trackerName`, `country`, `""` when unset) and
+`adgroup`, `creative`, `tracker-name`, `country`, `debug` (`true`/`false`), `json` (the segment as
+one compact JSON object: `name`, `campaign`, `network`, `adgroup`, `creative`, `trackerName`,
+`country` (`""` when unset), `debug`) and
 `patched` (newline-separated project-relative paths of the files changed or added). `enabled` is
 `false` (with a notice, not an error) when the segment is `none`/empty. A missing file or an unknown
 name fails.

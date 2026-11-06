@@ -26,7 +26,7 @@ outputs:
   details:
     description: >-
       list: JSON array of the same segments with what a build table needs:
-      {"name", "campaign", "network", "country"} ("" when unset)
+      {"name", "campaign", "network", "country", "debug"} (country "" when unset, debug true/false)
   count:
     description: 'list: number of segments'
   enabled:
@@ -45,8 +45,10 @@ outputs:
     description: Forced tracker name
   country:
     description: Forced IP country (empty when not forced)
+  debug:
+    description: '`true` when the segment asks for a development build (`debug: true`), else `false`'
   json:
-    description: Applied segment as compact JSON (name, campaign, network, adgroup, creative, trackerName, country)
+    description: Applied segment as compact JSON (name, campaign, network, adgroup, creative, trackerName, country, debug)
   patched:
     description: Newline-separated project-relative paths of the files changed or added
 

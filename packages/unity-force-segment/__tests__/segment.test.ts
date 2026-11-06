@@ -13,6 +13,7 @@ segments:
     adgroup: g
     creative: c
     tracker-name: custom
+    debug: true
 `
 
 function issues(text: string): string {
@@ -35,14 +36,31 @@ describe('parseSegmentFile', () => {
       adgroup: '',
       creative: '',
       trackerName: 'ForcedSegment::QA_IAPROAS',
-      country: 'US'
+      country: 'US',
+      debug: false
     })
     expect(file.segments[1]).toMatchObject({
       campaign: '',
       network: 'Organic',
       trackerName: 'custom',
-      country: undefined
+      country: undefined,
+      debug: true
     })
+  })
+
+  it.each([
+    ['an empty file', ''],
+    ['only comments', '# segments:\n#   - name: a\n#     campaign: x\n'],
+    ['no segments key', '{}'],
+    ['every entry commented out', 'segments:\n  # - name: a\n  #   campaign: x\n'],
+    ['an empty list', 'segments: []']
+  ])('has no segment for %s', (_name, text) => {
+    expect(parseSegmentFile(text)).toEqual({ segments: [] })
+  })
+
+  it.each(['debug: false', 'debug: ~', 'debug:'])('reads %j as false', field => {
+    const file = parseSegmentFile(`segments:\n  - name: a\n    campaign: x\n    ${field}\n`)
+    expect(file.segments[0]?.debug).toBe(false)
   })
 
   it.each([
@@ -53,7 +71,8 @@ describe('parseSegmentFile', () => {
       'x: 1\nsegments:\n  - {name: a, campaign: x}',
       'unknown top-level key "x"'
     ],
-    ['no segments', 'segments: []', '"segments" must be a non-empty list'],
+    ['segments not a list', 'segments: a', '"segments" must be a list'],
+    ['segments a mapping', 'segments:\n  name: a', '"segments" must be a list'],
     [
       'the removed default key',
       'default: a\nsegments:\n  - {name: a, campaign: x}',
@@ -72,6 +91,8 @@ describe('parseSegmentFile', () => {
     ],
     ['wrong type', 'segments:\n  - {name: a, campaign: 12}', 'campaign must be a string'],
     ['bad country', 'segments:\n  - {name: a, campaign: x, country: USA}', 'ISO 3166-1 alpha-2'],
+    ['debug not a boolean', 'segments:\n  - {name: a, campaign: x, debug: yes}', 'true or false'],
+    ['debug a string', 'segments:\n  - {name: a, campaign: x, debug: "true"}', 'true or false'],
     ['reserved name all', 'segments:\n  - {name: all, campaign: x}', 'is reserved'],
     [
       'newline in a value',
@@ -111,6 +132,11 @@ describe('resolveSegment', () => {
       /unknown segment "nope".*iaproas-us, organic/
     )
   })
+  it('says when the file has no segments', () => {
+    expect(() => resolveSegment(parseSegmentFile('segments:'), 'a')).toThrow(
+      /unknown segment "a" \(the file has no segments\)/
+    )
+  })
 })
 
 describe('listSegments', () => {
@@ -127,6 +153,9 @@ describe('listSegments', () => {
   })
   it('rejects an unknown name', () => {
     expect(() => listSegments(file, 'organic,nope')).toThrow(/unknown segment "nope"/)
+  })
+  it.each(['', 'all', 'none'])('lists nothing from a file without segments for %j', filter => {
+    expect(listSegments(parseSegmentFile('segments:'), filter)).toEqual([])
   })
   it.each([',', ' , ,'])('rejects a filter with no name: %j', filter => {
     expect(() => listSegments(file, filter)).toThrow(/no segment name/)

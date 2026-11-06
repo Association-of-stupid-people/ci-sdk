@@ -10,6 +10,11 @@ export interface Segment {
   trackerName: string
   /** Upper-case ISO 3166-1 alpha-2, or undefined when the IP country is left alone. */
   country: string | undefined
+  /**
+   * The segment wants a development build. The action only reports it (`debug` output); the
+   * workflow's build step decides what it changes. Default false.
+   */
+  debug: boolean
 }
 
 export interface SegmentFile {
@@ -29,7 +34,8 @@ const KEYS = new Set([
   'adgroup',
   'creative',
   'tracker-name',
-  'country'
+  'country',
+  'debug'
 ])
 // Reserved: they are the special values of the `segment` input.
 const RESERVED = new Set(['all', 'none'])
@@ -45,7 +51,9 @@ export function csString(value: string): string {
 }
 
 /**
- * Parse and strictly validate the segment file.
+ * Parse and strictly validate the segment file. No segment is valid: an empty file (or only
+ * comments), no `segments` key, `segments:` with nothing under it and `segments: []` all give
+ * `{ segments: [] }`.
  * @throws {InputError} listing every problem found.
  */
 export function parseSegmentFile(text: string, source = 'segment file'): SegmentFile {
@@ -62,6 +70,8 @@ export function parseSegmentFile(text: string, source = 'segment file'): Segment
       { input: 'config', message: `${source}: invalid YAML: ${errorMessage(err)}` }
     ])
   }
+  // An empty document (every segment commented out, `segments:` included) is no segment.
+  if (doc === null || doc === undefined) return { segments: [] }
   if (!isRecord(doc)) {
     throw new InputError([{ input: 'config', message: `${source}: must be a YAML mapping` }])
   }
@@ -71,8 +81,10 @@ export function parseSegmentFile(text: string, source = 'segment file'): Segment
 
   const segments: Segment[] = []
   const rawSegments = doc['segments']
-  if (!Array.isArray(rawSegments) || rawSegments.length === 0) {
-    fail('"segments" must be a non-empty list')
+  if (rawSegments === undefined || rawSegments === null) {
+    // `segments:` with every entry commented out: no segment.
+  } else if (!Array.isArray(rawSegments)) {
+    fail('"segments" must be a list')
   } else {
     const seen = new Set<string>()
     rawSegments.forEach((raw: unknown, index) => {
@@ -145,7 +157,16 @@ function parseSegment(
     }
   }
 
-  return ok ? { name, campaign, network, adgroup, creative, trackerName, country } : undefined
+  const debugRaw = raw['debug']
+  let debug = false
+  if (debugRaw !== undefined && debugRaw !== null) {
+    if (typeof debugRaw === 'boolean') debug = debugRaw
+    else bad(`${at('debug')} must be true or false`)
+  }
+
+  return ok
+    ? { name, campaign, network, adgroup, creative, trackerName, country, debug }
+    : undefined
 }
 
 /**
@@ -162,10 +183,10 @@ export function resolveSegment(file: SegmentFile, selector: string): Segment | u
 function findSegment(file: SegmentFile, name: string): Segment {
   const found = file.segments.find(s => s.name === name)
   if (!found) {
-    const known = file.segments.map(s => s.name).join(', ')
-    throw new InputError([
-      { input: 'segment', message: `unknown segment "${name}" (known: ${known})` }
-    ])
+    const known = file.segments.length
+      ? `known: ${file.segments.map(s => s.name).join(', ')}`
+      : 'the file has no segments'
+    throw new InputError([{ input: 'segment', message: `unknown segment "${name}" (${known})` }])
   }
   return found
 }

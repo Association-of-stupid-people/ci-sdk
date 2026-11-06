@@ -11,6 +11,7 @@ const CONFIG = `segments:
   - name: us
     campaign: QA_US
     country: us
+    debug: true
 `
 
 let project: string
@@ -57,7 +58,8 @@ describe('apply', () => {
       campaign: 'QA_X',
       network: 'ForcedSegment',
       'tracker-name': 'ForcedSegment::QA_X',
-      country: ''
+      country: '',
+      debug: 'false'
     })
     expect(JSON.parse(out['json']!)).toEqual({
       name: 'qa',
@@ -66,13 +68,25 @@ describe('apply', () => {
       adgroup: '',
       creative: '',
       trackerName: 'ForcedSegment::QA_X',
-      country: ''
+      country: '',
+      debug: false
     })
     expect(out['json']).not.toContain('\n')
     expect(out['patched']).toBe(`${ADJUST_PATH}\nAssets/Adjust/Scripts/AdjustCiForcedSegment.cs`)
 
     await call({ mode: 'restore' })
     expect(await readFile(path.join(project, ADJUST_PATH), 'utf8')).toBe(ADJUST_CS)
+  })
+
+  it('outputs debug for a development-build segment', async () => {
+    await writeFile(
+      path.join(project, 'segment-ci.yml'),
+      'segments:\n  - {name: dev, campaign: "", debug: true}\n'
+    )
+    const out = await call({ segment: 'dev' })
+    expect(out).toMatchObject({ enabled: 'true', name: 'dev', campaign: '', debug: 'true' })
+    expect(JSON.parse(out['json']!)).toMatchObject({ debug: true })
+    await call({ mode: 'restore' })
   })
 
   it.each(['', 'none'])('does nothing for segment %j', async segment => {
@@ -111,8 +125,8 @@ describe('list', () => {
   it('details carry campaign, network and country', async () => {
     const out = await call({ mode: 'list' })
     expect(JSON.parse(out['details']!)).toEqual([
-      { name: 'qa', campaign: 'QA_X', network: 'ForcedSegment', country: '' },
-      { name: 'us', campaign: 'QA_US', network: 'ForcedSegment', country: 'US' }
+      { name: 'qa', campaign: 'QA_X', network: 'ForcedSegment', country: '', debug: false },
+      { name: 'us', campaign: 'QA_US', network: 'ForcedSegment', country: 'US', debug: true }
     ])
   })
 
@@ -127,6 +141,15 @@ describe('list', () => {
 
   it('is empty, not an error, when the file is missing', async () => {
     await rm(path.join(project, 'segment-ci.yml'))
+    expect(await call({ mode: 'list' })).toEqual({ segments: '[]', details: '[]', count: '0' })
+  })
+
+  it.each([
+    ['every segment commented out', 'segments:\n  # - name: qa\n  #   campaign: QA_X\n'],
+    ['only comments', '# nothing to build\n'],
+    ['an empty list', 'segments: []']
+  ])('is empty, not an error, with %s', async (_name, text) => {
+    await writeFile(path.join(project, 'segment-ci.yml'), text)
     expect(await call({ mode: 'list' })).toEqual({ segments: '[]', details: '[]', count: '0' })
   })
 
