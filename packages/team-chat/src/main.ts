@@ -1,7 +1,6 @@
 import * as core from '@actions/core'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import pkg from '../../../package.json' with { type: 'json' }
 import { InputError, input, readInputs } from '../../sdk/src/index.js'
 import { buildPayload, checkLimits } from './payload.js'
 import { parseReport } from './report.js'
@@ -24,7 +23,7 @@ export async function run(sendOptions: SendOptions = {}): Promise<void> {
     ])
   }
   const report = parseReport(cfg.report ?? (await readFile(path.resolve(cfg.reportFile!), 'utf8')))
-  const payload = buildPayload(report, { sdkVersion: pkg.version })
+  const payload = buildPayload(report)
   const problems = checkLimits(payload)
   if (problems.length > 0) core.warning(`Chat payload over a webhook limit: ${problems.join('; ')}`)
 

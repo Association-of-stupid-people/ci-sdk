@@ -17,13 +17,17 @@ import {
   type Block,
   messageVariant,
   runStatus,
-  type Payload,
-  type TableCell
+  type Payload
 } from '../src/payload.js'
 import { parseReport, type Build, type Report } from '../src/report.js'
 import { sendPayload, webhookKeyForms, webhookLabel, type Fetch } from '../src/send.js'
 
 const RUN = 'https://github.com/acme/Game/actions/runs/1'
+const DRIVE = 'https://drive.google.com/drive/folders/EXAMPLE'
+/** U+2060 WORD JOINER: `defang` inserts it after a `.` before a letter (invisible in the client). */
+const WJ = String.fromCharCode(0x2060)
+/** The keystore file name as it renders after defang (the `.k` gets a word joiner). */
+const KEYSTORE = `My-Game.${WJ}keystore`
 const segment = (name: string, ok = true, extra: Partial<Build> = {}): Build => ({
   name,
   kind: 'segment',
@@ -46,6 +50,7 @@ function debugReport(over: Partial<Report> = {}): Report {
     status: 'success',
     game: 'My Game',
     platform: 'Android',
+    driveFolderUrl: DRIVE,
     project: { name: 'acme/My-Game', url: 'https://github.com/acme/My-Game' },
     run: { url: RUN, number: 128 },
     ref: { type: 'branch', name: 'main' },
@@ -85,7 +90,11 @@ function releaseReport(over: Partial<Report> = {}): Report {
     name: 'My-Game',
     kind: 'release',
     status: 'success',
+    game: 'My Game',
     platform: 'Android',
+    keystore: 'My-Game.keystore',
+    driveFolderUrl: DRIVE,
+    actor: 'dev',
     run: { url: RUN, number: 60 },
     ref: { type: 'tag', name: 'v1.0.2' },
     commit: { sha: 'abcdef0123', subject: 'chore: release' },
@@ -114,9 +123,10 @@ function releaseReport(over: Partial<Report> = {}): Report {
 const find = <T extends Block['type']>(p: Payload, type: T): Extract<Block, { type: T }>[] =>
   p.blocks.filter((b): b is Extract<Block, { type: T }> => b.type === type)
 const json = (p: Payload): string => JSON.stringify(p)
-/** Visible text of a table cell. */
-const cellText = (c: TableCell): string =>
-  c.type === 'raw_text' ? c.text : c.elements.flatMap(e => e.elements.map(x => x.text)).join('')
+/** The one alert block's three lines. */
+const alertLines = (p: Payload): string[] => find(p, 'alert')[0]!.text.text.split('\n')
+/** The one context line. */
+const contextText = (p: Payload): string => find(p, 'context')[0]!.elements[0]!.text
 /** Every string the server reads as mrkdwn: `text` and the mrkdwn text objects. */
 function mrkdwnStrings(p: Payload): string[] {
   const out = [p.text]
@@ -156,27 +166,20 @@ describe('escaping', () => {
         actor: evil,
         ref: { type: 'branch', name: evil },
         commit: { sha: 'abc1234', subject: evil },
-        warnings: [evil],
-        builds: [{ name: evil, kind: 'normal', status: 'failure', failedStep: evil }],
-        changelog: [{ sha: 'abc1234', subject: evil, author: evil }]
+        driveFolderUrl: undefined,
+        builds: [{ name: evil, kind: 'normal', status: 'failure', failedStep: evil }]
       })
     )
     const body = json(p)
     for (const text of mrkdwnStrings(p)) expect(text).not.toMatch(/<!|<@|<https:\/\/evil/)
-    // Untrusted text elsewhere is only in literal rich_text `text` elements and plain_text.
     expect(body).not.toMatch(/"type":"(broadcast|user)"/)
-    for (const cell of find(p, 'table')[0]!.rows.slice(1).flat()) {
-      if (cell.type === 'raw_text') expect(cell.text).not.toContain('<')
-    }
+    // The push line is the only place untrusted text is left raw (it is never rendered).
     expect(p.text).toContain('&lt;!channel&gt;')
-    // rich_text and raw_text cells are literal text, not mrkdwn.
-    expect(body).toContain(JSON.stringify(evil).slice(1, -1).slice(0, 20))
     expect(checkLimits(p)).toEqual([])
   })
 })
 
 describe('hardening', () => {
-  const WJ = String.fromCharCode(0x2060)
   const allAlerts = (p: Payload): string[] => find(p, 'alert').map(a => a.text.text)
 
   it('defang: plain URLs, domains and @names are not linked; versions stay as they are', () => {
@@ -193,32 +196,27 @@ describe('hardening', () => {
         runner: lure,
         commit: { sha: 'abc1234', subject: lure },
         ref: { type: 'branch', name: lure },
-        warnings: [lure],
-        project: { name: lure, url: 'https://github.com/acme/Game' },
-        builds: [
-          { name: lure, kind: 'normal', status: 'failure', failedStep: lure },
-          { name: 'seg', kind: 'segment', status: 'success', campaign: lure, country: lure }
-        ],
-        changelog: [{ sha: 'abc1234', subject: lure, author: lure }]
+        driveFolderUrl: undefined,
+        builds: [{ name: lure, kind: 'normal', status: 'failure', failedStep: lure }]
       })
     )
+    // Every rendered mrkdwn string (all but the push line) is defanged.
     for (const text of mrkdwnStrings(p).slice(1)) {
       expect(text).not.toMatch(/https:\/\/evil|evil\.test|evil\.com|@here/)
     }
-    // Link labels, table cells and the changelog too (rich_text `text` elements).
     expect(JSON.stringify(p.blocks)).not.toMatch(/https:\/\/evil|evil\.test|evil\.com|@here/)
     // The notification line is not rendered: it stays searchable.
     expect(p.text).toContain('https://evil.test/login')
   })
 
-  it('every alert stays under 3000 chars after escaping', () => {
+  it('never exceeds the alert limit, even with pathological input', () => {
     const heavy = '&<>'.repeat(100)
     const many = Array.from({ length: 40 }, (_, i): Build => ({
       name: `${heavy}${i}`,
       kind: 'segment',
       status: 'success',
-      fallback: true,
-      link: 'https://github.com/acme/Game/actions/runs/1/artifacts/1'
+      size: 85_000_000,
+      link: `https://drive.google.com/file/d/seg${i}/view`
     }))
     const longUrl = `https://github.com/acme/Game/actions/runs/2?${'q'.repeat(450)}`
     const reports: Report[] = [
@@ -228,35 +226,66 @@ describe('hardening', () => {
         jobs: { apk: 'cancelled' },
         failedStep: '&'.repeat(5000),
         supersededBy: { number: 129, url: longUrl },
-        logUrl: longUrl,
         run: { url: longUrl, number: 128 },
         builds: many
       }),
       debugReport({
         status: 'failure',
         failedStep: '&'.repeat(5000),
-        logUrl: longUrl,
         run: { url: longUrl, number: 128 },
-        builds: [debugReport().builds[0]!, ...many, segment('x', false)],
-        warnings: Array.from({ length: 20 }, () => '&'.repeat(1000))
+        builds: [
+          debugReport().builds[0]!,
+          ...Array.from({ length: 40 }, (_, i): Build => ({
+            name: `${heavy}${i}`,
+            kind: 'segment',
+            status: 'failure',
+            failedStep: '&'.repeat(200),
+            logUrl: 'https://github.com/acme/Game/actions/runs/1/artifacts/1'
+          }))
+        ]
       })
     ]
     for (const report of reports) {
       const p = buildPayload(report)
       expect(checkLimits(p)).toEqual([])
       for (const text of allAlerts(p)) expect(text.length).toBeLessThanOrEqual(LIMITS.alertText)
-      expect(allAlerts(p).join('\n')).toMatch(/\+\d+ more/)
     }
+  })
+
+  it('caps long lists with +N more', () => {
+    const many = Array.from({ length: 40 }, (_, i): Build => ({
+      name: `seg-${i}`,
+      kind: 'segment',
+      status: 'success',
+      size: 85_000_000,
+      link: `https://drive.google.com/file/d/seg${i}/view`
+    }))
+    const p = buildPayload(debugReport({ builds: [debugReport().builds[0]!, ...many] }))
+    // The downloads line is capped and ends with "+N more".
+    expect(alertLines(p)[2]).toMatch(/\+\d+ more$/)
+    expect(checkLimits(p)).toEqual([])
+
+    const failed = Array.from({ length: 6 }, (_, i): Build => ({
+      name: `seg-${i}`,
+      kind: 'segment',
+      status: 'failure',
+      failedStep: 'Unity build'
+    }))
+    const q = buildPayload(
+      debugReport({ status: 'failure', builds: [debugReport().builds[0]!, ...failed] })
+    )
+    // The failed-build list on line 2 keeps the first two, then "+N more".
+    expect(alertLines(q)[1]).toContain('+4 more')
   })
 
   it('numbers where strings are expected do not crash the card', () => {
     const report = debugReport({
       name: 5 as unknown as string,
+      game: 5 as unknown as string,
       actor: 7 as unknown as string,
       commit: { sha: 1234567890 as unknown as string, subject: 42 as unknown as string },
       version: { name: 1 as unknown as string, code: 19 },
-      builds: [{ name: 3 as unknown as string, kind: 'normal', status: 'success' }],
-      changelog: [{ sha: 99 as unknown as string, subject: 'x', author: 8 as unknown as string }]
+      builds: [{ name: 3 as unknown as string, kind: 'normal', status: 'success' }]
     })
     const p = buildPayload(report)
     expect(p.text.startsWith('✅ 5 · Debug #128')).toBe(true)
@@ -269,7 +298,7 @@ describe('hardening', () => {
         })
       )
     ).toThrow(
-      /commit\.sha must be a string[\s\S]*version\.name must be a string[\s\S]*builds\[0\]\.campaign must be a string[\s\S]*changelog\[0\]\.sha must be a string/
+      /commit\.sha must be a string[\s\S]*version\.name must be a string[\s\S]*builds\[0\]\.campaign must be a string/
     )
   })
 
@@ -277,56 +306,30 @@ describe('hardening', () => {
     expect(truncate(`a${'😀'.repeat(10)}`, 6)).toBe('a😀😀…')
     expect(truncate('abc', 3)).toBe('abc')
     expect(truncate('abc', 0)).toBe('')
-    const p = buildPayload(debugReport({ name: '😀'.repeat(200) }))
-    expect(find(p, 'header')[0]!.text.text.length).toBeLessThanOrEqual(LIMITS.header)
+    const p = buildPayload(debugReport({ name: '😀'.repeat(200), game: '😀'.repeat(200) }))
+    expect(find(p, 'alert')[0]!.text.text.length).toBeLessThanOrEqual(LIMITS.alertText)
     expect(checkLimits(p)).toEqual([])
   })
 })
 
-describe('buildPayload', () => {
-  it('debug all green', () => {
-    const p = buildPayload(debugReport(), { sdkVersion: '3.4.0' })
-    expect(p.text).toBe('✅ My-Game · Debug #128 · 3/3 builds OK · 12m34s')
-    expect(find(p, 'header')[0]!.text).toEqual({
-      type: 'plain_text',
-      text: '✅ My-Game · Debug #128'
-    })
-    const fields = find(p, 'section')[0]!.fields!.map(f => f.text)
-    expect(fields).toEqual([
-      '*Branch*\nmain',
-      '*Commit*\n<https://github.com/acme/Game/commit/abcdef0|abcdef0> feat: new level',
-      '*Version*\n1.0.9 (19)',
-      '*Duration*\n12m34s',
-      '*Game*\nMy Game',
-      '*Build*\nAndroid · Debug',
-      '*Triggered by*\ndev'
+describe('buildPayload (compact card v3)', () => {
+  it('debug all green: three lines, sizes on every link, grey context', () => {
+    const p = buildPayload(debugReport())
+    expect(p.text).toBe('✅ My Game · Debug #128 · 3/3 OK · 12m')
+    expect(alertLines(p)).toEqual([
+      '*✅ My Game · Debug #128 · 3/3 OK*',
+      '⏱ 12m34s · 1.0.9 (19)',
+      '📦 <https://drive.google.com/file/d/n/view|Normal (1.0 MB)> · <https://drive.google.com/file/d/iaproas-us/view|iaproas-us (2.0 MB)> · <https://drive.google.com/file/d/organic-us/view|organic-us (2.0 MB)>'
     ])
-    const rows = find(p, 'table')[0]!.rows
-    expect(rows[0]!.map(cellText)).toEqual(['Build', 'Campaign', 'Country', 'Result', 'Link'])
-    expect(rows[1]!.slice(0, 4).map(cellText)).toEqual(['Normal', '—', '—', '✅'])
-    expect(rows[2]!.slice(0, 3).map(cellText)).toEqual(['iaproas-us', 'QA_IAPROAS-US', 'US'])
-    expect(rows[1]![4]).toEqual({
-      type: 'rich_text',
-      elements: [
-        {
-          type: 'rich_text_section',
-          elements: [
-            { type: 'link', url: 'https://drive.google.com/file/d/n/view', text: 'Drive · 1.0 MB' }
-          ]
-        }
-      ]
-    })
-    expect(cellText(rows[3]![1]!)).toBe('(organic)')
-    expect(find(p, 'alert')).toEqual([
-      { type: 'alert', level: 'success', text: { type: 'mrkdwn', text: 'All 3 builds OK.' } }
-    ])
-    expect(find(p, 'context')[0]!.elements[0]!.text).toBe(
-      `GitHub Actions · <https://github.com/acme/My-Game|acme/My-Game> · <${RUN}|Run #128> · ci-sdk v3.4.0`
+    expect(find(p, 'alert')[0]!.level).toBe('success')
+    expect(contextText(p)).toBe(
+      `main · <https://github.com/acme/Game/commit/abcdef0|abcdef0> feat: new level · dev · <${DRIVE}|Drive> · <${RUN}|Run #128>`
     )
+    expect(p.blocks).toHaveLength(2)
     expect(checkLimits(p)).toEqual([])
   })
 
-  it('debug with failed segments is a warning, not an error', () => {
+  it('debug with a failed segment is a warning, names the failed build with its log', () => {
     const p = buildPayload(
       debugReport({
         status: 'failure',
@@ -334,211 +337,119 @@ describe('buildPayload', () => {
         builds: [debugReport().builds[0]!, segment('iaproas-us'), segment('organic-us', false)]
       })
     )
-    expect(p.text).toBe(
-      '⚠️ My-Game · Debug #128 failed at segment organic-us · 2/3 builds OK · 12m34s'
-    )
-    const [alert] = find(p, 'alert')
-    expect(alert!.level).toBe('warning')
-    expect(alert!.text.text).toContain('*Failed:* segment organic-us')
-    const failedRow = find(p, 'table')[0]!.rows[3]!
-    expect(cellText(failedRow[3]!)).toBe('❌ Unity build')
-    expect(JSON.stringify(failedRow[4])).toContain('Unity log')
+    expect(p.text).toBe('⚠️ My Game · Debug #128 · 2/3 OK')
+    expect(find(p, 'alert')[0]!.level).toBe('warning')
+    expect(alertLines(p)).toEqual([
+      '*⚠️ My Game · Debug #128 · 2/3 OK*',
+      '⏱ 12m34s · ❌ organic-us: Unity build (<https://github.com/acme/Game/actions/runs/1/artifacts/9|log>)',
+      '📦 <https://drive.google.com/file/d/n/view|Normal (1.0 MB)> · <https://drive.google.com/file/d/iaproas-us/view|iaproas-us (2.0 MB)>'
+    ])
   })
 
-  it('debug whose normal build failed is an error with the log link', () => {
+  it('debug whose normal build failed is an error; no downloads line', () => {
     const p = buildPayload(
       debugReport({
         status: 'failure',
         failedStep: 'Unity build',
-        logUrl: 'https://github.com/acme/Game/actions/runs/1/artifacts/7',
-        builds: [{ name: 'Normal', kind: 'normal', status: 'failure', failedStep: 'Unity build' }]
+        builds: [
+          {
+            name: 'Normal',
+            kind: 'normal',
+            status: 'failure',
+            failedStep: 'Unity build',
+            logUrl: 'https://github.com/acme/Game/actions/runs/1/artifacts/7'
+          }
+        ]
       })
     )
-    expect(p.text.startsWith('❌ My-Game · Debug #128 failed at Unity build')).toBe(true)
-    const [alert] = find(p, 'alert')
-    expect(alert!.level).toBe('error')
-    expect(alert!.text.text).toBe(
-      `*Failed at* Unity build · <https://github.com/acme/Game/actions/runs/1/artifacts/7|Unity log> · <${RUN}|Run #128>`
-    )
-    // No segment columns without segments.
-    expect(find(p, 'table')[0]!.rows[0]!.length).toBe(3)
+    expect(p.text).toBe('❌ My Game · Debug #128 · 0/1 OK')
+    expect(find(p, 'alert')[0]!.level).toBe('error')
+    expect(alertLines(p)).toEqual([
+      '*❌ My Game · Debug #128 · 0/1 OK*',
+      '⏱ 12m34s · ❌ Normal: Unity build (<https://github.com/acme/Game/actions/runs/1/artifacts/7|log>)'
+    ])
   })
 
-  it('release ready', () => {
+  it('release ready: keystore key fact and AAB/APK sizes', () => {
     const p = buildPayload(releaseReport())
-    expect(p.text).toBe('🚀 My-Game · Release v1.0.2 (10002) ready')
-    expect(find(p, 'header')[0]!.text.text).toBe('🚀 My-Game · Release v1.0.2 (10002)')
-    const [alert] = find(p, 'alert')
-    expect(alert).toEqual({
-      type: 'alert',
-      level: 'success',
-      text: {
-        type: 'mrkdwn',
-        text: 'Release v1.0.2 (10002) is ready: AAB (store), APK (QA, universal).'
-      }
-    })
-    expect(find(p, 'table')[0]!.rows.map(r => r.length)).toEqual([3, 3, 3])
-    expect(json(p)).toContain('Drive · 160.0 MB')
+    expect(p.text).toBe('🚀 My Game · Release v1.0.2 ready')
+    expect(find(p, 'alert')[0]!.level).toBe('success')
+    expect(alertLines(p)).toEqual([
+      '*🚀 My Game · Release v1.0.2 (10002)*',
+      `⏱ 30m00s · 🔑 ${KEYSTORE}`,
+      '📦 <https://drive.google.com/file/d/a/view|AAB (store) (160.0 MB)> · <https://drive.google.com/file/d/b/view|APK (QA, universal) (225.7 MB)>'
+    ])
+    expect(contextText(p)).toBe(
+      `v1.0.2 · abcdef0 chore: release · dev · <${DRIVE}|Drive> · <${RUN}|Run #60>`
+    )
   })
 
-  it('release failed, and release built with a fallback upload', () => {
-    const failed = buildPayload(
+  it('release failed at AAB to APK: error, the built AAB still shows', () => {
+    const p = buildPayload(
       releaseReport({
         status: 'failure',
         failedStep: 'AAB to APK',
+        logUrl: 'https://github.com/acme/Game/actions/runs/1',
         builds: [
           releaseReport().builds[0]!,
           { name: 'APK (QA, universal)', kind: 'apk', status: 'failure', failedStep: 'AAB to APK' }
         ]
       })
     )
-    expect(failed.text).toBe('❌ My-Game · Release v1.0.2 (10002) failed at AAB to APK')
-    expect(find(failed, 'alert').map(a => a.level)).toEqual(['error'])
+    expect(p.text).toBe('❌ My Game · Release v1.0.2 failed: AAB to APK')
+    expect(find(p, 'alert')[0]!.level).toBe('error')
+    expect(alertLines(p)).toEqual([
+      '*❌ My Game · Release v1.0.2 (10002) · failed*',
+      '⏱ 30m00s · ❌ AAB to APK (<https://github.com/acme/Game/actions/runs/1|log>)',
+      '📦 <https://drive.google.com/file/d/a/view|AAB (store) (160.0 MB)>'
+    ])
+  })
 
-    const fallback = buildPayload(
+  it('release built but the Drive upload failed is a warning (partial)', () => {
+    const p = buildPayload(
       releaseReport({
         status: 'failure',
         failedStep: 'Upload to Drive (release APK)',
-        builds: [
-          releaseReport().builds[0]!,
-          {
-            name: 'APK (QA, universal)',
-            kind: 'apk',
-            status: 'success',
-            link: 'https://github.com/a/b/artifacts/1',
-            fallback: true
-          }
-        ],
-        warnings: ['Drive is not set up']
+        logUrl: 'https://github.com/acme/Game/actions/runs/1'
       })
     )
-    expect(fallback.text).toBe(
-      '⚠️ My-Game · Release v1.0.2 (10002) built · Upload to Drive (release APK) failed'
-    )
-    const [alert] = find(fallback, 'alert')
-    expect(alert!.level).toBe('warning')
-    expect(alert!.text.text.split('\n')).toEqual([
-      `*Failed:* Upload to Drive (release APK) · <${RUN}|Run #60>`,
-      'Not on Drive, GitHub artifact instead: APK (QA, universal)',
-      'Drive is not set up'
-    ])
-    expect(json(fallback)).toContain('GitHub artifact')
+    expect(p.text).toBe('⚠️ My Game · Release v1.0.2 · Upload to Drive (release APK) failed')
+    expect(find(p, 'alert')[0]!.level).toBe('warning')
+    expect(alertLines(p)[0]).toBe('*⚠️ My Game · Release v1.0.2 (10002) · built*')
   })
 
-  it('a release that failed before the version is known', () => {
+  it('a build with an unknown size shows its name only', () => {
     const p = buildPayload(
-      releaseReport({
-        status: 'failure',
-        failedStep: 'Release setup (tag vX.Y.Z or keystore)',
-        ref: { type: 'tag', name: 'v1.2' },
-        version: {},
+      debugReport({
         builds: [
-          { name: 'AAB (store)', kind: 'aab', status: 'failure', failedStep: 'Release setup' },
-          {
-            name: 'APK (QA, universal)',
-            kind: 'apk',
-            status: 'failure',
-            failedStep: 'Release setup'
-          }
+          { name: 'Normal', kind: 'normal', status: 'success', link: 'https://x.test/a' },
+          segment('iaproas-us')
         ]
       })
     )
-    expect(p.text).toBe(
-      '❌ My-Game · Release v1.2 failed at Release setup (tag vX.Y.Z or keystore)'
+    expect(alertLines(p)[2]).toBe(
+      '📦 <https://x.test/a|Normal> · <https://drive.google.com/file/d/iaproas-us/view|iaproas-us (2.0 MB)>'
     )
-    expect(find(p, 'section')[0]!.fields!.some(f => f.text.startsWith('*Version*'))).toBe(false)
-  })
-
-  it('changelog: newest 10, then +N earlier', () => {
-    const changelog = Array.from({ length: 14 }, (_, i) => ({
-      sha: `${i}`.padStart(7, '0'),
-      subject: `change ${i}`,
-      author: 'a'
-    }))
-    const p = buildPayload(debugReport({ changelog }))
-    const rich = find(p, 'rich_text')[0]!
-    const list = rich.elements[1]!
-    expect(list.type).toBe('rich_text_list')
-    const items = (list as { elements: { elements: { text: string }[] }[] }).elements
-    expect(items).toHaveLength(11)
-    expect(items[0]!.elements[0]!.text).toBe('change 4 (')
-    expect(items[10]!.elements[0]!.text).toBe('+4 earlier')
-  })
-
-  it('cuts to the limits: many builds, long names, long changelog', () => {
-    const builds: Build[] = [
-      {
-        name: 'Normal',
-        kind: 'normal',
-        status: 'success',
-        link: 'https://drive.google.com/file/d/n/view'
-      },
-      ...Array.from({ length: 150 }, (_, i) =>
-        segment(`segment-with-a-rather-long-name-${i}-${'x'.repeat(40)}`, i % 7 !== 3, {
-          campaign: 'C'.repeat(300)
-        })
-      )
-    ]
-    const changelog = Array.from({ length: 50 }, (_, i) => ({
-      sha: `${i}abcdef`,
-      subject: 'S'.repeat(500),
-      author: 'A'.repeat(100)
-    }))
-    const p = buildPayload(
-      debugReport({
-        status: 'failure',
-        failedStep: 'F'.repeat(5000),
-        name: 'N'.repeat(400),
-        game: 'G'.repeat(5000),
-        commit: { sha: 'abc', subject: 'S'.repeat(5000) },
-        builds,
-        changelog,
-        warnings: Array.from({ length: 20 }, () => 'W'.repeat(1000))
-      })
-    )
-    expect(checkLimits(p)).toEqual([])
-    expect(Array.from(find(p, 'header')[0]!.text.text).length).toBeLessThanOrEqual(LIMITS.header)
-    const rows = find(p, 'table')[0]!.rows
-    // Main build first, then the failed segments, then a "+N more" row.
-    expect(cellText(rows[1]![0]!)).toBe('Normal')
-    expect(cellText(rows[2]![3]!)).toBe('❌ Unity build')
-    expect(cellText(rows.at(-1)![0]!)).toMatch(/^\+\d+ more \(see the run\)$/)
-    expect(rows.at(-1)!.slice(1).map(cellText)).toEqual(['—', '—', '—', '—'])
-    expect(p.text.length).toBeLessThanOrEqual(LIMITS.text)
-  })
-
-  it('no builds: no table, still valid', () => {
-    const p = buildPayload(
-      debugReport({ builds: [], changelog: [], status: 'failure', failedStep: 'Unity license' })
-    )
-    expect(find(p, 'table')).toEqual([])
-    expect(find(p, 'alert')[0]!.level).toBe('error')
-    expect(p.text).toBe('❌ My-Game · Debug #128 failed at Unity license · 0/0 builds OK · 12m34s')
-    expect(checkLimits(p)).toEqual([])
   })
 })
 
 describe('message lifecycle', () => {
-  const debugStart = (): Report => ({
+  const debugStart = (over: Partial<Report> = {}): Report => ({
     ...debugReport(),
     phase: 'start',
     event: 'push',
     runner: 'runner-windows',
     startedAt: '05/11/2026 14:30 (UTC+7)',
+    eta: '~36m (~18:58)',
     durationSeconds: undefined,
     changelog: [],
     builds: [
       { name: 'Normal', kind: 'normal', status: 'planned' },
       ...['iaproas-us', 'iaaroas-us', 'organic-us', 'iaproas-vn', 'iaaroas-vn', 'organic-vn'].map(
-        (name): Build => ({
-          name,
-          kind: 'segment',
-          status: 'planned',
-          campaign: 'QA',
-          country: 'US'
-        })
+        (name): Build => ({ name, kind: 'segment', status: 'planned' })
       )
-    ]
+    ],
+    ...over
   })
 
   it.each<[string, Partial<Report>, Build[] | undefined, string]>([
@@ -600,82 +511,72 @@ describe('message lifecycle', () => {
     ).toBe('success')
   })
 
-  it('START (debug): planned outputs, info alert, no links or duration', () => {
+  it('START (debug): ETA, version, planned list, short push text', () => {
     const p = buildPayload(debugStart())
-    expect(p.text).toBe('🛠️ My-Game · Đang build Debug #128 · 7 bản (normal + 6 segment)')
-    expect(find(p, 'header')[0]!.text.text).toBe('🛠️ My-Game · Đang build Debug #128')
-    const fields = find(p, 'section')[0]!.fields!.map(f => f.text.split('\n')[0])
-    expect(fields).toEqual([
-      '*Branch*',
-      '*Commit*',
-      '*Version*',
-      '*Game*',
-      '*Build*',
-      '*Triggered by*',
-      '*Event*',
-      '*Runner*',
-      '*Started*'
+    expect(p.text).toBe('🛠️ My Game · Đang build Debug #128')
+    expect(find(p, 'alert')[0]!.level).toBe('info')
+    expect(alertLines(p)).toEqual([
+      '*🛠️ My Game · Đang build Debug #128*',
+      '⏱ ETA ~36m (~18:58) · 1.0.9 (19)',
+      '🎯 Normal + 6 segment: iaproas-us · iaaroas-us · organic-us · iaproas-vn · iaaroas-vn · organic-vn'
     ])
-    const rows = find(p, 'table')[0]!.rows
-    expect(rows[0]!.map(cellText)).toEqual(['Build', 'Campaign', 'Country', 'Status'])
-    expect(rows).toHaveLength(8)
-    expect(rows.slice(1).every(r => cellText(r[3]!) === '⏳ planned')).toBe(true)
-    const [alert] = find(p, 'alert')
-    expect(alert!.level).toBe('info')
-    expect(alert!.text.text).toContain('Building 7 builds on runner-windows.')
-    expect(find(p, 'section')[0]!.fields!.find(f => f.text.startsWith('*Event*'))!.text).toBe(
-      '*Event*\npush'
+    // The context line is the same shape on START and END (no event/runner in v3).
+    expect(contextText(p)).toBe(
+      `main · <https://github.com/acme/Game/commit/abcdef0|abcdef0> feat: new level · dev · <${DRIVE}|Drive> · <${RUN}|Run #128>`
     )
     expect(checkLimits(p)).toEqual([])
   })
 
-  it('START (release)', () => {
+  it('START without a previous run omits the ETA', () => {
+    const p = buildPayload(debugStart({ eta: undefined }))
+    expect(alertLines(p)[1]).toBe('⏱ 1.0.9 (19)')
+    expect(alertLines(p)[1]).not.toContain('ETA')
+  })
+
+  it('START (release): keystore and the AAB + APK plan', () => {
     const p = buildPayload({
       ...releaseReport(),
       phase: 'start',
+      eta: '~25m (~18:47)',
+      durationSeconds: undefined,
       builds: releaseReport().builds.map(b => ({
         name: b.name,
         kind: b.kind,
         status: 'planned' as const
       }))
     })
-    expect(p.text).toBe('🛠️ My-Game · Đang build Release v1.0.2 (10002)')
-    expect(find(p, 'table')[0]!.rows.map(r => r.map(cellText))).toEqual([
-      ['Build', 'Status'],
-      ['AAB (store)', '⏳ planned'],
-      ['APK (QA, universal)', '⏳ planned']
+    expect(p.text).toBe('🛠️ My Game · Đang build Release v1.0.2')
+    expect(alertLines(p)).toEqual([
+      '*🛠️ My Game · Đang build Release v1.0.2 (10002)*',
+      `⏱ ETA ~25m (~18:47) · 🔑 ${KEYSTORE}`,
+      '🎯 AAB (store) + APK (QA, universal)'
     ])
   })
 
-  it('END cancelled: duration, stage, superseded run, what finished', () => {
+  it('END cancelled: stage, superseded run, what finished with sizes', () => {
     const p = buildPayload(
       debugReport({
         status: undefined,
         jobs: { apk: 'success', segment: 'cancelled', release: 'skipped' },
-        failedStep: 'segment builds',
+        failedStep: 'organic-us',
         supersededBy: { number: 129, url: 'https://github.com/acme/Game/actions/runs/2' },
         builds: [
           debugReport().builds[0]!,
           segment('iaproas-us'),
-          { name: 'organic-us', kind: 'segment', status: 'cancelled', campaign: '', country: 'US' }
+          { name: 'organic-us', kind: 'segment', status: 'cancelled' }
         ]
       })
     )
-    expect(p.text).toBe(
-      '🚫 My-Game · Debug #128 cancelled after 12m34s · during segment builds · superseded by run #129'
-    )
-    const [alert] = find(p, 'alert')
-    expect(alert!.level).toBe('default')
-    expect(alert!.text.text).toBe(
-      `*Cancelled* after 12m34s, during segment builds. Superseded by <https://github.com/acme/Game/actions/runs/2|Run #129>. Finished before the cancel: Normal, iaproas-us. · <${RUN}|Run #128>`
-    )
-    const rows = find(p, 'table')[0]!.rows
-    expect(cellText(rows[3]![3]!)).toBe('🚫 cancelled')
-    expect(cellText(rows[3]![4]!)).toBe('—')
-    expect(cellText(rows[1]![4]!)).toBe('Drive · 1.0 MB')
+    expect(p.text).toBe('🚫 My Game · Debug #128 cancelled')
+    expect(find(p, 'alert')[0]!.level).toBe('default')
+    expect(alertLines(p)).toEqual([
+      '*🚫 My Game · Debug #128 · cancelled*',
+      '⏱ 12m34s · during organic-us · superseded by <https://github.com/acme/Game/actions/runs/2|#129>',
+      '📦 <https://drive.google.com/file/d/n/view|Normal (1.0 MB)> · <https://drive.google.com/file/d/iaproas-us/view|iaproas-us (2.0 MB)>'
+    ])
   })
 
-  it('END cancelled while queued: nothing finished', () => {
+  it('END cancelled while queued: nothing finished, two lines', () => {
     const p = buildPayload(
       debugReport({
         status: undefined,
@@ -684,14 +585,24 @@ describe('message lifecycle', () => {
         builds: []
       })
     )
-    expect(p.text).toBe('🚫 My-Game · Debug #128 cancelled')
-    expect(find(p, 'alert')[0]!.text.text).toContain('Nothing finished before the cancel.')
+    expect(p.text).toBe('🚫 My Game · Debug #128 cancelled')
+    expect(alertLines(p)[0]).toBe('*🚫 My Game · Debug #128 · cancelled*')
   })
 })
 
 describe('parseReport', () => {
-  it('accepts a report and ignores unknown keys', () => {
-    expect(parseReport(JSON.stringify({ ...debugReport(), extra: 1 })).name).toBe('My-Game')
+  it('accepts a report (with the v3 fields) and ignores unknown keys', () => {
+    const r = parseReport(
+      JSON.stringify({
+        ...debugReport(),
+        eta: '~36m (~18:58)',
+        keystore: 'My-Game.keystore',
+        driveFolderUrl: DRIVE,
+        extra: 1
+      })
+    )
+    expect(r.name).toBe('My-Game')
+    expect(r.eta).toBe('~36m (~18:58)')
   })
   it('lists every problem', () => {
     expect(() => parseReport('nope')).toThrow(/not valid JSON/)
@@ -881,11 +792,11 @@ describe('run', () => {
     expect(fetchImpl).not.toHaveBeenCalled()
     expect(out).toMatchObject({
       sent: 'false',
-      text: '🚀 My-Game · Release v1.0.2 (10002) ready'
+      text: '🚀 My Game · Release v1.0.2 ready'
     })
     const payload = JSON.parse(await readFile(payloadFile, 'utf8')) as Payload
     expect(checkLimits(payload)).toEqual([])
-    expect(JSON.stringify(payload)).toMatch(/ci-sdk v\d+\.\d+\.\d+/)
+    expect(payload.blocks.map(b => b.type)).toEqual(['alert', 'context'])
   })
 
   it('an empty webhook sends nothing; a report file works', async () => {
@@ -907,7 +818,6 @@ describe('run', () => {
     expect(log).toContain(
       '::warning::Chat message not sent (ma=0123456789ab…, 1 tries): HTTP 404 no_active_hooks'
     )
-    // The only copy is the runner's own ::add-mask:: command (consumed, never shown in the log).
     expect(
       log
         .split('\n')

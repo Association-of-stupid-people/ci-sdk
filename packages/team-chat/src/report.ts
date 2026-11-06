@@ -57,7 +57,16 @@ export interface Report {
   runner?: string
   /** When the build started, already formatted for people (e.g. `05/11/2026 14:30 (UTC+7)`). */
   startedAt?: string
-  /** Product name, when it differs from `name`. */
+  /**
+   * START only: the estimated time, already formatted (e.g. `~36m (~18:58)`), from the previous
+   * successful run of the same kind. Omitted when there is no previous run to estimate from.
+   */
+  eta?: string
+  /** Release only: the keystore file name shown as the signing key (never a password). */
+  keystore?: string
+  /** The Drive folder the builds were uploaded to; adds a `Drive` link to the context line. */
+  driveFolderUrl?: string
+  /** Product name (Unity productName), shown on the card instead of the repo `name`. */
   game?: string
   platform?: string
   /** A build without caches. */
@@ -138,6 +147,9 @@ export function parseReport(raw: string): Report {
     }
   }
   str(r.failedStep, 'failedStep')
+  str(r.eta, 'eta')
+  str(r.keystore, 'keystore')
+  str(r.driveFolderUrl, 'driveFolderUrl')
   str(r.game, 'game')
   str(r.platform, 'platform')
   str(r.actor, 'actor')
