@@ -46,6 +46,7 @@ export {
   type AnnotationLocation
 } from './log.js'
 export { runAction } from './action.js'
+export { listZip, extractZipEntry } from './zip.js'
 export {
   GitHubClient,
   GitHubApiError,
