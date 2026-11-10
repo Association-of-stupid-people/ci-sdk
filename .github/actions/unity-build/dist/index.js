@@ -36,7 +36,7 @@ import 'timers';
 import { existsSync, readFileSync, createWriteStream } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdir as mkdir$1, mkdtemp, rm as rm$1, readFile } from 'node:fs/promises';
+import { rm as rm$1, mkdir as mkdir$1, writeFile as writeFile$1, readFile, readdir as readdir$1, mkdtemp } from 'node:fs/promises';
 import 'node:stream/promises';
 import path$1 from 'node:path';
 import os$1 from 'node:os';
@@ -30612,6 +30612,23 @@ async function group(name, fn) {
         endGroup();
     }
 }
+/**
+ * Run `fn` with workflow commands disabled, for steps that stream untrusted
+ * output live (e.g. `exec` of a remote script). `fn` must not call `core.*`
+ * commands itself (`setOutput`/`saveState` use files and are fine).
+ */
+async function withoutCommands(fn) {
+    const token = `ci-sdk-${randomUUID()}`;
+    info(`::stop-commands::${token}`);
+    try {
+        return await fn();
+    }
+    finally {
+        // Leading newline: fn's output may end mid-line (killed process), and the
+        // runner only reads the resume command at the start of a line.
+        info(`\n::${token}::`);
+    }
+}
 /** Error/warning annotations shown on the PR "Files changed" tab and run summary. */
 const annotate = {
     error(message, where = {}) {
@@ -31029,6 +31046,406 @@ function modulesForTarget(buildTarget, hostPlatform) {
         return [module];
     const standalone = STANDALONE[key];
     return standalone && standalone[0] !== hostPlatform ? [standalone[1]] : [];
+}
+
+/**
+ * BIBG Debug View for QA builds: the client file goes into Assets/ and Firebase.Analytics.dll is
+ * patched so every managed Firebase call is mirrored. Release safety rests on `cleanDebugView`,
+ * which runs before every build (a persistent workspace may hold a killed QA run's leftovers).
+ */
+/** The client folder (relative to the Unity project); its `.meta` sits next to it. */
+const DEBUG_VIEW_DIR = 'Assets/BibgDebugView';
+const CLIENT_FILE = 'BibgDebugView.cs';
+const PATCH_TOOL_FILE = 'BibgFirebasePatch.cs';
+const DEFAULT_DEBUG_VIEW_URL = 'https://bi.blackgems.org';
+const DEFAULT_FIREBASE_DLL = 'Assets/Firebase/Plugins/Firebase.Analytics.dll';
+const URL_PLACEHOLDER = '__BIBG_DEBUGVIEW_URL__';
+const BUILD_PLACEHOLDER = '__BIBG_DEBUGVIEW_BUILD__';
+/** The type the Firebase patch adds: never present in an original Firebase.Analytics.dll. */
+const PATCH_MARKER = 'BibgDebugViewHooks';
+/** Temp file the patch tool writes next to the DLL before it moves it in place. */
+const PATCH_TMP_SUFFIX = '.bibg.tmp';
+const DOWNLOAD_TIMEOUT_MS = 60_000;
+const PATCH_TIMEOUT_MS = 15 * 60_000;
+const MAX_LABEL = 100;
+const clientUrl = (base) => `${base}/api/v1/sdk/debugview/${CLIENT_FILE}`;
+const patchToolUrl = (base) => `${base}/api/v1/sdk/debugview/${PATCH_TOOL_FILE}`;
+/**
+ * The BIBG base URL: https only, no credentials, query or fragment, no trailing slash. It is
+ * written into a C# string literal, so it must hold no quote, backslash or control character.
+ */
+function parseBaseUrl(raw) {
+    let url;
+    try {
+        url = new URL(raw.trim());
+    }
+    catch {
+        throw new Error(`not a URL: ${raw}`);
+    }
+    if (url.protocol !== 'https:')
+        throw new Error(`must be an https URL: ${raw}`);
+    if (url.username || url.password)
+        throw new Error('must not contain credentials');
+    if (url.search || url.hash)
+        throw new Error('must not have a query or fragment');
+    const base = url.href.replace(/\/+$/, '');
+    if (/\/api\/v1$/i.test(base))
+        throw new Error('is the base URL, without /api/v1');
+    if (!/^https:\/\/[A-Za-z0-9._~:/@!$&'()*+,;=%-]+$/.test(base)) {
+        throw new Error(`has characters that cannot go into the client: ${raw}`);
+    }
+    return base;
+}
+/**
+ * Build label shown in the Debug View tab: `<ref>@<sha7> #<run>`, reduced to the characters the
+ * BIBG sample keeps (it lands in a C# literal). Runs of `_` are collapsed and a leading `_` dropped,
+ * so a branch name can never bring back a placeholder or start like one (`__BIBG_` = unset).
+ */
+function buildLabel(parts) {
+    const raw = `${parts.refName ?? ''}@${(parts.sha ?? '').slice(0, 7)} #${parts.runNumber ?? ''}`;
+    return raw
+        .replace(/[^A-Za-z0-9._@#/ +-]/g, '')
+        .replace(/_{2,}/g, '_')
+        .replace(/^_+/, '')
+        .slice(0, MAX_LABEL);
+}
+/** Replace both placeholders; fails when the file lacks one or one survives. */
+function fillPlaceholders(source, url, label) {
+    for (const p of [URL_PLACEHOLDER, BUILD_PLACEHOLDER]) {
+        if (!source.includes(p)) {
+            throw new CiError('E_DEBUG_VIEW_CLIENT', `${CLIENT_FILE} has no ${p} placeholder`);
+        }
+    }
+    // Function replacers: `$'`, `$&` or `$$` in a value must stay literal text.
+    const out = source
+        .replaceAll(URL_PLACEHOLDER, () => url)
+        .replaceAll(BUILD_PLACEHOLDER, () => label);
+    if (out.includes(URL_PLACEHOLDER) || out.includes(BUILD_PLACEHOLDER)) {
+        throw new CiError('E_DEBUG_VIEW_CLIENT', `${CLIENT_FILE} still holds a placeholder`);
+    }
+    return out;
+}
+/** Inject only when asked for, and never on a tag (a release), whatever the caller passed. */
+function debugViewGate(opts) {
+    if (!opts.enabled)
+        return { inject: false, reason: 'off' };
+    if (opts.refType === 'tag' || opts.ref?.startsWith('refs/tags/')) {
+        return { inject: false, reason: 'tag' };
+    }
+    return { inject: true };
+}
+/** File name the patch accepts, so every build's cleanup finds a patched copy by name. */
+const FIREBASE_DLL_NAME = 'Firebase.Analytics.dll';
+/**
+ * The Firebase.Analytics.dll to patch and restore: the input, else FIREBASE_ANALYTICS_DLL, else the
+ * default, relative to the project. `none` = the game has no committed Firebase DLL (LogBridge
+ * fallback). Must stay inside the project.
+ */
+function resolveFirebaseDll(raw, envValue, projectDir) {
+    const given = raw?.trim() || envValue?.trim() || '';
+    if (given.toLowerCase() === 'none')
+        return undefined;
+    const value = given || DEFAULT_FIREBASE_DLL;
+    const abs = path$1.resolve(projectDir, value);
+    const rel = path$1.relative(projectDir, abs);
+    if (!rel || rel.startsWith('..') || path$1.isAbsolute(rel)) {
+        throw new Error(`must be a file inside the project (${projectDir}): ${value}`);
+    }
+    return { rel: rel.split(path$1.sep).join('/'), abs, explicit: Boolean(given) };
+}
+/** A path git must take as is (no glob or pathspec magic, whatever the input holds). */
+const literal = (rel) => `:(literal)${rel}`;
+/** git in the project; no git on the runner is an exit code null with a message, not a throw. */
+async function git(projectDir, args, signal) {
+    try {
+        return await exec('git', args, {
+            cwd: projectDir,
+            allowFailure: true,
+            silent: true,
+            timeout: 120_000,
+            signal
+        });
+    }
+    catch (err) {
+        if (err instanceof CiError && err.code === 'E_EXEC_SPAWN') {
+            return {
+                command: `git ${args.join(' ')}`,
+                exitCode: null,
+                signal: null,
+                stdout: '',
+                stderr: 'no git on the runner',
+                durationMs: 0
+            };
+        }
+        throw err;
+    }
+}
+async function gitState(projectDir, rel, signal) {
+    const res = await git(projectDir, ['ls-files', '--error-unmatch', '--', literal(rel)], signal);
+    if (res.exitCode === 0)
+        return { kind: 'tracked' };
+    // 1 = not in the index; anything else (not a repository, dubious ownership, no git) is unknown.
+    if (res.exitCode === 1)
+        return { kind: 'untracked' };
+    return { kind: 'unknown', reason: res.stderr.trim() || `git exit code ${res.exitCode}` };
+}
+const gitStateText = (state) => state.kind === 'unknown'
+    ? `git cannot tell if it is tracked (${state.reason})`
+    : 'not tracked by git';
+async function hasPatchMarker(file) {
+    return (await readFile(file)).includes(PATCH_MARKER);
+}
+/** `git checkout HEAD -- <rel>`, then fail unless the file equals HEAD and holds no patch. */
+async function restoreFromGit(projectDir, rel, signal) {
+    await rm$1(path$1.join(projectDir, `${rel}${PATCH_TMP_SUFFIX}`), { force: true });
+    const co = await git(projectDir, ['checkout', 'HEAD', '--', literal(rel)], signal);
+    if (co.exitCode !== 0) {
+        throw new CiError('E_DEBUG_VIEW_STALE', `git checkout HEAD -- ${rel} failed: ${co.stderr.trim() || `exit code ${co.exitCode}`}`);
+    }
+    const diff = await git(projectDir, ['diff', '--quiet', 'HEAD', '--', literal(rel)], signal);
+    if (diff.exitCode !== 0) {
+        throw new CiError('E_DEBUG_VIEW_STALE', diff.exitCode === 1
+            ? `${rel} still differs from git after the restore (patched Firebase.Analytics.dll)`
+            : `git diff -- ${rel} failed: ${diff.stderr.trim() || `exit code ${diff.exitCode}`}`);
+    }
+}
+const patchedError = (rel) => new CiError('E_DEBUG_VIEW_STALE', `${rel} contains the BIBG Debug View patch (${PATCH_MARKER}): restore the original Firebase.Analytics.dll`);
+/**
+ * Before every build (release included): remove the client and restore Firebase.Analytics.dll from
+ * git (HEAD), and fail when either cannot be made clean. Besides the configured DLL, every tracked
+ * `Firebase.Analytics.dll` of the project that holds the patch is restored too, so a QA build that
+ * patched another path (or a release with `none`) cannot leave it behind. A DLL git does not track
+ * cannot be restored: it only has to be free of the patch. Also the post-build removal.
+ */
+async function cleanDebugView(opts) {
+    const { projectDir, dll, signal } = opts;
+    const dir = path$1.join(projectDir, DEBUG_VIEW_DIR);
+    const meta = `${dir}.meta`;
+    await rm$1(dir, { recursive: true, force: true, maxRetries: 3 });
+    await rm$1(meta, { force: true, maxRetries: 3 });
+    for (const p of [dir, meta]) {
+        if (existsSync(p))
+            throw new CiError('E_DEBUG_VIEW_STALE', `Stale BIBG Debug View client: ${p}`);
+    }
+    if (dll) {
+        const state = await gitState(projectDir, dll.rel, signal);
+        if (state.kind === 'tracked') {
+            await restoreFromGit(projectDir, dll.rel, signal);
+        }
+        else {
+            await rm$1(`${dll.abs}${PATCH_TMP_SUFFIX}`, { force: true });
+            if (existsSync(dll.abs)) {
+                opts.warn(`${dll.rel}: ${gitStateText(state)}, so it cannot be restored, only checked for the patch`);
+            }
+            else if (dll.explicit) {
+                // No Firebase DLL here (a game without Firebase): nothing can be patched.
+                opts.warn(`${dll.rel} does not exist: no Firebase.Analytics.dll to restore`);
+            }
+        }
+    }
+    // Every other tracked Firebase.Analytics.dll (the patch only accepts that name): restored when patched.
+    const listed = await git(projectDir, ['ls-files', '-z', '--', `:(glob,icase)**/${FIREBASE_DLL_NAME}`], signal);
+    if (listed.exitCode === 0) {
+        for (const rel of listed.stdout.split('\0').filter(Boolean)) {
+            if (rel === dll?.rel)
+                continue;
+            const abs = path$1.join(projectDir, rel);
+            if (!existsSync(abs) || !(await hasPatchMarker(abs)))
+                continue;
+            await restoreFromGit(projectDir, rel, signal);
+            if (await hasPatchMarker(abs))
+                throw patchedError(rel);
+            opts.log(`${rel}: held the Debug View patch, restored from git`);
+        }
+    }
+    else {
+        // git cannot list them: nothing can be restored, but a patched copy must still stop the build.
+        for (const rel of await findByName(path$1.join(projectDir, 'Assets'), FIREBASE_DLL_NAME)) {
+            if (await hasPatchMarker(path$1.join(projectDir, 'Assets', rel))) {
+                throw patchedError(`Assets/${rel.split(path$1.sep).join('/')}`);
+            }
+        }
+    }
+    // Last, so the sweep above can restore a configured path git lists with another case.
+    // Also catches a patched DLL that was committed or staged by mistake.
+    if (dll && existsSync(dll.abs)) {
+        if (await hasPatchMarker(dll.abs))
+            throw patchedError(dll.rel);
+        opts.log(`${dll.rel}: original Firebase.Analytics.dll`);
+    }
+}
+/** Files named `name` (any case) under `dir`, relative to it; none when `dir` does not exist. */
+async function findByName(dir, name) {
+    if (!existsSync(dir))
+        return [];
+    const wanted = name.toLowerCase();
+    return (await readdir$1(dir, { recursive: true })).filter(rel => path$1.basename(rel).toLowerCase() === wanted);
+}
+class DownloadError extends CiError {
+    retryable;
+    constructor(message, retryable) {
+        super('E_DEBUG_VIEW_DOWNLOAD', message);
+        this.retryable = retryable;
+    }
+}
+/** GET a public BIBG file over https (fail closed: non-empty, holds every `mustContain`). */
+async function download(url, mustContain, opts) {
+    const fetchImpl = opts.fetchImpl ?? fetch;
+    const name = url.split('/').pop() ?? url;
+    return retry$1(async () => {
+        let res;
+        try {
+            const timeout = AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS);
+            res = await fetchImpl(url, {
+                signal: opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout
+            });
+        }
+        catch (err) {
+            if (opts.signal?.aborted)
+                throw err;
+            throw new DownloadError(`${name} download failed: ${err instanceof Error ? err.message : String(err)} (${url})`, true);
+        }
+        // A redirect must not downgrade to cleartext.
+        if (res.url && !res.url.startsWith('https://')) {
+            throw new DownloadError(`${name} download was redirected off https: ${res.url}`, false);
+        }
+        if (!res.ok) {
+            // Not awaited: a cancel can wait on a tee'd branch; the body only has to be released.
+            void res.body?.cancel().catch(() => undefined);
+            const retryable = res.status >= 500 || res.status === 408 || res.status === 429;
+            throw new DownloadError(`${name} download failed: HTTP ${res.status} (${url})`, retryable);
+        }
+        let text;
+        try {
+            text = await res.text();
+        }
+        catch (err) {
+            if (opts.signal?.aborted)
+                throw err;
+            throw new DownloadError(`${name} download failed while reading: ${err instanceof Error ? err.message : String(err)} (${url})`, true);
+        }
+        if (text.trim() === '')
+            throw new DownloadError(`${name} download is empty (${url})`, true);
+        const missing = mustContain.filter(s => !text.includes(s));
+        if (missing.length) {
+            throw new DownloadError(`${name} download does not look like ${name} (no ${missing.join(', ')}) (${url})`, false);
+        }
+        return text;
+    }, {
+        attempts: 3,
+        minDelay: opts.minDelay ?? '2s',
+        signal: opts.signal,
+        retryIf: err => err instanceof DownloadError && err.retryable,
+        onRetry: (err, attempt) => opts.warn(`${err instanceof Error ? err.message : String(err)}; retry ${attempt}`)
+    });
+}
+/** Download the client into Assets/BibgDebugView and fill in the URL and build label. */
+async function injectClient(opts) {
+    const source = await download(clientUrl(opts.baseUrl), [URL_PLACEHOLDER, BUILD_PLACEHOLDER], {
+        fetchImpl: opts.fetchImpl,
+        signal: opts.signal,
+        minDelay: opts.retryDelay,
+        warn: opts.warn
+    });
+    const code = fillPlaceholders(source, opts.baseUrl, opts.label);
+    const dir = path$1.join(opts.projectDir, DEBUG_VIEW_DIR);
+    const file = path$1.join(dir, CLIENT_FILE);
+    await mkdir$1(dir, { recursive: true });
+    await writeFile$1(file, code);
+    opts.log(`BIBG Debug View client injected: ${file} (url ${opts.baseUrl}, build "${opts.label}")`);
+    return file;
+}
+/** `dotnet` from DOTNET_ROOT (setup-dotnet sets it), else from PATH. */
+function dotnetCommand(env = process.env) {
+    const root = env.DOTNET_ROOT;
+    if (root) {
+        const bin = path$1.join(root, process.platform === 'win32' ? 'dotnet.exe' : 'dotnet');
+        if (existsSync(bin))
+            return bin;
+    }
+    return 'dotnet';
+}
+const NO_DOTNET = 'The Firebase patch needs the .NET 10 SDK: add actions/setup-dotnet (dotnet-version 10.0.x) before ' +
+    'this step or preinstall it on the runner, or set firebase-analytics-dll: none (LogBridge fallback)';
+const PATCH_EXIT = {
+    1: 'the DLL does not look as the tool expects, was patched by another tool version (restore the original), or could not be read/written',
+    2: 'usage error'
+};
+/**
+ * Patch Firebase.Analytics.dll with BibgFirebasePatch.cs (a .NET 10 file-based app) before Unity
+ * starts. The tool lives in `toolDir`, outside Assets/ so Unity never imports it. The DLL must be
+ * tracked by git: the next cleanup restores it from there.
+ */
+async function patchFirebaseDll(opts) {
+    const { dll, signal } = opts;
+    if (path$1.basename(dll.abs).toLowerCase() !== FIREBASE_DLL_NAME.toLowerCase()) {
+        // The cleanup of every build finds a patched DLL by this name, whatever its inputs say.
+        throw new CiError('E_DEBUG_VIEW_PATCH', `firebase-analytics-dll must be a ${FIREBASE_DLL_NAME}: ${dll.rel}`);
+    }
+    const assets = path$1.join(opts.projectDir, 'Assets');
+    const toolRel = path$1.relative(assets, opts.toolDir);
+    if (!toolRel.startsWith('..') && !path$1.isAbsolute(toolRel)) {
+        throw new CiError('E_DEBUG_VIEW_PATCH', `The patch tool must not go under Assets/: ${opts.toolDir}`);
+    }
+    if (!existsSync(dll.abs)) {
+        throw new CiError('E_DEBUG_VIEW_PATCH', `Missing ${dll.rel}: set firebase-analytics-dll to the committed Firebase.Analytics.dll, or none to use the LogBridge fallback`);
+    }
+    const state = await gitState(opts.projectDir, dll.rel, signal);
+    if (state.kind !== 'tracked') {
+        throw new CiError('E_DEBUG_VIEW_PATCH', `${dll.rel}: ${gitStateText(state)}, so the patched DLL could not be restored after the build. Commit it, or set firebase-analytics-dll: none`);
+    }
+    const dotnet = opts.dotnet ?? dotnetCommand();
+    let sdks;
+    try {
+        const res = await exec(dotnet, ['--list-sdks'], {
+            allowFailure: true,
+            silent: true,
+            timeout: 60_000,
+            signal
+        });
+        sdks = res.exitCode === 0 ? res.stdout : '';
+    }
+    catch (err) {
+        if (err instanceof CiError && err.code === 'E_EXEC_SPAWN') {
+            throw new CiError('E_DEBUG_VIEW_DOTNET', `${NO_DOTNET} (${err.message})`);
+        }
+        throw err;
+    }
+    if (!/^10\./m.test(sdks)) {
+        throw new CiError('E_DEBUG_VIEW_DOTNET', `${NO_DOTNET}. Installed SDKs: ${sdks.trim().replace(/\s*\r?\n\s*/g, ', ') || 'none'}`);
+    }
+    const source = await download(patchToolUrl(opts.baseUrl), [PATCH_MARKER], {
+        fetchImpl: opts.fetchImpl,
+        signal,
+        minDelay: opts.retryDelay,
+        warn: opts.warn
+    });
+    await mkdir$1(opts.toolDir, { recursive: true });
+    const tool = path$1.join(opts.toolDir, PATCH_TOOL_FILE);
+    await writeFile$1(tool, source);
+    opts.log(`dotnet run --file ${tool} -- ${dll.abs}`);
+    // The tool's output is downloaded code's output: shown, never run as workflow commands.
+    const res = await withoutCommands(async () => exec(dotnet, ['run', '--file', tool, '--', dll.abs], {
+        cwd: opts.toolDir,
+        env: {
+            ...opts.env,
+            DOTNET_CLI_TELEMETRY_OPTOUT: '1',
+            DOTNET_NOLOGO: '1',
+            DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+        },
+        inheritEnv: opts.env === undefined,
+        allowFailure: true,
+        timeout: PATCH_TIMEOUT_MS,
+        signal
+    }));
+    if (res.exitCode !== 0) {
+        const why = (res.exitCode !== null && PATCH_EXIT[res.exitCode]) || 'see the log above';
+        throw new CiError('E_DEBUG_VIEW_PATCH', `Firebase patch failed (exit code ${res.exitCode ?? res.signal}): ${why}`);
+    }
+    if (!(await hasPatchMarker(dll.abs))) {
+        throw new CiError('E_DEBUG_VIEW_PATCH', `Firebase patch exited 0 but ${dll.rel} has no ${PATCH_MARKER}`);
+    }
+    opts.log(`${dll.rel} patched: Firebase Analytics calls are mirrored to the Debug View`);
 }
 
 /** Where the project is mounted inside the container. */
@@ -31833,6 +32250,7 @@ function summaryMarkdown(s) {
         ...(s.runtime ? [`| ${s.mode === 'docker' ? 'Image' : 'Editor'} | \`${s.runtime}\` |`] : []),
         `| Attempts | ${s.attempts} |`,
         ...(s.failureKind ? [`| Failure | ${KIND_TEXT[s.failureKind]} |`] : []),
+        ...(s.debugView !== undefined ? [`| BIBG Debug View | on (\`${s.debugView}\`) |`] : []),
         `| Log | \`${s.logFile}\` |`,
         ''
     ];
@@ -32237,7 +32655,10 @@ const readSpecs = {
         name: 'clean-gradle-cache',
         default: 'auto'
     }),
-    summary: input.boolean({ default: true })
+    summary: input.boolean({ default: true }),
+    debugView: input.boolean({ name: 'debug-view', default: false }),
+    debugViewUrl: input.string({ name: 'debug-view-url', default: DEFAULT_DEBUG_VIEW_URL }),
+    firebaseDll: input.string({ name: 'firebase-analytics-dll' })
 };
 /**
  * Variables a JavaScript action receives that a `run:` step never had: the
@@ -32283,6 +32704,30 @@ async function run(options = {}) {
     const ci = getCiContext();
     const licensePatterns = parsePatterns(cfg.licensePatterns);
     const projectDir = path$1.resolve(process.cwd(), cfg.workdir);
+    // BIBG Debug View: the cleanup runs in every build; inject/patch only when asked, never on a tag.
+    const firebaseDll = (() => {
+        try {
+            return resolveFirebaseDll(cfg.firebaseDll, process.env.FIREBASE_ANALYTICS_DLL, projectDir);
+        }
+        catch (err) {
+            throw new InputError([{ input: 'firebase-analytics-dll', message: err.message }]);
+        }
+    })();
+    const gate = debugViewGate({ enabled: cfg.debugView, refType: ci.refType, ref: ci.ref });
+    if (!gate.inject && gate.reason === 'tag') {
+        warning('debug-view is ignored on a tag build: a release never gets the BIBG Debug View');
+    }
+    // Only validated when used, like obfuscate-assemblies.
+    const debugViewUrl = gate.inject
+        ? (() => {
+            try {
+                return parseBaseUrl(cfg.debugViewUrl);
+            }
+            catch (err) {
+                throw new InputError([{ input: 'debug-view-url', message: err.message }]);
+            }
+        })()
+        : '';
     // Version: input, then the UNITY_VER variable, then the project itself.
     const project = await readProjectVersion(projectDir);
     const version = cfg.version || process.env.UNITY_VER?.trim() || project?.version;
@@ -32674,7 +33119,47 @@ async function run(options = {}) {
         maxDelay: '10m',
         jitter: false // as documented: the delay doubles, a busy license seat needs the wait
     };
+    const debugViewIo = {
+        log: (m) => info(m),
+        warn: (m) => warning(m)
+    };
     const pipeline = new Pipeline({ name: 'unity-build', state, ci })
+        // First, in every build: a QA run killed before its removal must not leak into this build.
+        .step('remove stale Debug View', async (ctx) => cleanDebugView({ projectDir, dll: firebaseDll, ...debugViewIo, signal: ctx.signal }));
+    if (gate.inject) {
+        const label = buildLabel({ refName: ci.refName, sha: ci.sha, runNumber: ci.runNumber });
+        pipeline.step('inject Debug View', async (ctx) => {
+            await injectClient({
+                projectDir,
+                baseUrl: debugViewUrl,
+                label,
+                fetchImpl: options.fetch,
+                retryDelay: options.downloadRetryDelay,
+                ...debugViewIo,
+                signal: ctx.signal
+            });
+            // Before Unity starts: Unity must not have the DLL loaded.
+            if (firebaseDll) {
+                await patchFirebaseDll({
+                    projectDir,
+                    dll: firebaseDll,
+                    baseUrl: debugViewUrl,
+                    toolDir: path$1.join(ci.runner.temp ?? os$1.tmpdir(), 'bibg-fbpatch'),
+                    dotnet: options.dotnet,
+                    env: childEnv({}),
+                    fetchImpl: options.fetch,
+                    retryDelay: options.downloadRetryDelay,
+                    ...debugViewIo,
+                    signal: ctx.signal
+                });
+            }
+            else {
+                info('firebase-analytics-dll: none: no Firebase patch (LogBridge fallback)');
+            }
+            ctx.state.debugView = label;
+        });
+    }
+    pipeline
         .step('clean gradle cache', cleanGradleCache, { if: () => cleanGradle, continueOnError: true })
         .step(inDocker ? `docker image (Unity ${version})` : `locate Unity ${version}`, inDocker ? prepareImage : resolveEditor);
     // Added only when used, so the other setups keep their step list.
@@ -32692,6 +33177,10 @@ async function run(options = {}) {
     });
     if (returnHostLicense) {
         pipeline.always('return Unity license', returnLicense, { continueOnError: true });
+    }
+    // Tidiness only (the stale cleanup of the next build is the guarantee); also after a failure.
+    if (gate.inject) {
+        pipeline.always('remove Debug View', async (ctx) => cleanDebugView({ projectDir, dll: firebaseDll, ...debugViewIo, signal: ctx.signal }), { continueOnError: true });
     }
     const report = await pipeline.run();
     const failedStep = report.steps.find(s => s.status === 'failure' || s.status === 'cancelled');
@@ -32712,6 +33201,7 @@ async function run(options = {}) {
     setOutput('failure-kind', state.failureKind ?? '');
     setOutput('log-file', logFile);
     setOutput('errors', JSON.stringify(state.issues.map(i => i.message)));
+    setOutput('debug-view', String(state.debugView !== undefined));
     if (cfg.summary && process.env.GITHUB_STEP_SUMMARY) {
         await summary
             .addRaw(summaryMarkdown({
@@ -32723,7 +33213,8 @@ async function run(options = {}) {
             failureKind: state.failureKind,
             issues: state.issues,
             totalIssues: state.totalIssues,
-            logFile
+            logFile,
+            debugView: state.debugView
         }), true)
             .write();
     }
