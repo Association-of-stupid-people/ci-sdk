@@ -172,6 +172,25 @@ inputs:
     description: Write the result and the Unity log errors to the job summary.
     required: false
     default: 'true'
+  debug-view:
+    description: >-
+      QA builds only: inject the BIBG Debug View client into Assets/BibgDebugView and patch
+      firebase-analytics-dll before Unity starts, both removed after the build. Ignored on a tag
+      build (a release never gets it). Whatever this says, every build first removes a stale
+      client and restores the Firebase DLL from git, and fails if it cannot.
+    required: false
+    default: 'false'
+  debug-view-url:
+    description: BIBG base URL (https) that serves the Debug View files and receives the events.
+    required: false
+    default: 'https://bi.blackgems.org'
+  firebase-analytics-dll:
+    description: >-
+      Firebase.Analytics.dll committed in the project, relative to workdir. Empty = the
+      FIREBASE_ANALYTICS_DLL variable, then Assets/Firebase/Plugins/Firebase.Analytics.dll. none =
+      the game has no committed Firebase DLL: no patch (LogBridge fallback) and no restore of this
+      path. Any other tracked Firebase.Analytics.dll holding the patch is restored in every build.
+    required: false
 
 outputs:
   status:
@@ -190,6 +209,8 @@ outputs:
     description: Full Unity log (upload it with actions/upload-artifact on failure).
   errors:
     description: JSON array of the errors found in the Unity log.
+  debug-view:
+    description: true when the BIBG Debug View client was injected into this build (and the DLL patched).
 
 runs:
   using: node24

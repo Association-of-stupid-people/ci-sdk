@@ -307,6 +307,85 @@ PlayerSettings.Android.keyaliasPass = Arg("-keystoreAliasPassword", "UNITY_KEYAL
 Also make the build method call `EditorApplication.Exit(1)` on failure; the action additionally
 fails on `Build Finished, Result: Failure` when Unity exits 0.
 
+### BIBG Debug View (QA builds)
+
+`debug-view: true` mirrors a QA build's analytics events to the BIBG Debug View: before Unity
+starts, the action downloads the client (`<debug-view-url>/api/v1/sdk/debugview/BibgDebugView.cs`,
+public, no key) into `Assets/BibgDebugView/`, fills in the URL and the build label
+(`<ref>@<sha7> #<run>`, reduced to `A-Za-z0-9._@#/ +-`), downloads `BibgFirebasePatch.cs` into
+`$RUNNER_TEMP/bibg-fbpatch/` (outside `Assets/`) and runs it with `dotnet run --file` on
+`firebase-analytics-dll`, so every managed Firebase Analytics call is mirrored. After the build
+(also a failed or cancelled one) the client is removed and the DLL restored from git.
+
+- **Every build cleans first, whatever `debug-view` says**: it removes `Assets/BibgDebugView`
+  (+ `.meta`), restores `firebase-analytics-dll` with `git checkout HEAD --`, and fails before
+  Unity starts if the folder survives, the DLL still differs from git, or the DLL holds the patch
+  (`BibgDebugViewHooks`, e.g. committed by mistake). A persistent workspace (`clean: false`) may
+  hold the leftovers of a QA run that was killed before its removal: this step is what keeps them
+  out of a release build. Every other tracked `Firebase.Analytics.dll` of the project that holds
+  the patch is restored too, so a QA build that patched another path (or a release with `none`)
+  cannot leave it behind. A game without a committed Firebase DLL (no file at the path) is fine.
+  Since v3.7.0 every build therefore resets the configured DLL to `HEAD`: an uncommitted change to
+  it, or its deletion, made by an earlier step of the job is undone. Without git, a patched copy
+  under `Assets/` still fails the build (it cannot be restored).
+- **Never on a tag**: with `GITHUB_REF_TYPE=tag` (or a `refs/tags/` ref) `debug-view: true` is
+  ignored with a warning, even when the caller forgot its own `if:`.
+- **Fail closed**: downloads are https only (also after redirects), retried on 5xx/network errors,
+  and must not be empty and must hold the placeholders (`__BIBG_DEBUGVIEW_URL__`,
+  `__BIBG_DEBUGVIEW_BUILD__`), which must all be gone after the replacement. The patch must exit 0
+  and leave the hooks in the DLL.
+- **Firebase DLL**: `firebase-analytics-dll`, else `FIREBASE_ANALYTICS_DLL`, else
+  `Assets/Firebase/Plugins/Firebase.Analytics.dll`, all relative to `workdir` (unlike the BIBG
+  sample's repository-root paths, which differ for a project in a subfolder). Set a non-default
+  path once at workflow level with `FIREBASE_ANALYTICS_DLL`, so every build uses the same one.
+  With `debug-view` it must be named `Firebase.Analytics.dll`, exist and be tracked by git (a
+  Firebase installed as a package is not supported). `none` = no patch and no restore of that
+  path: only the client is injected and it hooks the game's `LogBridge` fields instead.
+- **.NET 10 SDK** on the runner for the patch (`DOTNET_ROOT`, else `PATH`): add
+  `actions/setup-dotnet` before the step or preinstall it; nuget.org must be reachable (Mono.Cecil).
+  On a self-hosted Windows runner set `DOTNET_INSTALL_DIR` to a runner-local folder: the default
+  `C:\Program Files\dotnet` needs admin and changes the machine-wide .NET.
+- Works in both modes: the action edits the project on the host before Unity (or the container)
+  starts. Output `debug-view`: `true` when the client went into this build; the job summary shows
+  its build label.
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      debug_view:
+        description: Debug APK only - mirror analytics events to the BIBG Debug View
+        type: boolean
+        default: false
+
+env:
+  # Only when Firebase is not at the default path; workflow level, so every build restores it.
+  FIREBASE_ANALYTICS_DLL: Assets/MyGame/Plugins/Firebase.Analytics.dll
+
+jobs:
+  apk: # the debug / QA APK
+    runs-on: [self-hosted, Windows, runner-windows]
+    steps:
+      - uses: actions/checkout@<sha> # v7
+        with:
+          clean: false
+
+      - if: ${{ inputs.debug_view == true && github.ref_type != 'tag' }}
+        uses: actions/setup-dotnet@<sha> # v6
+        with:
+          dotnet-version: '10.0.x'
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.tool_cache }}/dotnet
+
+      - uses: <owner>/ci-sdk/.github/actions/unity-build@runner
+        with:
+          mode: host
+          args: -buildTarget Android
+          debug-view: ${{ inputs.debug_view == true }} # push/PR runs have no inputs: false
+
+  release: # nothing to add: the cleanup runs in every unity-build
+```
+
 ## `unity-force-segment` action
 
 Builds a "segment QA" player, one build per segment of the segment file: `mode: list` returns the

@@ -17,6 +17,17 @@ import {
 } from '../../sdk/src/index.js'
 import { DEFAULT_ARGS, buildUnityArgs, modulesForTarget } from './args.js'
 import {
+  DEFAULT_DEBUG_VIEW_URL,
+  buildLabel,
+  cleanDebugView,
+  debugViewGate,
+  injectClient,
+  parseBaseUrl,
+  patchFirebaseDll,
+  resolveFirebaseDll,
+  type Fetch
+} from './debug-view.js'
+import {
   CI_ENV_NAMES,
   CONTAINER_PROJECT,
   CONTAINER_ULF,
@@ -120,7 +131,10 @@ const readSpecs = {
     name: 'clean-gradle-cache',
     default: 'auto'
   }),
-  summary: input.boolean({ default: true })
+  summary: input.boolean({ default: true }),
+  debugView: input.boolean({ name: 'debug-view', default: false }),
+  debugViewUrl: input.string({ name: 'debug-view-url', default: DEFAULT_DEBUG_VIEW_URL }),
+  firebaseDll: input.string({ name: 'firebase-analytics-dll' })
 }
 
 interface State {
@@ -133,10 +147,18 @@ interface State {
   issues: UnityIssue[]
   totalIssues: number
   error?: string
+  /** Build label when the BIBG Debug View client was injected (and the DLL patched, unless none). */
+  debugView?: string
 }
 
 export interface RunOptions {
   host?: HostEnv
+  /** Debug View downloads (tests). */
+  fetch?: Fetch
+  /** dotnet binary for the Firebase patch (tests); default DOTNET_ROOT, then PATH. */
+  dotnet?: string
+  /** First retry delay of the Debug View downloads (tests). */
+  downloadRetryDelay?: number | string
 }
 
 /**
@@ -191,6 +213,29 @@ export async function run(options: RunOptions = {}): Promise<PipelineReport> {
   const ci = getCiContext()
   const licensePatterns = parsePatterns(cfg.licensePatterns)
   const projectDir = path.resolve(process.cwd(), cfg.workdir)
+
+  // BIBG Debug View: the cleanup runs in every build; inject/patch only when asked, never on a tag.
+  const firebaseDll = (() => {
+    try {
+      return resolveFirebaseDll(cfg.firebaseDll, process.env.FIREBASE_ANALYTICS_DLL, projectDir)
+    } catch (err) {
+      throw new InputError([{ input: 'firebase-analytics-dll', message: (err as Error).message }])
+    }
+  })()
+  const gate = debugViewGate({ enabled: cfg.debugView, refType: ci.refType, ref: ci.ref })
+  if (!gate.inject && gate.reason === 'tag') {
+    core.warning('debug-view is ignored on a tag build: a release never gets the BIBG Debug View')
+  }
+  // Only validated when used, like obfuscate-assemblies.
+  const debugViewUrl = gate.inject
+    ? (() => {
+        try {
+          return parseBaseUrl(cfg.debugViewUrl)
+        } catch (err) {
+          throw new InputError([{ input: 'debug-view-url', message: (err as Error).message }])
+        }
+      })()
+    : ''
 
   // Version: input, then the UNITY_VER variable, then the project itself.
   const project = await readProjectVersion(projectDir)
@@ -618,7 +663,48 @@ export async function run(options: RunOptions = {}): Promise<PipelineReport> {
     maxDelay: '10m',
     jitter: false // as documented: the delay doubles, a busy license seat needs the wait
   }
+  const debugViewIo = {
+    log: (m: string) => core.info(m),
+    warn: (m: string) => core.warning(m)
+  }
   const pipeline = new Pipeline<State>({ name: 'unity-build', state, ci })
+    // First, in every build: a QA run killed before its removal must not leak into this build.
+    .step('remove stale Debug View', async ctx =>
+      cleanDebugView({ projectDir, dll: firebaseDll, ...debugViewIo, signal: ctx.signal })
+    )
+  if (gate.inject) {
+    const label = buildLabel({ refName: ci.refName, sha: ci.sha, runNumber: ci.runNumber })
+    pipeline.step('inject Debug View', async ctx => {
+      await injectClient({
+        projectDir,
+        baseUrl: debugViewUrl,
+        label,
+        fetchImpl: options.fetch,
+        retryDelay: options.downloadRetryDelay,
+        ...debugViewIo,
+        signal: ctx.signal
+      })
+      // Before Unity starts: Unity must not have the DLL loaded.
+      if (firebaseDll) {
+        await patchFirebaseDll({
+          projectDir,
+          dll: firebaseDll,
+          baseUrl: debugViewUrl,
+          toolDir: path.join(ci.runner.temp ?? os.tmpdir(), 'bibg-fbpatch'),
+          dotnet: options.dotnet,
+          env: childEnv({}),
+          fetchImpl: options.fetch,
+          retryDelay: options.downloadRetryDelay,
+          ...debugViewIo,
+          signal: ctx.signal
+        })
+      } else {
+        core.info('firebase-analytics-dll: none: no Firebase patch (LogBridge fallback)')
+      }
+      ctx.state.debugView = label
+    })
+  }
+  pipeline
     .step('clean gradle cache', cleanGradleCache, { if: () => cleanGradle, continueOnError: true })
     .step(
       inDocker ? `docker image (Unity ${version})` : `locate Unity ${version}`,
@@ -640,6 +726,15 @@ export async function run(options: RunOptions = {}): Promise<PipelineReport> {
   })
   if (returnHostLicense) {
     pipeline.always('return Unity license', returnLicense, { continueOnError: true })
+  }
+  // Tidiness only (the stale cleanup of the next build is the guarantee); also after a failure.
+  if (gate.inject) {
+    pipeline.always(
+      'remove Debug View',
+      async ctx =>
+        cleanDebugView({ projectDir, dll: firebaseDll, ...debugViewIo, signal: ctx.signal }),
+      { continueOnError: true }
+    )
   }
   const report = await pipeline.run()
 
@@ -663,6 +758,7 @@ export async function run(options: RunOptions = {}): Promise<PipelineReport> {
   core.setOutput('failure-kind', state.failureKind ?? '')
   core.setOutput('log-file', logFile)
   core.setOutput('errors', JSON.stringify(state.issues.map(i => i.message)))
+  core.setOutput('debug-view', String(state.debugView !== undefined))
 
   if (cfg.summary && process.env.GITHUB_STEP_SUMMARY) {
     await core.summary
@@ -676,7 +772,8 @@ export async function run(options: RunOptions = {}): Promise<PipelineReport> {
           failureKind: state.failureKind,
           issues: state.issues,
           totalIssues: state.totalIssues,
-          logFile
+          logFile,
+          debugView: state.debugView
         }),
         true
       )

@@ -29,8 +29,11 @@ vi.mock('@actions/core', async importOriginal => ({
 }))
 
 import type { PipelineReport } from '../../sdk/src/index.js'
+import type { RunOptions } from '../src/main.js'
 import { machineLicenseFile } from '../src/license.js'
 import { currentHost, type HostEnv } from '../src/locate.js'
+import { fakeDotnet } from './fixtures/dotnet.js'
+import { DLL, ORIGINAL_DLL, git, gitProject, status } from './fixtures/project.js'
 import { ulf } from './fixtures/ulf.js'
 
 const { run } = await import('../src/main.js')
@@ -59,7 +62,8 @@ afterEach(() => {
 const start = async (
   mode: string,
   extra: Record<string, string> = {},
-  host?: HostEnv
+  host?: HostEnv,
+  options: Omit<RunOptions, 'host'> = {}
 ): Promise<PipelineReport> => {
   process.env.FAKE_UNITY_MODE = mode
   const values: Record<string, string> = {
@@ -75,7 +79,7 @@ const start = async (
     ...extra
   }
   vi.mocked(core.getInput).mockImplementation(name => values[name] ?? '')
-  return run(host ? { host } : {})
+  return run(host ? { ...options, host } : options)
 }
 
 describe('unity-build', () => {
@@ -302,6 +306,37 @@ describe.skipIf(process.platform === 'win32')('unity-build with a fake docker CL
     )
   }, 20_000)
 
+  it('debug-view in docker mode: the project is prepared on the host and cleaned after', async () => {
+    Object.assign(process.env, { GITHUB_REF_TYPE: 'branch', GITHUB_REF: 'refs/heads/develop' })
+    const project = gitProject(path.join(dir, 'game'))
+    const fetched: string[] = []
+    const fetchStub: typeof fetch = async input => {
+      const url = input instanceof Request ? input.url : input.toString()
+      fetched.push(url)
+      return new Response(
+        url.endsWith('BibgDebugView.cs')
+          ? 'class BibgDebugView { "__BIBG_DEBUGVIEW_URL__" "__BIBG_DEBUGVIEW_BUILD__" }'
+          : '// Firebase.Analytics.BibgDebugViewHooks'
+      )
+    }
+    const report = await start(
+      'ok',
+      { ...dockerMode, workdir: project, 'debug-view': 'true' },
+      undefined,
+      { fetch: fetchStub, dotnet: fakeDotnet(path.join(dir, 'bin')), downloadRetryDelay: 1 }
+    )
+    expect(report.status).toBe('success')
+    expect(report.steps.map(s => [s.name, s.status])).toEqual(
+      expect.arrayContaining([
+        ['inject Debug View', 'success'],
+        ['remove Debug View', 'success']
+      ])
+    )
+    expect(fetched).toHaveLength(2)
+    expect(docker().some(l => l.startsWith('run '))).toBe(true)
+    expect(status(project)).toBe('')
+  })
+
   it('warns when the Gradle volume cannot be removed', async () => {
     const report = await start('ok', {
       ...dockerMode,
@@ -369,6 +404,7 @@ describe('unity-build host license', () => {
     const report = await start('ok', host(), machine())
     expect(report.status).toBe('success')
     expect(report.steps.map(s => s.name)).toEqual([
+      'remove stale Debug View',
       'clean gradle cache',
       'locate Unity 2022.3.20f1',
       'activate Unity license',
@@ -525,6 +561,212 @@ describe('unity-build host license', () => {
     expect(warnings()).toContainEqual(
       'return-license applies to mode: host only; in mode: docker the container always returns its seat'
     )
+  })
+})
+
+/** BIBG Debug View: a git project with a committed Firebase DLL, a fetch stub and a fake dotnet. */
+describe('unity-build Debug View', () => {
+  const CLIENT_PATH = 'Assets/BibgDebugView/BibgDebugView.cs'
+  const BASE = 'https://bi.example.org'
+  const CLIENT =
+    'public static class BibgDebugView { const string U = "__BIBG_DEBUGVIEW_URL__"; const string B = "__BIBG_DEBUGVIEW_BUILD__"; }'
+  const TOOL = '#:package Mono.Cecil@0.11.6\n// Firebase.Analytics.BibgDebugViewHooks\n'
+  const PATCHED = Buffer.concat([ORIGINAL_DLL, Buffer.from('BibgDebugViewHooks')])
+  let project: string
+  let dotnet: string
+  let fetched: string[]
+  const fetchStub: typeof fetch = async input => {
+    const url = input instanceof Request ? input.url : input.toString()
+    fetched.push(url)
+    if (url === `${BASE}/api/v1/sdk/debugview/BibgDebugView.cs`) return new Response(CLIENT)
+    if (url === `${BASE}/api/v1/sdk/debugview/BibgFirebasePatch.cs`) return new Response(TOOL)
+    return new Response('not found', { status: 404 })
+  }
+  const warnings = (): string[] => vi.mocked(core.warning).mock.calls.map(([m]) => String(m))
+  /** What the (fake) Unity build saw: the client file and the DLL patch. */
+  const seen = (): { client: boolean; patched: boolean } => {
+    const log = readFileSync(output('log-file') as string, 'utf8')
+    return {
+      client: log.includes(`probe ${CLIENT_PATH} exists=true`),
+      patched: log.includes(`probe ${DLL} exists=true patched=true`)
+    }
+  }
+  const debugBuild = async (
+    mode: string,
+    extra: Record<string, string> = {}
+  ): Promise<PipelineReport> =>
+    start(
+      mode,
+      { workdir: project, 'debug-view': 'true', 'debug-view-url': `${BASE}/`, ...extra },
+      undefined,
+      { fetch: fetchStub, dotnet, downloadRetryDelay: 1 }
+    )
+  const steps = (report: PipelineReport): Record<string, string> =>
+    Object.fromEntries(report.steps.map(s => [s.name, s.status]))
+
+  beforeEach(() => {
+    project = gitProject(path.join(dir, 'game'))
+    const bin = path.join(dir, 'bin')
+    mkdirSync(bin)
+    dotnet = fakeDotnet(bin)
+    fetched = []
+    Object.assign(process.env, {
+      FAKE_UNITY_PROBE: `${CLIENT_PATH}|${DLL}`,
+      GITHUB_REF: 'refs/heads/develop',
+      GITHUB_REF_TYPE: 'branch',
+      GITHUB_REF_NAME: 'develop',
+      GITHUB_SHA: '0123456789abcdef0123456789abcdef01234567',
+      GITHUB_RUN_NUMBER: '42'
+    })
+  })
+
+  it('injects the client and patches the DLL for the build, then leaves a clean tree', async () => {
+    const report = await debugBuild('ok')
+    expect(report.status).toBe('success')
+    expect(report.steps.map(s => s.name)).toEqual([
+      'remove stale Debug View',
+      'inject Debug View',
+      'clean gradle cache',
+      'locate Unity 2022.3.20f1',
+      'build (Unity 2022.3.20f1)',
+      'remove Debug View'
+    ])
+    expect(seen()).toEqual({ client: true, patched: true })
+    expect(core.info).toHaveBeenCalledWith(
+      expect.stringContaining(`(url ${BASE}, build "develop@0123456 #42")`)
+    )
+    expect(fetched).toHaveLength(2)
+    expect(output('debug-view')).toBe('true')
+    expect(status(project)).toBe('')
+  })
+
+  it('removes the client and restores the DLL after a failed build', async () => {
+    const report = await debugBuild('compile')
+    expect(report.status).toBe('failure')
+    expect(steps(report)['remove Debug View']).toBe('success')
+    expect(seen()).toEqual({ client: true, patched: true })
+    expect(status(project)).toBe('')
+  })
+
+  it('removes the client after Unity is killed at the timeout', async () => {
+    const report = await debugBuild('hang', { timeout: '400ms', 'idle-timeout': '0' })
+    expect(output('failure-kind')).toBe('timeout')
+    expect(steps(report)['remove Debug View']).toBe('success')
+    expect(seen()).toEqual({ client: true, patched: true })
+    expect(status(project)).toBe('')
+  }, 20_000)
+
+  it('a QA build that patched another path, then a release with none: still restored', async () => {
+    const other = 'Assets/MyGame/Plugins/Firebase.Analytics.dll'
+    project = gitProject(path.join(dir, 'moved'), { [other]: ORIGINAL_DLL })
+    writeFileSync(path.join(project, other), PATCHED) // a QA run killed after its patch
+    Object.assign(process.env, {
+      GITHUB_REF_TYPE: 'tag',
+      GITHUB_REF: 'refs/tags/v1.2.3',
+      FAKE_UNITY_PROBE: other
+    })
+    const report = await start('ok', { workdir: project, 'firebase-analytics-dll': 'none' })
+    expect(report.status).toBe('success')
+    expect(readFileSync(output('log-file') as string, 'utf8')).toContain(
+      `probe ${other} exists=true patched=false`
+    )
+    expect(status(project)).toBe('')
+  })
+
+  it('debug-view off (the default): downloads nothing', async () => {
+    const report = await debugBuild('ok', { 'debug-view': 'false' })
+    expect(report.status).toBe('success')
+    expect(Object.keys(steps(report))).not.toContain('inject Debug View')
+    expect(fetched).toEqual([])
+    expect(seen()).toEqual({ client: false, patched: false })
+    expect(output('debug-view')).toBe('false')
+  })
+
+  it.each([
+    ['GITHUB_REF_TYPE', { GITHUB_REF_TYPE: 'tag', GITHUB_REF: 'refs/tags/v1.2.3' }],
+    ['GITHUB_REF only', { GITHUB_REF_TYPE: '', GITHUB_REF: 'refs/tags/v1.2.3' }]
+  ])('a tag build (%s) never gets it, even with debug-view: true', async (_name, env) => {
+    Object.assign(process.env, env)
+    const report = await debugBuild('ok')
+    expect(report.status).toBe('success')
+    expect(fetched).toEqual([])
+    expect(seen()).toEqual({ client: false, patched: false })
+    expect(warnings()).toContainEqual(
+      expect.stringMatching(/^debug-view is ignored on a tag build/)
+    )
+  })
+
+  it('a release after a killed QA run: the leftovers are removed before Unity starts', async () => {
+    mkdirSync(path.join(project, 'Assets/BibgDebugView'))
+    writeFileSync(path.join(project, CLIENT_PATH), CLIENT)
+    writeFileSync(path.join(project, 'Assets/BibgDebugView.meta'), 'guid: 1')
+    writeFileSync(path.join(project, DLL), PATCHED)
+    Object.assign(process.env, { GITHUB_REF_TYPE: 'tag', GITHUB_REF: 'refs/tags/v1.2.3' })
+    const report = await start('ok', { workdir: project })
+    expect(report.status).toBe('success')
+    expect(seen()).toEqual({ client: false, patched: false })
+    expect(status(project)).toBe('')
+  })
+
+  it('a cleanup that cannot make the DLL clean stops the build', async () => {
+    project = gitProject(path.join(dir, 'patched-in-git'), { [DLL]: PATCHED })
+    const report = await start('ok', { workdir: project })
+    expect(report.status).toBe('failure')
+    expect(steps(report)).toMatchObject({
+      'remove stale Debug View': 'failure',
+      'build (Unity 2022.3.20f1)': 'skipped'
+    })
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining('contains the BIBG Debug View patch')
+    )
+  })
+
+  it('a failed Firebase patch stops before Unity and still removes the client', async () => {
+    process.env.FAKE_DOTNET_MODE = 'fail'
+    const report = await debugBuild('ok')
+    expect(report.status).toBe('failure')
+    expect(steps(report)).toMatchObject({
+      'inject Debug View': 'failure',
+      'build (Unity 2022.3.20f1)': 'skipped',
+      'remove Debug View': 'success'
+    })
+    expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('Firebase patch failed'))
+    expect(output('debug-view')).toBe('false')
+    expect(status(project)).toBe('')
+  })
+
+  it('a missing DLL fails, firebase-analytics-dll: none injects the client only', async () => {
+    // Not in git, not on disk (the cleanup restores a tracked DLL that was only deleted).
+    git(project, 'rm', '-q', DLL)
+    git(project, 'commit', '-q', '-m', 'no Firebase')
+    const missing = await debugBuild('ok')
+    expect(missing.status).toBe('failure')
+    expect(core.setFailed).toHaveBeenCalledWith(expect.stringMatching(/Missing .*LogBridge/))
+
+    vi.mocked(core.setOutput).mockClear()
+    const none = await debugBuild('ok', { 'firebase-analytics-dll': 'none' })
+    expect(none.status).toBe('success')
+    expect(seen()).toEqual({ client: true, patched: false })
+    expect(fetched.filter(u => u.endsWith('BibgFirebasePatch.cs'))).toEqual([])
+  })
+
+  it('takes the DLL path from FIREBASE_ANALYTICS_DLL', async () => {
+    const other = 'Assets/Plugins/Firebase.Analytics.dll'
+    project = gitProject(path.join(dir, 'other'), { [other]: ORIGINAL_DLL })
+    Object.assign(process.env, { FIREBASE_ANALYTICS_DLL: other, FAKE_UNITY_PROBE: other })
+    const report = await debugBuild('ok')
+    expect(report.status).toBe('success')
+    expect(readFileSync(output('log-file') as string, 'utf8')).toContain(
+      `probe ${other} exists=true patched=true`
+    )
+    expect(status(project)).toBe('')
+  })
+
+  it('rejects a debug-view-url that is not https before touching anything', async () => {
+    await expect(debugBuild('ok', { 'debug-view-url': 'http://bi.example.org' })).rejects.toThrow(
+      /debug-view-url: must be an https URL/
+    )
+    expect(fetched).toEqual([])
   })
 })
 

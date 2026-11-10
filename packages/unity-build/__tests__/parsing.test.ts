@@ -683,5 +683,22 @@ describe('summaryMarkdown', () => {
     expect(md).toContain('hung: no log output')
     expect(md).toContain('showing 1 of 3')
     expect(md).toContain('~~~\nError building Player\n~~~')
+    expect(md).not.toContain('Debug View')
+  })
+
+  it('shows the BIBG Debug View build label when the client went in', () => {
+    const md = summaryMarkdown({
+      report: { name: 'unity-build', status: 'success', durationMs: 1, steps: [] },
+      version: '2022.3.20f1',
+      mode: 'host',
+      runtime: undefined,
+      attempts: 1,
+      failureKind: undefined,
+      issues: [],
+      totalIssues: 0,
+      logFile: '/tmp/u.log',
+      debugView: 'develop@0123456 #42'
+    })
+    expect(md).toContain('| BIBG Debug View | on (`develop@0123456 #42`) |')
   })
 })

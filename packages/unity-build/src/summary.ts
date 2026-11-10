@@ -13,6 +13,8 @@ export interface BuildSummary {
   issues: readonly UnityIssue[]
   totalIssues: number
   logFile: string
+  /** Build label of the BIBG Debug View client in this build (undefined = not injected). */
+  debugView?: string
   maxShown?: number
 }
 
@@ -43,6 +45,7 @@ export function summaryMarkdown(s: BuildSummary): string {
     ...(s.runtime ? [`| ${s.mode === 'docker' ? 'Image' : 'Editor'} | \`${s.runtime}\` |`] : []),
     `| Attempts | ${s.attempts} |`,
     ...(s.failureKind ? [`| Failure | ${KIND_TEXT[s.failureKind]} |`] : []),
+    ...(s.debugView !== undefined ? [`| BIBG Debug View | on (\`${s.debugView}\`) |`] : []),
     `| Log | \`${s.logFile}\` |`,
     ''
   ]

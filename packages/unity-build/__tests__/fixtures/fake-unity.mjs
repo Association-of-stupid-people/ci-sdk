@@ -47,6 +47,11 @@ if (stateFile) {
 const inputs = Object.keys(process.env).filter(k => /^(INPUT_|ACTIONS_RUNTIME_)/i.test(k)).length
 console.log(`fake unity run=${run} args=${process.argv.slice(2).join(' ')}`)
 console.log(`env keystore=${process.env.UNITY_KEYSTORE_PASS ?? '-'} inputs=${inputs}`)
+// FAKE_UNITY_PROBE: project-relative paths (| separated) whose state the build saw.
+for (const p of (process.env.FAKE_UNITY_PROBE ?? '').split('|').filter(Boolean)) {
+  const marker = existsSync(p) && readFileSync(p).includes('BibgDebugViewHooks')
+  console.log(`probe ${p} exists=${existsSync(p)} patched=${marker}`)
+}
 
 switch (mode) {
   case 'license-then-ok':
