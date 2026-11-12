@@ -1,4 +1,4 @@
-// Static checks of the reusable workflows in workflows/ (published to the runner branch by publish.yml): what
+// Static checks of the reusable workflows (.github/workflows/unity-android-*.yml, called by games @main): what
 // GitHub only reports when a game runs them.
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import path from 'node:path'
@@ -7,8 +7,8 @@ import { describe, expect, it } from 'vitest'
 import { parse } from 'yaml'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
-const dir = path.join(root, 'workflows')
-const files = readdirSync(dir).filter(f => f.endsWith('.yml'))
+const dir = path.join(root, '.github', 'workflows')
+const files = readdirSync(dir).filter(f => /^unity-android-.+\.yml$/.test(f))
 
 interface Step {
   id?: string
@@ -33,6 +33,10 @@ const matches = (text: string, re: RegExp): string[] => [...text.matchAll(re)].m
 const expressions = (text: string): string => matches(text, /\$\{\{([\s\S]*?)\}\}/g).join('\n')
 const asList = (needs: Job['needs']): string[] =>
   needs === undefined ? [] : Array.isArray(needs) ? needs : [needs]
+
+it('finds both reusable workflows', () => {
+  expect(files.sort()).toEqual(['unity-android-debug.yml', 'unity-android-release.yml'])
+})
 
 describe.each(files)('%s', file => {
   const { text, wf } = load(file)

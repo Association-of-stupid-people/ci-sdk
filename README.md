@@ -37,7 +37,7 @@ packages/
   docker-smoke/         NEW: run a container, wait for health, dump logs, always clean up
   release-gate/         NEW: release waits for a green CI run of the same commit; tag == version
   release-assets/       NEW: upload files + SHA256SUMS to a GitHub Release, marked notes section
-workflows/              NEW: reusable workflows (Unity Android debug build, Unity Android release)
+.github/workflows/unity-android-*.yml NEW: reusable workflows (Unity Android debug build, release)
 scripts/build.mjs       bundles each action -> dist/<name>/{action.yml,dist/index.js}
 ```
 
@@ -63,16 +63,9 @@ env 'INPUT_RUN=npm ci' INPUT_RETRIES=2 'INPUT_RETRY-DELAY=5s' node dist/run/dist
 ## Publishing
 
 `.github/workflows/publish.yml` runs on every push to `actions`: lint, typecheck, test,
-build, then copies `dist/<name>/` into `runner:.github/actions/<name>/` and pushes. Then it
-copies each `workflows/<name>.yml` into `runner:.github/workflows/<name>.yml` with every
-`ci-sdk/.github/actions/<x>@runner` pinned to the runner commit that holds those actions
-(`@<sha> # ci-sdk vX.Y.Z`, `scripts/pin-workflows.sh`), and pushes that as a second commit. GitHub
-refuses a `GITHUB_TOKEN` push that changes `.github/workflows`, so that push uses the secret
-`WORKFLOWS_PUSH_TOKEN` (contents + workflows write on this repository); without it the job fails
-after the actions are published and prints the commands to publish the workflows by hand (a
-worktree of `runner`, `scripts/pin-workflows.sh`, a push with a token that has the `workflow`
-scope). Only the folders of the actions
-built here and those workflow files are replaced; composite actions on `runner` are not touched.
+build, then copies `dist/<name>/` into `runner:.github/actions/<name>/` and pushes. Only the
+folders of the actions built here are replaced; composite actions on `runner` are not touched.
+The reusable workflows are not published: they live on `main` and games call them `@main`.
 `ci.yml` runs the same checks on PRs and executes the built actions.
 `scripts/__tests__/workflows.test.ts` checks the reusable workflows statically: ci-sdk actions at
 `@runner`, others by full sha, every `inputs.*` / `secrets.*` declared, every `steps.*` and
@@ -147,9 +140,11 @@ await runAction(run) // any thrown error -> core.setFailed, exit code 1
 
 ## Reusable workflows (Unity Android)
 
-A game's CI is two short files that call two workflows of `runner` (`on: workflow_call`); the
-triggers, the concurrency and the secrets stay in the game repository. Pin both to the runner
-head after a publish (`git ls-remote origin runner`).
+A game's CI is two short files that call two workflows of `main`
+(`.github/workflows/unity-android-*.yml`, `on: workflow_call`); the triggers, the concurrency and
+the secrets stay in the game repository. Games call them `@main`, and the ci-sdk actions inside are
+`@runner`: a push to `main` (or a publish) reaches every game's next run, with no pin to update. A
+change that needs a new action input only works once that action is published.
 
 | Workflow                    | Jobs                                                                | Runs on              |
 | --------------------------- | ------------------------------------------------------------------- | -------------------- |
@@ -173,7 +168,7 @@ concurrency:
 jobs:
   debug:
     permissions: { contents: read, actions: read }
-    uses: <owner>/ci-sdk/.github/workflows/unity-android-debug.yml@<runner sha> # ci-sdk vX.Y.Z
+    uses: <owner>/ci-sdk/.github/workflows/unity-android-debug.yml@main
     with:
       clean: ${{ inputs.clean == true }}
       segments: ${{ inputs.segments || 'all' }}

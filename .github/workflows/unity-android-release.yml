@@ -7,7 +7,7 @@
 #     release:
 #       if: github.ref_type == 'tag'
 #       permissions: { contents: write, actions: read }
-#       uses: Association-of-stupid-people/ci-sdk/.github/workflows/unity-android-release.yml@<runner sha> # ci-sdk vX.Y.Z
+#       uses: Association-of-stupid-people/ci-sdk/.github/workflows/unity-android-release.yml@main
 #       with:
 #         clean: ${{ inputs.clean == true }}
 #       secrets:
@@ -15,9 +15,9 @@
 #         ...
 #
 # A game in another organization cannot use `secrets: inherit`: it passes each secret (see on.workflow_call.secrets).
-# Every github.* value (event, ref, sha, actor, run) is the caller's run. Pin the workflow to a commit of the runner
-# branch: publish.yml pins every ci-sdk action used here to the runner commit of the same publish. contents: write is
-# for the keystore job only (every other job here asks for read).
+# Every github.* value (event, ref, sha, actor, run) is the caller's run. Games call it @main (always the latest), and
+# the ci-sdk actions used here are @runner (the latest publish): a change on main reaches every game's next run.
+# contents: write is for the keystore job only (every other job here asks for read).
 #
 # The game needs no release build method: ci-sdk unity-android-build-script adds a CI-only one for that build: a store
 # AAB (not a development build) with bundleVersion X.Y.Z and version code X*10000+Y*100+Z; a tag that is not strict
