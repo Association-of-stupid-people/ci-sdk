@@ -37,6 +37,7 @@ packages/
   docker-smoke/         NEW: run a container, wait for health, dump logs, always clean up
   release-gate/         NEW: release waits for a green CI run of the same commit; tag == version
   release-assets/       NEW: upload files + SHA256SUMS to a GitHub Release, marked notes section
+workflows/              NEW: reusable workflows (Unity Android debug build, Unity Android release)
 scripts/build.mjs       bundles each action -> dist/<name>/{action.yml,dist/index.js}
 ```
 
@@ -62,9 +63,15 @@ env 'INPUT_RUN=npm ci' INPUT_RETRIES=2 'INPUT_RETRY-DELAY=5s' node dist/run/dist
 ## Publishing
 
 `.github/workflows/publish.yml` runs on every push to `actions`: lint, typecheck, test,
-build, then copies `dist/<name>/` into `runner:.github/actions/<name>/` and pushes. Only the
-folders of the actions built here are replaced; composite actions and reusable workflows on
-`runner` are not touched. `ci.yml` runs the same checks on PRs and executes the built actions.
+build, then copies `dist/<name>/` into `runner:.github/actions/<name>/` and pushes. Then it
+copies each `workflows/<name>.yml` into `runner:.github/workflows/<name>.yml` with every
+`ci-sdk/.github/actions/<x>@runner` pinned to the runner commit that holds those actions
+(`@<sha> # ci-sdk vX.Y.Z`), and pushes that as a second commit. Only the folders of the actions
+built here and those workflow files are replaced; composite actions on `runner` are not touched.
+`ci.yml` runs the same checks on PRs and executes the built actions.
+`scripts/__tests__/workflows.test.ts` checks the reusable workflows statically: ci-sdk actions at
+`@runner`, others by full sha, every `inputs.*` / `secrets.*` declared, every `steps.*` and
+`needs.*.outputs.*` defined.
 
 Actions run on `node24` (Node 20 actions are deprecated). Self-hosted runners must be recent
 enough to support `node24`.
@@ -132,6 +139,71 @@ await runAction(run) // any thrown error -> core.setFailed, exit code 1
 | `runAction`                                                                      | Entrypoint wrapper                                                                                                                              |
 | `listZip`, `extractZipEntry`                                                     | Read a zip's entries, or extract one (stored/deflated, zip64), size and CRC-32 checked                                                          |
 | `CiError`, `InputError`, `TimeoutError`, `AbortError`, `RetryError`, `ExecError` | Errors with a stable `code`                                                                                                                     |
+
+## Reusable workflows (Unity Android)
+
+A game's CI is two short files that call two workflows of `runner` (`on: workflow_call`); the
+triggers, the concurrency and the secrets stay in the game repository. Pin both to the runner
+head after a publish (`git ls-remote origin runner`).
+
+| Workflow                    | Jobs                                                                | Runs on              |
+| --------------------------- | ------------------------------------------------------------------- | -------------------- |
+| `unity-android-debug.yml`   | Debug APK, one APK per segment of `segment-ci.yml`, Drive + chat    | push, PR, manual run |
+| `unity-android-release.yml` | Release AAB + universal APK, commit of a new keystore, Drive + chat | tag `vX.Y.Z`         |
+
+```yaml
+# .github/workflows/debug.yaml
+on:
+  push: { branches: [main] }
+  pull_request: { branches: [main] }
+  workflow_dispatch:
+    inputs:
+      clean: { type: boolean, default: false }
+      segments: { type: string, default: all }
+permissions:
+  contents: read
+concurrency:
+  group: android-debug-${{ github.ref }}-${{ inputs.clean == true && 'clean' || 'cached' }}
+  cancel-in-progress: ${{ inputs.clean != true }}
+jobs:
+  debug:
+    permissions: { contents: read, actions: read }
+    uses: <owner>/ci-sdk/.github/workflows/unity-android-debug.yml@<runner sha> # ci-sdk vX.Y.Z
+    with:
+      clean: ${{ inputs.clean == true }}
+      segments: ${{ inputs.segments || 'all' }}
+      debug-view: true
+    secrets:
+      UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+      UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+      UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+      GDRIVE_SERVICE_ACCOUNT_KEY: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY }}
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+      CHAT_WEBHOOK_URL: ${{ secrets.CHAT_WEBHOOK_URL }}
+```
+
+The release file is the same shape: `on: push: tags: ['v*']` and a manual run (from the tag),
+a concurrency group per run (`android-release-${{ github.run_id }}`, never cancelled),
+`permissions: { contents: write, actions: read }` on the job (the keystore job commits a new
+keystore; every other job asks for read), and the four `KEYSTORE_*` secrets as well.
+
+Inputs (debug): `clean`, `segments` (`all`, `none` or names), `debug-view` (BIBG Debug View in every
+debug APK, default false), `build-method` (the game's static method that writes
+`Builds/check.apk`, `-ciDevelopmentBuild` = development build; default
+`GameBuildCheck.CiAndroidApk`), `build-runs-on` and `light-runs-on` (JSON arrays of runner labels;
+defaults `["self-hosted", "Windows", "runner-windows"]` and `["light"]`). Inputs (release): `clean`,
+`build-runs-on`, `light-runs-on`. The header of each workflow file documents the behaviour
+(signing, caches, IL2CPP clean, Drive names, chat card).
+
+Notes:
+
+- A game in another organization cannot use `secrets: inherit`: pass each secret. Only the Unity
+  ones are required; empty Drive secrets keep the files as GitHub artifacts, an empty webhook posts
+  nothing.
+- Jobs run on the **caller's** runners, and every `github.*` value is the caller's run (event, ref,
+  actor, `GITHUB_WORKFLOW_REF`: the START ETA reads the caller workflow's earlier runs).
+- The caller's `GITHUB_TOKEN` permissions are a ceiling: a job here can only ask for less.
+- On the Actions page a job shows as `<caller job> / <job>` (`debug / Debug APK`).
 
 ## `run` action
 

@@ -23,7 +23,7 @@ export default tseslint.config(
   },
   {
     // Tests use inline async stubs and vi.mock(import()) types.
-    files: ['packages/*/__tests__/**/*.ts'],
+    files: ['packages/*/__tests__/**/*.ts', 'scripts/__tests__/**/*.ts'],
     rules: {
       '@typescript-eslint/require-await': 'off',
       '@typescript-eslint/promise-function-async': 'off',

@@ -1,0 +1,1349 @@
+# Reusable workflow: the Debug APK of a Unity Android game, plus one QA APK per segment of segment-ci.yml, on a
+# self-hosted Windows runner, then one chat card (START before Unity, END from the notify job) and the files on a
+# Google Shared Drive folder. The game repository calls it from its own workflow (triggers, concurrency and secrets
+# stay there):
+#
+#   jobs:
+#     debug:
+#       if: github.ref_type != 'tag'
+#       permissions: { contents: read, actions: read }
+#       uses: Association-of-stupid-people/ci-sdk/.github/workflows/unity-android-debug.yml@<runner sha> # ci-sdk vX.Y.Z
+#       with:
+#         clean: ${{ inputs.clean == true }}
+#         segments: ${{ inputs.segments || 'all' }}
+#       secrets:
+#         UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+#         ...
+#
+# A game in another organization cannot use `secrets: inherit`: it passes each secret (see on.workflow_call.secrets).
+# Every github.* value (event, ref, sha, actor, run) is the caller's run. Pin the workflow to a commit of the runner
+# branch: publish.yml pins every ci-sdk action used here to the runner commit of the same publish.
+#
+# The game provides:
+# - a static build method (input build-method, default GameBuildCheck.CiAndroidApk) that builds an APK with the
+#   project's own settings (not a development build), signs it with the debug keystore and writes Builds/check.apk;
+#   with the extra argument -ciDevelopmentBuild it makes a development build (a segment with `debug: true`).
+# - segment-ci.yml at the repository root (optional): the segments of ci-sdk unity-force-segment. For each segment
+#   build only, the Adjust SDK is patched so every attribution callback returns that segment's campaign (and the IP
+#   country source its country); the patch is undone after the build. The segment builds run one after the other,
+#   after the normal APK. No segment (none listed, or `segments: none`) builds only the normal APK.
+# - the Windows runner (input build-runs-on): unity-build runs in host mode and on its first job installs the project's
+#   Unity version and the Android modules with Unity Hub. Windows, not Linux/Docker: the Unity Linux editor cannot
+#   import H.264 .mp4 videos. Jobs on a self-hosted runner run with the rights of its service account: keep "Run
+#   workflows from fork pull requests" off in the game repository (the apk job also skips fork PRs and Dependabot).
+# - BIBG Debug View (input debug-view): ci-sdk unity-build injects the client and patches
+#   Assets/Firebase/Plugins/Firebase.Analytics.dll (.NET 10 SDK, step debugviewdotnet) in every debug build of the
+#   run, so each Firebase Analytics event also streams to the game's Debug View tab; both are removed after the build.
+#   The package name must be registered once in the BIBG Debug View tab, else the client logs "not registered".
+#
+# Secrets: UNITY_LICENSE (content of the Unity .ulf file, only its serial is used), UNITY_EMAIL and UNITY_PASSWORD
+# (the Unity account of that license; the machine keeps the seat). GDRIVE_SERVICE_ACCOUNT_KEY (JSON key of a service
+# account that is a member of the Shared Drive), GDRIVE_FOLDER_ID (the target folder) and CHAT_WEBHOOK_URL (the full
+# webhook URL; Slack-style {"text", "blocks"} body). Empty Drive secrets skip the upload with a warning (the APKs are
+# GitHub artifacts), an empty webhook posts nothing: the build still passes. A failed upload fails the run; a failed
+# webhook call does not.
+#
+# Every build job uploads its own APK to Drive (seconds per APK; the runner downloads GitHub artifacts far slower than
+# it uploads, so APKs never go through an artifact round trip). The APK is a GitHub artifact only as a fallback.
+# Logs: every Unity build writes Builds/unity.log and uploads it next to its APK on Drive (same name, .log), whatever
+# the result. For a build job that failed or was cancelled, the notify job also puts its full GitHub job log on Drive
+# (<file name>-job.log). The card's `log` link is the Unity log when Unity is where it failed, else that job log; on
+# GitHub (the Unity log artifact, else the job's page) when Drive is not configured or the upload failed.
+# Chat: a webhook message cannot be edited, so every run posts two: START ("🛠️ Đang build", the run's info and the
+# planned builds) right before the first Unity build, then one END from the notify job: ✅ success, ⚠️ partial (the
+# normal build is there, some segments or an upload failed), ❌ failure (the failed step and the log) or 🚫 cancelled
+# (how long it ran, the stage it was in, the newer run that replaced it). A job stopped by its own timeout-minutes is
+# ❌ "(timed out)", not 🚫. A run cancelled before Unity started posts only the END message. The notify job runs on the
+# light runner (input light-runs-on), so the END message does not wait behind builds on the Windows runner.
+# Caches: every build reuses what the runner keeps between jobs: the checkout and Unity's Library, the installed editor
+# and the Gradle cache. `clean` checks out fresh (removes Library and every other ignored file) and empties the Gradle
+# cache. IL2CPP is the exception, cleaned by every build job itself (step il2cppclean).
+# Concurrency belongs to the caller: one cached build per branch at a time, a newer run cancels the older one (the
+# license stays activated, a cancel loses no seat), a clean run in a group of its own.
+name: Unity Android debug build
+
+on:
+  workflow_call:
+    inputs:
+      clean:
+        description: No caches. Fresh checkout (removes Library and ignored files), empty Gradle cache
+        type: boolean
+        default: false
+      segments:
+        description: 'Segment QA APKs from segment-ci.yml: all, none, or names separated by commas'
+        type: string
+        default: all
+      debug-view:
+        description: Inject the BIBG Debug View client into every debug APK of the run (normal and segments)
+        type: boolean
+        default: false
+      build-method:
+        description: Static Unity method (-executeMethod) that writes Builds/check.apk; -ciDevelopmentBuild = development build
+        type: string
+        default: GameBuildCheck.CiAndroidApk
+      build-runs-on:
+        description: JSON array of the labels of the Windows build runner
+        type: string
+        default: '["self-hosted", "Windows", "runner-windows"]'
+      light-runs-on:
+        description: JSON array of the labels of the runner of the notify job (any OS)
+        type: string
+        default: '["light"]'
+    secrets:
+      UNITY_LICENSE:
+        required: true
+      UNITY_EMAIL:
+        required: true
+      UNITY_PASSWORD:
+        required: true
+      GDRIVE_SERVICE_ACCOUNT_KEY:
+        required: false
+      GDRIVE_FOLDER_ID:
+        required: false
+      CHAT_WEBHOOK_URL:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    name: Debug APK
+    # Skips Dependabot (its runs get only Dependabot secrets; it is built on the default branch once merged), and fork
+    # PRs; a fork can still edit the calling workflow in its own PR. What keeps fork code off this self-hosted runner
+    # (no isolation) is the repo setting: keep "Run workflows from fork pull requests" off. A tag is a release
+    # (unity-android-release.yml), never a debug build.
+    if: >-
+      github.ref_type != 'tag' &&
+      github.actor != 'dependabot[bot]' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ${{ fromJSON(inputs.build-runs-on) }}
+    # Above unity-build's timeout + the first job's editor install with Unity Hub. Also LIMIT_MINUTES (timeout step).
+    timeout-minutes: 240
+    # actions: read for the START ETA (the previous successful run, read-only API).
+    permissions:
+      contents: read
+      actions: read
+    # What the segment builds and the notify job need: the segment list, names and the outcomes for the card.
+    outputs:
+      timed-out: ${{ steps.timeout.outputs.timed-out }}
+      segments: ${{ steps.list.outputs.segments || '[]' }}
+      segment-details: ${{ steps.list.outputs.details }}
+      build-start: ${{ steps.start.outputs.time }}
+      runner: ${{ runner.name }}
+      file-name: ${{ steps.meta.outputs.file-name }}
+      segment-file-prefix: ${{ steps.meta.outputs.segment-file-prefix }}
+      segment-file-suffix: ${{ steps.meta.outputs.segment-file-suffix }}
+      drive: ${{ steps.meta.outputs.drive }}
+      version-code: ${{ steps.meta.outputs.version-code }}
+      head-sha: ${{ steps.meta.outputs.head-sha }}
+      head-subject: ${{ steps.meta.outputs.head-subject }}
+      head-author: ${{ steps.meta.outputs.head-author }}
+      game-name: ${{ steps.info.outputs.name }}
+      game-version: ${{ steps.info.outputs.version }}
+      apk-url: ${{ steps.apkart.outputs.artifact-url }}
+      log-url: ${{ steps.unitylog.outputs.artifact-url }}
+      log-drive-outcome: ${{ steps.drivelog.outcome }}
+      log-drive-link: ${{ steps.drivelog.outputs.link }}
+      segment-log-suffix: ${{ steps.meta.outputs.segment-log-suffix }}
+      drive-outcome: ${{ steps.drive.outcome }}
+      drive-link: ${{ steps.drive.outputs.link }}
+      drive-name: ${{ steps.drive.outputs.name }}
+      drive-size: ${{ steps.drive.outputs.size }}
+      serial-outcome: ${{ steps.serial.outcome }}
+      list-outcome: ${{ steps.list.outcome }}
+      debugviewdotnet-outcome: ${{ steps.debugviewdotnet.outcome }}
+      prerestore-outcome: ${{ steps.prerestore.outcome }}
+      scriptrestore-outcome: ${{ steps.scriptrestore.outcome }}
+      cleanup-outcome: ${{ steps.cleanup.outcome }}
+      unity-outcome: ${{ steps.unity.outcome }}
+      guard-outcome: ${{ steps.guard.outcome }}
+      guard-reason: ${{ steps.guard.outputs.reason }}
+      apk-size: ${{ steps.guard.outputs.size }}
+      apk-outcome: ${{ steps.apkart.outcome }}
+      # The APK exists: on Drive, or else as the fallback artifact.
+      apk-ok: ${{ steps.drive.outcome == 'success' || steps.apkart.outcome == 'success' }}
+    # Scripts are github-script (Node), not shell lines: the same on any runner OS.
+    steps:
+      # Start of the run, for the duration in the chat message.
+      - id: start
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            core.setOutput('time', String(Math.floor(Date.now() / 1000)));
+
+      # No LFS (only the macOS editor plugins, *.bundle, use it) and no submodules (the library is vendored).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The default (true) runs git clean -ffdx, which would delete Library in a persistent workspace.
+          clean: ${{ inputs.clean == true }}
+
+      # Product name and version for the chat message; a missing value shows as ? and never fails the build.
+      - id: info
+        continue-on-error: true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-project-info@runner
+
+      # Names the APKs on Drive, and reads what the card shows from the checkout (the notify job has none). Event text
+      # is untrusted: it reaches the script only through env.
+      - id: meta
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+          HAVE_DRIVE: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY != '' && secrets.GDRIVE_FOLDER_ID != '' }}
+        with:
+          script: |
+            const env = process.env;
+            const isPr = env.EVENT_NAME === 'pull_request';
+            const sha = (isPr ? env.PR_HEAD_SHA : env.SHA).slice(0, 7);
+            const kind = 'debug';
+            const refLabel = isPr
+              ? `pr-${env.PR_NUMBER}`
+              : env.REF_NAME.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'ref';
+            const name = env.REPO.split('/')[1];
+            // The notify job builds the same names for the job logs.
+            core.setOutput('file-name', `${name}_${kind}_${refLabel}_${env.RUN_NUMBER}_${sha}.apk`);
+            core.setOutput('log-name', `${name}_${kind}_${refLabel}_${env.RUN_NUMBER}_${sha}.log`);
+            core.setOutput('segment-file-prefix', `${name}_${kind}-segment-`);
+            core.setOutput('segment-file-suffix', `_${refLabel}_${env.RUN_NUMBER}_${sha}.apk`);
+            core.setOutput('segment-log-suffix', `_${refLabel}_${env.RUN_NUMBER}_${sha}.log`);
+            core.setOutput('drive', env.HAVE_DRIVE);
+
+            let code = '?';
+            try {
+              code = /^\s*AndroidBundleVersionCode:\s*(\d+)/m.exec(
+                require('fs').readFileSync('ProjectSettings/ProjectSettings.asset', 'utf8'))?.[1] ?? '?';
+            } catch {}
+            core.setOutput('version-code', code);
+            try {
+              const out = require('child_process').execFileSync('git', ['log', '-1', '--format=%H%x00%an%x00%s'], { encoding: 'utf8' });
+              const [id, author, subject] = out.trim().split('\0');
+              core.setOutput('head-sha', id);
+              core.setOutput('head-author', author);
+              core.setOutput('head-subject', (subject || '').slice(0, 200));
+            } catch {}
+
+      - id: serial
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/extract-unity-serial@runner
+        with:
+          license: ${{ secrets.UNITY_LICENSE }}
+
+      # The segments to build, one job each (debug builds only), with their campaign and country for the START message.
+      # A broken segment-ci.yml or `segments` input does not stop the normal APK: the job fails at its end instead
+      # (last step), and the card says why.
+      - id: list
+        continue-on-error: true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-force-segment@runner
+        with:
+          mode: list
+          segment: ${{ inputs.segments || 'all' }}
+
+      # A segment job killed mid build (runner crash, timeout) may leave its generated Adjust file behind: tracked files
+      # are reset by the checkout, untracked ones are not. A clean checkout removes it anyway.
+      - id: prerestore
+        if: inputs.clean != true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-force-segment@runner
+        with:
+          mode: restore
+
+      # Same for a release job killed mid build: its CI-only build script (Assets/CiSdkBuild, untracked) must not stay.
+      # A debug build does not stop for it (the release job keeps its restore strict).
+      - id: scriptrestore
+        if: inputs.clean != true
+        continue-on-error: true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-android-build-script@runner
+        with:
+          mode: restore
+
+      # A persistent workspace keeps the APK and log of an earlier run: without this a failed build would pass the upload.
+      - id: cleanup
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            require('fs').rmSync('Builds/check.apk', { force: true });
+            require('fs').rmSync('Builds/unity.log', { force: true });
+
+      # Stale IL2CPP state must never reach a build. A Unity build killed mid compile (a cancelled run, a timeout) leaves
+      # objects in Library/Bee/artifacts/Android/<hash>/ that its build state never recorded: the next build trusts the
+      # older record and links them with fresh ones (seen: ld.lld duplicate symbols between GenericMethods__9 and
+      # __10, one compiled by the debug run killed just before). So: the generated C++
+      # (il2cppOutput) always goes, and the game's IL2CPP objects too unless the previous Unity build here exited
+      # normally (marker written after it), for a release always. The rest of Library (the import cache) stays, so do
+      # the il2cpp.a runtime folders (no game code). A failed clean is a warning here (the marker is gone, so the next
+      # build cleans again); it fails a release.
+      - id: il2cppclean
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ALWAYS: 'false'
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const root = 'Library/Bee/artifacts/Android';
+            const marker = 'Library/ci-unity-build-ok';
+            // Windows: a file another process still holds (a killed clang, an antivirus scan) fails at once; rmSync does not
+            // retry that itself.
+            const rm = async p => {
+              for (let i = 1; ; i++) {
+                try { return fs.rmSync(p, { recursive: true, force: true }); } catch (err) {
+                  if (i >= 10 || !['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY'].includes(err.code)) throw err;
+                  await new Promise(r => setTimeout(r, 1000));
+                }
+              }
+            };
+            try {
+              const keep = process.env.ALWAYS !== 'true' && fs.existsSync(marker);
+              await rm(marker);
+              await rm(path.join(root, 'il2cppOutput'));
+              core.setOutput('kept', String(keep));
+              if (keep) return core.info('The previous Unity build exited normally: IL2CPP objects kept');
+              // Object folders of the game's C++ (they hold libil2cpp.so once linked); not the il2cpp.a runtime ones.
+              const removed = [];
+              for (const e of fs.existsSync(root) ? fs.readdirSync(root, { withFileTypes: true }) : []) {
+                if (!e.isDirectory()) continue;
+                const files = fs.readdirSync(path.join(root, e.name));
+                if (files.includes('libil2cpp.so') || (files.some(f => f.endsWith('.o')) && !files.includes('il2cpp.a'))) {
+                  await rm(path.join(root, e.name));
+                  removed.push(e.name);
+                }
+              }
+              core.info(`IL2CPP output and objects removed (${removed.join(', ') || 'no object folder'})`);
+            } catch (err) {
+              // A release never builds on stale objects; a debug build goes on (the next build cleans again).
+              if (process.env.ALWAYS === 'true') core.setFailed(`IL2CPP clean failed: ${err.message}`);
+              else core.warning(`IL2CPP clean failed, this build may reuse stale IL2CPP objects: ${err.message}`);
+            }
+
+      # .NET 10 SDK for the Debug View Firebase patch (input debug-view, same condition as the unity step's debug-view).
+      # DOTNET_INSTALL_DIR keeps it runner-local: the default C:\Program Files\dotnet needs admin and would change the
+      # machine-wide .NET.
+      - id: debugviewdotnet
+        if: inputs.debug-view
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: '10.0.x'
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.tool_cache }}/dotnet
+
+      # START message: the run's info and the planned builds, right before Unity. A chat problem never stops the build.
+      - id: startreport
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CLEAN: ${{ inputs.clean == true }}
+          REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.triggering_actor }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUNNER: ${{ runner.name }}
+          BUILD_START: ${{ steps.start.outputs.time }}
+          GAME_NAME: ${{ steps.info.outputs.name }}
+          GAME_VERSION: ${{ steps.info.outputs.version }}
+          VERSION_CODE: ${{ steps.meta.outputs.version-code }}
+          HEAD_SUBJECT: ${{ steps.meta.outputs.head-subject }}
+          SEGMENTS: ${{ steps.list.outputs.segments }}
+          SEGMENT_DETAILS: ${{ steps.list.outputs.details }}
+          HAVE_DRIVE: ${{ steps.meta.outputs.drive }}
+          # Only the folder link is built from it, here: a job output holding a secret would be dropped.
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        with:
+          script: |
+            const env = process.env;
+            const first = s => (s || '').split('\n')[0].trim().slice(0, 200);
+            const parse = (s, fallback) => { try { return JSON.parse(s || ''); } catch { return fallback; } };
+            const isPr = env.EVENT_NAME === 'pull_request';
+            const repoUrl = `${env.SERVER_URL}/${env.REPO}`;
+            const sha = isPr ? env.PR_HEAD_SHA : env.SHA;
+            const startedAt = new Date((Number(env.BUILD_START) || Date.now() / 1000) * 1000).toLocaleString('en-GB', {
+              timeZone: 'Asia/Ho_Chi_Minh', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
+            }).replace(',', '') + ' (UTC+7)';
+            // ETA: the duration of the latest successful debug run (push or manual, on a branch: a release tag is
+            // vX.Y.Z), from now, in UTC+7. A run shorter than 3 minutes built nothing (Dependabot, skipped jobs).
+            // Best effort: no estimate without one.
+            let eta;
+            try {
+              const { owner, repo } = context.repo;
+              const workflow_id = (env.GITHUB_WORKFLOW_REF || '').split('@')[0].split('/').pop();
+              const secs = r => (Date.parse(r.updated_at) - Date.parse(r.run_started_at)) / 1000;
+              const match = r => ['push', 'workflow_dispatch'].includes(r.event)
+                && !/^v\d+\.\d+\.\d+$/.test(r.head_branch || '') && secs(r) >= 180;
+              let prev, pages = 0;
+              // Newest first, at most 5 pages of 100.
+              for await (const { data } of github.paginate.iterator(github.rest.actions.listWorkflowRuns, { owner, repo, workflow_id, status: 'success', per_page: 100 })) {
+                prev = data.find(match);
+                if (prev || ++pages >= 5) break;
+              }
+              if (prev) {
+                const done = new Date(Date.now() + secs(prev) * 1000).toLocaleTimeString('en-GB', {
+                  timeZone: 'Asia/Ho_Chi_Minh', hour: '2-digit', minute: '2-digit', hour12: false });
+                eta = `~${Math.round(secs(prev) / 60)}m (~${done})`;
+              }
+            } catch (err) {
+              core.info(`No ETA: ${err.message}`);
+            }
+            // Campaign and country of each segment (list details); the names alone if details are missing.
+            const details = parse(env.SEGMENT_DETAILS, null);
+            const segments = Array.isArray(details) ? details : parse(env.SEGMENTS, []).map(name => ({ name }));
+            const report = {
+              name: env.REPO.split('/')[1],
+              kind: 'debug',
+              phase: 'start',
+              game: env.GAME_NAME || undefined,
+              platform: 'Android',
+              clean: env.CLEAN === 'true',
+              project: { name: env.REPO, url: repoUrl },
+              run: { url: `${repoUrl}/actions/runs/${env.RUN_ID}`, number: env.RUN_NUMBER },
+              ref: isPr ? { type: 'pr', name: `#${env.PR_NUMBER}`, url: env.PR_URL, title: first(env.PR_TITLE) } : { type: 'branch', name: env.REF_NAME },
+              commit: { sha, url: `${repoUrl}/commit/${sha}`, subject: isPr ? undefined : first(env.HEAD_SUBJECT) || undefined },
+              actor: env.ACTOR,
+              event: env.EVENT_NAME,
+              runner: env.RUNNER || undefined,
+              startedAt,
+              eta,
+              driveFolderUrl: env.HAVE_DRIVE === 'true' && env.GDRIVE_FOLDER_ID ? `https://drive.google.com/drive/folders/${encodeURIComponent(env.GDRIVE_FOLDER_ID)}` : undefined,
+              version: { name: env.GAME_VERSION ? env.GAME_VERSION.replace(/^v?/i, 'v') : undefined, code: env.VERSION_CODE && env.VERSION_CODE !== '?' ? env.VERSION_CODE : undefined },
+              builds: [
+                { name: 'Normal', kind: 'normal', status: 'planned' },
+                // A development-build segment (debug: true) is marked on the card.
+                ...segments.map(s => ({ name: `${String(s.name)}${s.debug === true ? ' (debug)' : ''}`, kind: 'segment', status: 'planned',
+                  campaign: typeof s.campaign === 'string' ? s.campaign : undefined, country: typeof s.country === 'string' && s.country ? s.country : undefined })),
+              ],
+            };
+            core.setOutput('json', JSON.stringify(report));
+
+      - if: steps.startreport.outcome == 'success'
+        continue-on-error: true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/team-chat@runner
+        with:
+          webhook-url: ${{ secrets.CHAT_WEBHOOK_URL }}
+          report: ${{ steps.startreport.outputs.json }}
+
+      - id: unity
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-build@runner
+        with:
+          # The editor on the Windows machine (installed by the action on first use), activated with the serial.
+          mode: host
+          # The game's build method (input build-method) builds with the project's own settings (not a development
+          # build), signs with the debug keystore and writes Builds/check.apk. The action still streams the log to the
+          # job log and tees it (secrets redacted) to the -logFile path, a path known even after a kill.
+          default-args-override: -batchmode -nographics -silent-crashes -quit -logFile Builds/unity.log -executeMethod ${{ inputs.build-method }}
+          args: -buildTarget Android
+          timeout: 2h
+          clean-gradle-cache: ${{ inputs.clean == true }}
+          unity-serial: ${{ steps.serial.outputs.serial }}
+          unity-email: ${{ secrets.UNITY_EMAIL }}
+          unity-password: ${{ secrets.UNITY_PASSWORD }}
+          # The BIBG Debug View client when the caller asks for it. Firebase.Analytics.dll is at the action's default
+          # Assets/Firebase/Plugins/Firebase.Analytics.dll (firebase-analytics-dll). Off, v3.7.0 still first removes a
+          # client and restores the DLL that a killed build left in this persistent workspace.
+          debug-view: ${{ inputs.debug-view }}
+
+      # Unity exited normally (a debug build that failed inside Unity too): its build state matches its IL2CPP objects,
+      # the next build here may reuse them (il2cppclean).
+      - if: always() && steps.unity.outcome == 'success'
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            require('fs').writeFileSync('Library/ci-unity-build-ok', `${process.env.GITHUB_RUN_ID} ${process.env.GITHUB_JOB}\n`);
+
+      # The APK is an APK, and its size for the card. A release killed mid build leaves
+      # EditorUserBuildSettings.buildAppBundle on (a build method may never reset it): Unity then writes an AAB to
+      # check.apk. An APK has AndroidManifest.xml at its zip root, an AAB base/manifest/. A missing file is left to
+      # the upload steps (APK missing).
+      - id: guard
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          APK: Builds/check.apk
+        with:
+          script: |
+            const fs = require('fs');
+            const file = process.env.APK;
+            if (!fs.existsSync(file)) return;
+            const size = fs.statSync(file).size;
+            core.setOutput('size', String(size));
+            // Entry names from the zip's central directory (ZIP64 too).
+            const names = [];
+            const fd = fs.openSync(file, 'r');
+            try {
+              const read = (pos, len) => { const b = Buffer.alloc(len); fs.readSync(fd, b, 0, len, pos); return b; };
+              const tail = read(Math.max(0, size - 65557), Math.min(size, 65557));
+              const eocd = tail.lastIndexOf(Buffer.from('PK\x05\x06', 'latin1'));
+              if (eocd < 0) throw new Error('no zip end record');
+              let count = tail.readUInt16LE(eocd + 10), cdSize = tail.readUInt32LE(eocd + 12), cdOffset = tail.readUInt32LE(eocd + 16);
+              if (count === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) {
+                const loc = tail.lastIndexOf(Buffer.from('PK\x06\x07', 'latin1'), eocd);
+                if (loc < 0) throw new Error('no ZIP64 locator');
+                const z = read(Number(tail.readBigUInt64LE(loc + 8)), 56);
+                count = Number(z.readBigUInt64LE(32)); cdSize = Number(z.readBigUInt64LE(40)); cdOffset = Number(z.readBigUInt64LE(48));
+              }
+              const cd = read(cdOffset, cdSize);
+              for (let p = 0; names.length < count && p + 46 <= cd.length && cd.readUInt32LE(p) === 0x02014b50;) {
+                const n = cd.readUInt16LE(p + 28);
+                names.push(cd.toString('utf8', p + 46, p + 46 + n));
+                p += 46 + n + cd.readUInt16LE(p + 30) + cd.readUInt16LE(p + 32);
+              }
+            } catch (err) {
+              core.setOutput('reason', 'APK is not a zip');
+              core.setFailed(`${file} is not a zip (${err.message})`);
+              return;
+            } finally {
+              fs.closeSync(fd);
+            }
+            if (names.includes('AndroidManifest.xml')) return;
+            const aab = names.some(n => n.startsWith('base/manifest/'));
+            core.setOutput('reason', aab ? 'AAB produced instead of APK' : 'Not an APK (no AndroidManifest.xml)');
+            core.setFailed(aab
+              ? `AAB produced instead of APK (${file}): EditorUserBuildSettings.buildAppBundle was left on by a killed release build. Run with clean, or untick Build App Bundle on the runner`
+              : `${file} is not an APK: no AndroidManifest.xml at its root`);
+
+      # Straight from this job: no artifact round trip. A failed upload does not stop the segment builds; the notify
+      # job fails the run for it.
+      - id: drive
+        if: steps.meta.outputs.drive == 'true'
+        continue-on-error: true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/gdrive-upload@runner
+        with:
+          service-account-key: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY }}
+          folder-id: ${{ secrets.GDRIVE_FOLDER_ID }}
+          file: Builds/check.apk
+          name: ${{ steps.meta.outputs.file-name }}
+
+      # Fallback when the APK is not on Drive. A build method may not fail Unity when the build fails: a missing APK
+      # fails the job here instead (and fails the Drive upload above).
+      - id: apkart
+        if: steps.drive.outcome != 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: check-apk
+          path: Builds/check.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      # The Unity log next to the APK on Drive, whatever happened (also after a cancel or a timeout: Unity wrote it as it
+      # ran). A failed upload only loses the card's Drive link.
+      - id: drivelog
+        if: always() && steps.unity.outcome != 'skipped' && steps.meta.outputs.drive == 'true' && hashFiles('Builds/unity.log') != ''
+        continue-on-error: true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/gdrive-upload@runner
+        with:
+          service-account-key: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY }}
+          folder-id: ${{ secrets.GDRIVE_FOLDER_ID }}
+          file: Builds/unity.log
+          name: ${{ steps.meta.outputs.log-name }}
+
+      # Fallback when the log is not on Drive.
+      - id: unitylog
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure() && steps.unity.outcome != 'skipped' && steps.drivelog.outcome != 'success'
+        with:
+          name: unity-log
+          path: Builds/unity.log
+          retention-days: 7
+
+      - if: steps.list.outcome == 'failure'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            core.setFailed('Segment list failed (segment-ci.yml or the segments input): no segment APK was built, see the list step');
+
+      # The job's own timeout-minutes shows as cancelled too (job.status, needs.<job>.result): a job stopped within
+      # 3 minutes of its limit timed out, a failure the notify job reports as one.
+      - id: timeout
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          JOB_STATUS: ${{ job.status }}
+          START: ${{ steps.start.outputs.time }}
+          LIMIT_MINUTES: 240
+        with:
+          script: |
+            const ranFor = process.env.START ? Date.now() / 1000 - Number(process.env.START) : 0;
+            core.setOutput('timed-out', String(process.env.JOB_STATUS === 'cancelled' && ranFor >= Number(process.env.LIMIT_MINUTES) * 60 - 180));
+
+  segment:
+    name: Segment ${{ matrix.segment }}
+    needs: apk
+    if: needs.apk.result == 'success' && needs.apk.outputs.segments != '[]'
+    runs-on: ${{ fromJSON(inputs.build-runs-on) }}
+    timeout-minutes: 150 # also LEG_TIMEOUT_MINUTES in the result step
+    permissions:
+      contents: read
+    # One runner: the segment builds run one after the other on the same workspace (and Library). One failed segment
+    # does not stop the others.
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        segment: ${{ fromJSON(needs.apk.outputs.segments) }}
+    steps:
+      # The leg's start: the result step tells the job's own timeout-minutes from a cancelled run by it.
+      - name: Leg start
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: core.exportVariable('LEG_START', String(Math.floor(Date.now() / 1000)));
+
+      - id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          clean: false
+
+      - id: serial
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/extract-unity-serial@runner
+        with:
+          license: ${{ secrets.UNITY_LICENSE }}
+
+      - id: prerestore
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-force-segment@runner
+        with:
+          mode: restore
+
+      # A debug build does not stop for it (the release job keeps its restore strict).
+      - id: scriptrestore
+        continue-on-error: true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-android-build-script@runner
+        with:
+          mode: restore
+
+      # Also drops what an earlier leg left in segment-out (the workspace persists).
+      - id: cleanup
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            require('fs').rmSync('Builds/check.apk', { force: true });
+            require('fs').rmSync('Builds/unity.log', { force: true });
+            require('fs').rmSync('segment-out', { recursive: true, force: true });
+
+      # The same IL2CPP clean as the normal build: after a good previous build only il2cppOutput goes, so a leg stays
+      # incremental.
+      - id: il2cppclean
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ALWAYS: 'false'
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const root = 'Library/Bee/artifacts/Android';
+            const marker = 'Library/ci-unity-build-ok';
+            // Windows: a file another process still holds (a killed clang, an antivirus scan) fails at once; rmSync does not
+            // retry that itself.
+            const rm = async p => {
+              for (let i = 1; ; i++) {
+                try { return fs.rmSync(p, { recursive: true, force: true }); } catch (err) {
+                  if (i >= 10 || !['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY'].includes(err.code)) throw err;
+                  await new Promise(r => setTimeout(r, 1000));
+                }
+              }
+            };
+            try {
+              const keep = process.env.ALWAYS !== 'true' && fs.existsSync(marker);
+              await rm(marker);
+              await rm(path.join(root, 'il2cppOutput'));
+              core.setOutput('kept', String(keep));
+              if (keep) return core.info('The previous Unity build exited normally: IL2CPP objects kept');
+              // Object folders of the game's C++ (they hold libil2cpp.so once linked); not the il2cpp.a runtime ones.
+              const removed = [];
+              for (const e of fs.existsSync(root) ? fs.readdirSync(root, { withFileTypes: true }) : []) {
+                if (!e.isDirectory()) continue;
+                const files = fs.readdirSync(path.join(root, e.name));
+                if (files.includes('libil2cpp.so') || (files.some(f => f.endsWith('.o')) && !files.includes('il2cpp.a'))) {
+                  await rm(path.join(root, e.name));
+                  removed.push(e.name);
+                }
+              }
+              core.info(`IL2CPP output and objects removed (${removed.join(', ') || 'no object folder'})`);
+            } catch (err) {
+              // A release never builds on stale objects; a debug build goes on (the next build cleans again).
+              if (process.env.ALWAYS === 'true') core.setFailed(`IL2CPP clean failed: ${err.message}`);
+              else core.warning(`IL2CPP clean failed, this build may reuse stale IL2CPP objects: ${err.message}`);
+            }
+
+      # Adjust SDK patched to return this segment's attribution, for this build only.
+      - id: segment
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-force-segment@runner
+        with:
+          segment: ${{ matrix.segment }}
+
+      # .NET 10 SDK for the Debug View Firebase patch, as in the normal build.
+      - id: debugviewdotnet
+        if: steps.segment.outputs.enabled == 'true' && inputs.debug-view
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: '10.0.x'
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.tool_cache }}/dotnet
+
+      - id: unity
+        if: steps.segment.outputs.enabled == 'true'
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-build@runner
+        with:
+          mode: host
+          # The project's own settings, or a development build for a segment with `debug: true` (-ciDevelopmentBuild).
+          default-args-override: -batchmode -nographics -silent-crashes -quit -logFile Builds/unity.log -executeMethod ${{ inputs.build-method }}
+          args: -buildTarget Android${{ steps.segment.outputs.debug == 'true' && ' -ciDevelopmentBuild' || '' }}
+          timeout: 2h
+          unity-serial: ${{ steps.serial.outputs.serial }}
+          unity-email: ${{ secrets.UNITY_EMAIL }}
+          unity-password: ${{ secrets.UNITY_PASSWORD }}
+          # A segment APK is a debug build too: same BIBG Debug View client as the normal APK.
+          debug-view: ${{ inputs.debug-view }}
+
+      # Also when this leg never ran Unity but the objects were good (kept): nothing touched them.
+      - if: always() && (steps.unity.outcome == 'success' || (steps.unity.outcome == 'skipped' && steps.il2cppclean.outputs.kept == 'true'))
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            require('fs').writeFileSync('Library/ci-unity-build-ok', `${process.env.GITHUB_RUN_ID} ${process.env.GITHUB_JOB}\n`);
+
+      # The same APK check as the normal build (an AAB in check.apk fails the leg), and its size.
+      - id: guard
+        if: steps.unity.outcome == 'success'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          APK: Builds/check.apk
+        with:
+          script: |
+            const fs = require('fs');
+            const file = process.env.APK;
+            if (!fs.existsSync(file)) return;
+            const size = fs.statSync(file).size;
+            core.setOutput('size', String(size));
+            // Entry names from the zip's central directory (ZIP64 too).
+            const names = [];
+            const fd = fs.openSync(file, 'r');
+            try {
+              const read = (pos, len) => { const b = Buffer.alloc(len); fs.readSync(fd, b, 0, len, pos); return b; };
+              const tail = read(Math.max(0, size - 65557), Math.min(size, 65557));
+              const eocd = tail.lastIndexOf(Buffer.from('PK\x05\x06', 'latin1'));
+              if (eocd < 0) throw new Error('no zip end record');
+              let count = tail.readUInt16LE(eocd + 10), cdSize = tail.readUInt32LE(eocd + 12), cdOffset = tail.readUInt32LE(eocd + 16);
+              if (count === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) {
+                const loc = tail.lastIndexOf(Buffer.from('PK\x06\x07', 'latin1'), eocd);
+                if (loc < 0) throw new Error('no ZIP64 locator');
+                const z = read(Number(tail.readBigUInt64LE(loc + 8)), 56);
+                count = Number(z.readBigUInt64LE(32)); cdSize = Number(z.readBigUInt64LE(40)); cdOffset = Number(z.readBigUInt64LE(48));
+              }
+              const cd = read(cdOffset, cdSize);
+              for (let p = 0; names.length < count && p + 46 <= cd.length && cd.readUInt32LE(p) === 0x02014b50;) {
+                const n = cd.readUInt16LE(p + 28);
+                names.push(cd.toString('utf8', p + 46, p + 46 + n));
+                p += 46 + n + cd.readUInt16LE(p + 30) + cd.readUInt16LE(p + 32);
+              }
+            } catch (err) {
+              core.setOutput('reason', 'APK is not a zip');
+              core.setFailed(`${file} is not a zip (${err.message})`);
+              return;
+            } finally {
+              fs.closeSync(fd);
+            }
+            if (names.includes('AndroidManifest.xml')) return;
+            const aab = names.some(n => n.startsWith('base/manifest/'));
+            core.setOutput('reason', aab ? 'AAB produced instead of APK' : 'Not an APK (no AndroidManifest.xml)');
+            core.setFailed(aab
+              ? `AAB produced instead of APK (${file}): EditorUserBuildSettings.buildAppBundle was left on by a killed release build. Run with clean, or untick Build App Bundle on the runner`
+              : `${file} is not an APK: no AndroidManifest.xml at its root`);
+
+      # Whatever happened: the persistent workspace must never keep the patch.
+      - id: restore
+        if: always() && steps.segment.outcome != 'skipped'
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-force-segment@runner
+        with:
+          mode: restore
+
+      # Named after the segment (the fallback artifact keeps the name).
+      - env:
+          NAME: ${{ matrix.segment }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            fs.mkdirSync('segment-out', { recursive: true });
+            if (fs.existsSync('Builds/check.apk')) fs.copyFileSync('Builds/check.apk', `segment-out/${process.env.NAME}.apk`);
+
+      - id: drive
+        if: needs.apk.outputs.drive == 'true'
+        continue-on-error: true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/gdrive-upload@runner
+        with:
+          service-account-key: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY }}
+          folder-id: ${{ secrets.GDRIVE_FOLDER_ID }}
+          file: segment-out/${{ matrix.segment }}.apk
+          name: ${{ needs.apk.outputs.segment-file-prefix }}${{ matrix.segment }}${{ needs.apk.outputs.segment-file-suffix }}
+
+      - id: apkart
+        if: steps.drive.outcome != 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: segment-apk-${{ matrix.segment }}
+          path: segment-out/${{ matrix.segment }}.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      # Named after the segment APK, with .log.
+      - id: drivelog
+        if: always() && steps.unity.outcome != 'skipped' && needs.apk.outputs.drive == 'true' && hashFiles('Builds/unity.log') != ''
+        continue-on-error: true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/gdrive-upload@runner
+        with:
+          service-account-key: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY }}
+          folder-id: ${{ secrets.GDRIVE_FOLDER_ID }}
+          file: Builds/unity.log
+          name: ${{ needs.apk.outputs.segment-file-prefix }}${{ matrix.segment }}${{ needs.apk.outputs.segment-log-suffix }}
+
+      - id: unitylog
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure() && steps.unity.outcome != 'skipped' && steps.drivelog.outcome != 'success'
+        with:
+          name: seglog-${{ matrix.segment }}
+          path: Builds/unity.log
+          retention-days: 7
+
+      # The result of this segment for the notify job (matrix jobs have no per-leg outputs).
+      - if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          NAME: ${{ matrix.segment }}
+          SEGMENT_JSON: ${{ steps.segment.outputs.json }}
+          JOB_STATUS: ${{ job.status }}
+          LEG_TIMEOUT_MINUTES: 150
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          SERIAL_OUTCOME: ${{ steps.serial.outcome }}
+          PRERESTORE_OUTCOME: ${{ steps.prerestore.outcome }}
+          SCRIPTRESTORE_OUTCOME: ${{ steps.scriptrestore.outcome }}
+          CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
+          SEGMENT_OUTCOME: ${{ steps.segment.outcome }}
+          UNITY_OUTCOME: ${{ steps.unity.outcome }}
+          GUARD_OUTCOME: ${{ steps.guard.outcome }}
+          GUARD_REASON: ${{ steps.guard.outputs.reason }}
+          APK_SIZE: ${{ steps.guard.outputs.size }}
+          RESTORE_OUTCOME: ${{ steps.restore.outcome }}
+          APK_OUTCOME: ${{ steps.apkart.outcome }}
+          APK_URL: ${{ steps.apkart.outputs.artifact-url }}
+          LOG_URL: ${{ steps.unitylog.outputs.artifact-url }}
+          DRIVE_OUTCOME: ${{ steps.drive.outcome }}
+          DRIVE_LINK: ${{ steps.drive.outputs.link }}
+          DRIVE_NAME: ${{ steps.drive.outputs.name }}
+          DRIVE_SIZE: ${{ steps.drive.outputs.size }}
+          LOG_DRIVE_OUTCOME: ${{ steps.drivelog.outcome }}
+          LOG_DRIVE_LINK: ${{ steps.drivelog.outputs.link }}
+        with:
+          script: |
+            const env = process.env;
+            let segment = {};
+            try { segment = JSON.parse(env.SEGMENT_JSON || '{}'); } catch {}
+            // Cancelled: the job's own status. The first step that did not succeed is where it stopped.
+            const cancelled = env.JOB_STATUS ? env.JOB_STATUS === 'cancelled'
+              : [env.CHECKOUT_OUTCOME, env.SERIAL_OUTCOME, env.UNITY_OUTCOME].includes('cancelled');
+            const failedStep = env.CHECKOUT_OUTCOME !== 'success' ? 'Checkout'
+              : env.SERIAL_OUTCOME !== 'success' ? 'Unity license (serial)'
+              : env.PRERESTORE_OUTCOME !== 'success' ? 'Segment restore (before build)'
+              // The build script restore (continue-on-error) is not a failure of the leg.
+              : env.CLEANUP_OUTCOME !== 'success' ? 'Cleanup of the old APK'
+              : env.SEGMENT_OUTCOME !== 'success' ? 'Segment patch (segment-ci.yml)'
+              : env.UNITY_OUTCOME !== 'success' ? 'Unity build'
+              : env.GUARD_OUTCOME !== 'success' ? env.GUARD_REASON || 'APK check'
+              : env.RESTORE_OUTCOME !== 'success' ? 'Segment restore'
+              // On Drive, or else uploaded as the fallback artifact (which fails when the APK is missing).
+              : env.DRIVE_OUTCOME !== 'success' && env.APK_OUTCOME !== 'success' ? 'APK missing'
+              : '';
+            const drive = env.DRIVE_OUTCOME === 'success'
+              ? { link: env.DRIVE_LINK, name: env.DRIVE_NAME, size: Number(env.DRIVE_SIZE) } : null;
+            // Bytes of the built APK (guard step), for the card whether it is on Drive or an artifact.
+            const size = Number(env.APK_SIZE) || undefined;
+            // Only an APK that exists and did not reach Drive is an upload failure.
+            const driveFailed = env.DRIVE_OUTCOME === 'failure' && env.APK_OUTCOME === 'success';
+            // A leg that finished before the cancel is not a cancelled one. The job's timeout-minutes shows as
+            // cancelled too (here and in needs.segment.result): a leg stopped within 3 minutes of its limit timed out,
+            // a failure at its step. Any other cancel is the run's.
+            const stopped = cancelled && !!failedStep;
+            const ranFor = env.LEG_START ? Date.now() / 1000 - Number(env.LEG_START) : 0;
+            const timedOut = stopped && ranFor >= Number(env.LEG_TIMEOUT_MINUTES) * 60 - 180;
+            const result = { ...segment, name: env.NAME, ok: !failedStep, failedStep: timedOut ? `${failedStep} (timed out)` : failedStep,
+              cancelled: stopped && !timedOut, timedOut, apkUrl: env.APK_URL, logUrl: env.LOG_URL, drive, size, driveFailed,
+              logDrive: env.LOG_DRIVE_OUTCOME === 'success' ? env.LOG_DRIVE_LINK : undefined,
+              logDriveFailed: env.LOG_DRIVE_OUTCOME === 'failure',
+              scriptRestoreFailed: env.SCRIPTRESTORE_OUTCOME === 'failure' };
+            require('fs').mkdirSync('segment-out', { recursive: true });
+            require('fs').writeFileSync(`segment-out/${env.NAME}.json`, JSON.stringify(result));
+
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: segment-result-${{ matrix.segment }}
+          path: segment-out/${{ matrix.segment }}.json
+          retention-days: 7
+
+  # The END message of the run: success, partial, failure or cancelled. It also runs when the run is cancelled
+  # (always()): the result of each build job comes from needs.<job>.result.
+  notify:
+    name: Drive and chat
+    needs: [apk, segment]
+    if: ${{ always() && needs.apk.result != 'skipped' }}
+    # The light runner: the END message does not wait behind builds on the Windows build runner. Every step is
+    # OS-independent (github-script, artifacts, team-chat).
+    runs-on: ${{ fromJSON(inputs.light-runs-on) }}
+    timeout-minutes: 30
+    # actions: read finds the newer run that replaced a cancelled one, and the job logs (read-only API).
+    permissions:
+      contents: read
+      actions: read
+    env:
+      # From the secrets, not from a build job: a job cancelled while it waited for the runner has no outputs.
+      HAVE_DRIVE: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY != '' && secrets.GDRIVE_FOLDER_ID != '' }}
+    # Every step runs whatever happened before it (always()): the END message must go out.
+    steps:
+      # A fresh folder: the runner's workspace persists between jobs.
+      - id: dirs
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          TEMP_DIR: ${{ runner.temp }}
+        with:
+          script: |
+            const dir = require('path').join(process.env.TEMP_DIR, `notify-${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}`);
+            require('fs').rmSync(dir, { recursive: true, force: true });
+            core.setOutput('dir', dir);
+
+      # Only the small result files: the APKs are already on Drive.
+      - if: always() && needs.segment.result != 'skipped'
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: segment-result-*
+          path: ${{ steps.dirs.outputs.dir }}/segments
+
+      - if: always() && env.HAVE_DRIVE != 'true'
+        run: echo "::warning::GDRIVE_SERVICE_ACCOUNT_KEY or GDRIVE_FOLDER_ID is empty, the builds were not uploaded to Drive (they are GitHub artifacts)"
+
+      # Which built files did not reach Drive (each build job uploads its own; a failed upload fails the run here).
+      - id: drivecheck
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SEGMENTS: ${{ needs.apk.outputs.segments }}
+          SEGMENTS_DIR: ${{ steps.dirs.outputs.dir }}/segments
+          NORMAL_DRIVE_OUTCOME: ${{ needs.apk.outputs.drive-outcome }}
+          APK_OUTCOME: ${{ needs.apk.outputs.apk-outcome }}
+          SEGMENT_RESULT: ${{ needs.segment.result }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const env = process.env;
+            const failed = [];
+            if (env.NORMAL_DRIVE_OUTCOME === 'failure' && env.APK_OUTCOME === 'success') failed.push('normal');
+            let requested = [];
+            try { requested = JSON.parse(env.SEGMENTS || '[]'); } catch {}
+            const files = fs.existsSync(env.SEGMENTS_DIR)
+              ? fs.readdirSync(env.SEGMENTS_DIR, { recursive: true }).map(f => path.join(env.SEGMENTS_DIR, String(f)))
+              : [];
+            for (const name of requested) {
+              const file = files.find(f => path.basename(f) === `${name}.json`);
+              // No result (download failed, leg killed): its APK may be on neither Drive nor the card. A leg that a
+              // cancel stopped before it started has none either: that is not an upload failure.
+              if (!file) {
+                if (env.HAVE_DRIVE === 'true' && !['skipped', 'cancelled'].includes(env.SEGMENT_RESULT)) failed.push(`${name} (no result)`);
+                continue;
+              }
+              try { if (JSON.parse(fs.readFileSync(file, 'utf8')).driveFailed) failed.push(name); } catch { failed.push(`${name} (bad result)`); }
+            }
+            core.setOutput('failed', failed.join(', '));
+
+      # Set only when the run itself was cancelled. A cancel between two jobs (after apk, before the segment legs
+      # start) can leave no job result `cancelled`, and the card would say ⚠️ or ✅ instead of 🚫.
+      - id: runcancelled
+        if: cancelled()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: core.setOutput('cancelled', 'true');
+
+      # The full GitHub log of every build job that failed or was cancelled, as one file for Drive: where the Unity log
+      # does not help (checkout, upload, a killed Unity). Also each job's page, the card's GitHub fallback. Best effort:
+      # a problem here is a warning, never the run's result.
+      - id: joblog
+        if: always()
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          DIR: ${{ steps.dirs.outputs.dir }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const env = process.env;
+            const { owner, repo } = context.repo;
+            // Called as a reusable workflow, a job is listed as "<caller job> / <job name>".
+            const short = n => { const i = n.indexOf(' / '); return i < 0 ? n : n.slice(i + 3); };
+            const isBuildJob = n => n === 'Debug APK' || n.startsWith('Segment ');
+            let jobs;
+            try {
+              jobs = (await github.paginate(github.rest.actions.listJobsForWorkflowRun,
+                { owner, repo, run_id: context.runId, filter: 'latest', per_page: 100 }))
+                .map(j => ({ ...j, name: short(j.name) })).filter(j => isBuildJob(j.name));
+            } catch (err) {
+              core.warning(`Jobs of the run not listed, no job log on Drive: ${err.message}`);
+              return;
+            }
+            core.setOutput('urls', JSON.stringify(Object.fromEntries(jobs.map(j => [j.name, j.html_url]))));
+            if (env.HAVE_DRIVE !== 'true') return;
+            // Named like the build files (meta step of the apk job, which may not have run).
+            const isPr = env.EVENT_NAME === 'pull_request';
+            const label = env.REF_NAME.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+            const ref = isPr ? `pr-${env.PR_NUMBER}` : label || 'ref';
+            const sha = (isPr ? env.PR_HEAD_SHA : env.SHA).slice(0, 7);
+            const name = `${env.REPO.split('/')[1]}_debug_${ref}_${env.RUN_NUMBER}_${sha}-job.log`;
+            // A job that never got a runner (a leg cancelled while queued) has no steps and no log.
+            const stopped = jobs.filter(j => ['failure', 'cancelled', 'timed_out'].includes(j.conclusion) && (j.steps || []).length);
+            const parts = [];
+            const included = [];
+            for (const j of stopped) {
+              let text;
+              // The log can lag a few seconds behind the job's end.
+              for (let i = 1; i <= 3 && text === undefined; i++) {
+                try {
+                  const { data } = await github.rest.actions.downloadJobLogsForWorkflowRun({ owner, repo, job_id: j.id });
+                  text = typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
+                } catch (err) {
+                  core.info(`${j.name}: job log not available (try ${i} of 3): ${err.message}`);
+                  if (i < 3) await new Promise(r => setTimeout(r, 15000));
+                }
+              }
+              if (text === undefined) {
+                core.warning(`${j.name}: job log not downloaded, the card links its GitHub page`);
+                continue;
+              }
+              parts.push(`===== ${j.name}: ${j.conclusion} (${j.html_url}) =====\n${text}\n`);
+              included.push(j.name);
+            }
+            if (!parts.length) return;
+            fs.mkdirSync(env.DIR, { recursive: true });
+            const file = path.join(env.DIR, name);
+            fs.writeFileSync(file, parts.join('\n'));
+            core.setOutput('file', file);
+            core.setOutput('name', name);
+            core.setOutput('jobs', JSON.stringify(included));
+
+      - id: drivejoblog
+        if: always() && env.HAVE_DRIVE == 'true' && steps.joblog.outputs.file != ''
+        continue-on-error: true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/gdrive-upload@runner
+        with:
+          service-account-key: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY }}
+          folder-id: ${{ secrets.GDRIVE_FOLDER_ID }}
+          file: ${{ steps.joblog.outputs.file }}
+          name: ${{ steps.joblog.outputs.name }}
+
+      # The run report for the END message; ci-sdk team-chat turns it into the card. Everything from the event is
+      # untrusted text: it reaches the script only through env, and team-chat escapes it (no mention, no link).
+      - id: report
+        if: always()
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          APK_RESULT: ${{ needs.apk.result }}
+          SEGMENT_RESULT: ${{ needs.segment.result }}
+          RUN_CANCELLED: ${{ steps.runcancelled.outputs.cancelled }}
+          # Only the folder link is built from it, here: a job output holding a secret would be dropped.
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          APK_TIMED_OUT: ${{ needs.apk.outputs.timed-out }}
+          SEGMENTS: ${{ needs.apk.outputs.segments }}
+          SEGMENT_DETAILS: ${{ needs.apk.outputs.segment-details }}
+          SEGMENTS_DIR: ${{ steps.dirs.outputs.dir }}/segments
+          EVENT_NAME: ${{ github.event_name }}
+          CLEAN: ${{ inputs.clean == true }}
+          REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.triggering_actor }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          COMMIT_IDS: ${{ toJSON(github.event.commits.*.id) }}
+          COMMIT_MESSAGES: ${{ toJSON(github.event.commits.*.message) }}
+          COMMIT_AUTHORS: ${{ toJSON(github.event.commits.*.author.name) }}
+          HEAD_SHA: ${{ needs.apk.outputs.head-sha }}
+          HEAD_SUBJECT: ${{ needs.apk.outputs.head-subject }}
+          HEAD_AUTHOR: ${{ needs.apk.outputs.head-author }}
+          BUILD_START: ${{ needs.apk.outputs.build-start }}
+          RUNNER: ${{ needs.apk.outputs.runner }}
+          GAME_NAME: ${{ needs.apk.outputs.game-name }}
+          GAME_VERSION: ${{ needs.apk.outputs.game-version }}
+          VERSION_CODE: ${{ needs.apk.outputs.version-code }}
+          DRIVE_FAILED: ${{ steps.drivecheck.outputs.failed }}
+          NORMAL_LOG_URL: ${{ needs.apk.outputs.log-url }}
+          NORMAL_LOG_DRIVE_OUTCOME: ${{ needs.apk.outputs.log-drive-outcome }}
+          NORMAL_LOG_DRIVE_LINK: ${{ needs.apk.outputs.log-drive-link }}
+          JOB_LOG_JOBS: ${{ steps.joblog.outputs.jobs }}
+          JOB_URLS: ${{ steps.joblog.outputs.urls }}
+          JOB_LOG_DRIVE_OUTCOME: ${{ steps.drivejoblog.outcome }}
+          JOB_LOG_LINK: ${{ steps.drivejoblog.outputs.link }}
+          NORMAL_DRIVE_LINK: ${{ needs.apk.outputs.drive-link }}
+          NORMAL_DRIVE_SIZE: ${{ needs.apk.outputs.drive-size }}
+          NORMAL_SIZE: ${{ needs.apk.outputs.apk-size }}
+          NORMAL_DRIVE_OUTCOME: ${{ needs.apk.outputs.drive-outcome }}
+          APK_OK: ${{ needs.apk.outputs.apk-ok }}
+          APK_URL: ${{ needs.apk.outputs.apk-url }}
+          SERIAL_OUTCOME: ${{ needs.apk.outputs.serial-outcome }}
+          LIST_OUTCOME: ${{ needs.apk.outputs.list-outcome }}
+          DEBUGVIEWDOTNET_OUTCOME: ${{ needs.apk.outputs.debugviewdotnet-outcome }}
+          PRERESTORE_OUTCOME: ${{ needs.apk.outputs.prerestore-outcome }}
+          SCRIPTRESTORE_OUTCOME: ${{ needs.apk.outputs.scriptrestore-outcome }}
+          CLEANUP_OUTCOME: ${{ needs.apk.outputs.cleanup-outcome }}
+          UNITY_OUTCOME: ${{ needs.apk.outputs.unity-outcome }}
+          GUARD_OUTCOME: ${{ needs.apk.outputs.guard-outcome }}
+          GUARD_REASON: ${{ needs.apk.outputs.guard-reason }}
+          APK_OUTCOME: ${{ needs.apk.outputs.apk-outcome }}
+        with:
+          script: |
+            const env = process.env;
+            const fs = require('fs');
+            const path = require('path');
+            const first = s => (s || '').split('\n')[0].trim().slice(0, 200);
+            const parse = (s, fallback) => { try { return JSON.parse(s || ''); } catch { return fallback; } };
+            const num = s => (s === undefined || s === '' || !Number.isFinite(Number(s)) ? undefined : Number(s));
+
+            const isPr = env.EVENT_NAME === 'pull_request';
+            const repoUrl = `${env.SERVER_URL}/${env.REPO}`;
+            const sha = isPr ? env.PR_HEAD_SHA : env.SHA;
+            // One result per requested segment leg: <name>.json, flat (a single downloaded artifact) or in its
+            // artifact's folder; null when the leg never wrote one.
+            const requested = parse(env.SEGMENTS, []);
+            const segFiles = fs.existsSync(env.SEGMENTS_DIR)
+              ? fs.readdirSync(env.SEGMENTS_DIR, { recursive: true }).map(f => path.join(env.SEGMENTS_DIR, String(f)))
+              : [];
+            const legs = requested.map(name => {
+              const file = segFiles.find(f => path.basename(f) === `${name}.json`);
+              return file ? { ...parse(fs.readFileSync(file, 'utf8'), { ok: false, failedStep: 'unknown step' }), name } : null;
+            });
+
+            // needs.<job>.result: success, failure, cancelled or skipped. team-chat picks the END variant from them.
+            // A leg stopped by its own timeout-minutes also shows as cancelled there, so the legs decide: the segments
+            // were cancelled when a leg says so (it tells its timeout apart), or a leg never started and the result
+            // says cancelled. A timeout alone is a failure; a cancel that only hit a leg's last steps after it built
+            // and uploaded leaves every leg OK.
+            const segmentsCancelled = legs.some(s => s && s.cancelled) || (env.SEGMENT_RESULT === 'cancelled' && legs.some(s => !s));
+            const segmentResult = segmentsCancelled ? 'cancelled'
+              : env.SEGMENT_RESULT === 'cancelled' ? (legs.length && legs.every(s => s && s.ok) ? 'success' : 'failure')
+              : env.SEGMENT_RESULT;
+            // The normal APK job tells its own timeout-minutes apart too (its timeout step): a failure.
+            const apkTimedOut = env.APK_RESULT === 'cancelled' && env.APK_TIMED_OUT === 'true';
+            const apkResult = apkTimedOut ? 'failure' : env.APK_RESULT;
+            const jobs = { apk: apkResult, segment: segmentResult };
+            // A run cancelled between two jobs has no cancelled job result. Two signals: the segment job skipped
+            // although the normal APK succeeded with segments to build (only a cancel skips it then), and the run's
+            // own state (runcancelled step). The latter only when a segment leg never ran after a good normal APK (a
+            // cancel after every build finished, or after a failed one, keeps that result) and no job stopped at its
+            // own timeout-minutes (a failure).
+            const timedOut = apkTimedOut || legs.some(s => s && s.timedOut);
+            const unfinished = env.APK_RESULT === 'success' && legs.some(s => !s);
+            const cancelledBetween = env.APK_RESULT === 'success' && requested.length > 0 && env.SEGMENT_RESULT === 'skipped';
+            const cancelled = cancelledBetween || (env.RUN_CANCELLED === 'true' && unfinished && !timedOut) || Object.values(jobs).includes('cancelled');
+
+            // A leg with no result counts as failed, or as cancelled (a cancel stopped it before it started), or as
+            // skipped (the normal build failed).
+            const details = parse(env.SEGMENT_DETAILS, []);
+            const detail = name => (Array.isArray(details) && details.find(x => x && x.name === name)) || {};
+            const segments = requested.map((name, i) => {
+              if (legs[i]) return legs[i];
+              const { campaign, country } = detail(name);
+              return { name, campaign, country, ok: false, queued: true, cancelled, skipped: !cancelled && env.SEGMENT_RESULT === 'skipped', failedStep: 'unknown step' };
+            });
+
+            const driveOn = env.HAVE_DRIVE === 'true';
+            const uploadFailed = !!env.DRIVE_FAILED;
+            const mainOk = env.APK_RESULT === 'success';
+            const ok = mainOk && segments.every(s => s.ok) && !uploadFailed;
+            // The stage a stopped job was in: its first step whose outcome is cancelled. A job with no start time never
+            // got the runner.
+            const stage = pairs => (pairs.find(([outcome]) => outcome === 'cancelled') || [])[1];
+            const started = !!env.BUILD_START;
+            const normalStage = () => stage([
+              [env.SERIAL_OUTCOME, 'Unity license (serial)'], [env.LIST_OUTCOME, 'Segment list'],
+              [env.PRERESTORE_OUTCOME, 'Segment restore (before build)'], [env.SCRIPTRESTORE_OUTCOME, 'Build script restore (before build)'],
+              [env.CLEANUP_OUTCOME, 'Cleanup of the old APK'], [env.DEBUGVIEWDOTNET_OUTCOME, '.NET setup (Debug View)'],
+              [env.UNITY_OUTCOME, 'Unity build (normal APK)'],
+              [env.GUARD_OUTCOME, 'APK check'], [env.NORMAL_DRIVE_OUTCOME, 'Upload to Drive'], [env.APK_OUTCOME, 'APK artifact'],
+            ]) || (started ? 'the normal APK job' : 'the wait for the runner');
+            // The build script restore (continue-on-error) never fails the debug build.
+            const normalFailedStep = apkTimedOut ? `${normalStage()} (timed out)`
+              : env.SERIAL_OUTCOME === 'failure' ? 'Unity license (serial)'
+              : env.PRERESTORE_OUTCOME === 'failure' ? 'Segment restore (before build)'
+              : env.CLEANUP_OUTCOME === 'failure' ? 'Cleanup of the old APK'
+              : env.DEBUGVIEWDOTNET_OUTCOME === 'failure' ? '.NET setup (Debug View)'
+              : env.UNITY_OUTCOME === 'failure' ? 'Unity build'
+              : env.GUARD_OUTCOME === 'failure' ? env.GUARD_REASON || 'APK check'
+              : env.APK_OUTCOME === 'failure' ? 'APK missing'
+              : env.LIST_OUTCOME === 'failure' ? 'Segment list (segment-ci.yml)'
+              : 'unknown step';
+
+            // A cancelled run: the stage it was in.
+            let cancelStage = '';
+            if (cancelled && apkResult === 'cancelled') {
+              cancelStage = normalStage();
+            } else if (cancelled) {
+              const leg = segments.find(s => s.cancelled && !s.queued);
+              cancelStage = leg ? `segment ${leg.name} (${leg.failedStep || 'build'})` : 'segment builds';
+            }
+
+            // Run details (read-only API) for a cancelled run: its start, and the newer run of the same concurrency
+            // group that replaced it (a newer cached run of the same branch or PR; a clean run is never replaced).
+            // Best effort: without them the message just leaves them out.
+            let runStarted;
+            let supersededBy;
+            if (cancelled) {
+              try {
+                const { owner, repo } = context.repo;
+                const { data: me } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: Number(env.RUN_ID) });
+                runStarted = Math.floor(Date.parse(me.run_started_at) / 1000) || undefined;
+                if (env.REF_TYPE !== 'tag' && env.CLEAN !== 'true') {
+                  const { data } = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: me.workflow_id, branch: me.head_branch, per_page: 20 });
+                  // The run that replaced this one is still waiting for it (its group is held until this notify job
+                  // ends): a completed or running newer run is not it.
+                  // `pending` is a run held by the concurrency group; a merely `queued` one is not waiting on this run.
+                  const newer = data.workflow_runs
+                    .filter(r => r.run_number > me.run_number && r.status === 'pending' && (r.event === 'pull_request') === isPr)
+                    .sort((a, b) => a.run_number - b.run_number)[0];
+                  if (newer) supersededBy = { number: newer.run_number, url: newer.html_url };
+                }
+              } catch (err) {
+                core.info(`Run details not available: ${err.message}`);
+              }
+            }
+
+            // The log of a failed build: its Unity log on Drive when Unity is where it failed (unityDrive), else the job's
+            // full log on Drive (joblog step), else GitHub: the Unity log artifact, else the job's page.
+            const jobLogJobs = parse(env.JOB_LOG_JOBS, []);
+            const jobUrls = parse(env.JOB_URLS, {});
+            const inUnity = step => ['Unity build', 'APK missing'].includes(step);
+            const logFor = (job, unityDrive, artifactUrl) => unityDrive
+              || (env.JOB_LOG_LINK && Array.isArray(jobLogJobs) && jobLogJobs.includes(job) ? env.JOB_LOG_LINK : '')
+              || artifactUrl || jobUrls?.[job] || undefined;
+            const logUrl = logFor('Debug APK', inUnity(normalFailedStep) ? env.NORMAL_LOG_DRIVE_LINK : '', env.NORMAL_LOG_URL);
+            const logUploadsFailed = [
+              ...(env.NORMAL_LOG_DRIVE_OUTCOME === 'failure' ? ['normal Unity log'] : []),
+              ...segments.filter(s => s.logDriveFailed).map(s => `${s.name} Unity log`),
+              ...(env.JOB_LOG_DRIVE_OUTCOME === 'failure' ? ['job log'] : []),
+            ];
+            if (logUploadsFailed.length) core.warning(`Log upload to Drive failed (${logUploadsFailed.join(', ')}): the card links the next log available (job log on Drive, else GitHub)`);
+            // A built file: its Drive link, else the fallback artifact. A missing one: why, and the log.
+            // size: bytes of the built file (measured by the build job), else what Drive reported.
+            const linkOf = (driveLink, size, artifactUrl) => driveLink ? { link: driveLink, size: num(size) }
+              : artifactUrl ? { link: artifactUrl, fallback: true, size: num(size) } : {};
+            const built = (ok, stopped, driveLink, size, artifactUrl, why, log) => ok
+              ? { status: 'success', ...linkOf(driveLink, size, artifactUrl) }
+              : stopped ? { status: 'cancelled' } : { status: 'failure', failedStep: why, logUrl: log };
+            const builds = [
+              { name: 'Normal', kind: 'normal', ...built(env.APK_OK === 'true', apkResult === 'cancelled', env.NORMAL_DRIVE_LINK, env.NORMAL_SIZE || env.NORMAL_DRIVE_SIZE, env.APK_URL, normalFailedStep, logUrl) },
+              // A development-build segment (debug: true) is marked on the card, as in START.
+              ...segments.map(s => ({ name: `${s.name}${detail(s.name).debug === true ? ' (debug)' : ''}`, kind: 'segment', campaign: s.campaign, country: s.country || undefined,
+                ...(s.skipped ? { status: 'skipped' }
+                  : built(!!s.ok, !!s.cancelled, s.drive?.link, s.size || s.drive?.size, s.apkUrl, s.failedStep || 'unknown step',
+                    logFor(`Segment ${s.name}`, inUnity(s.failedStep) ? s.logDrive : '', s.logUrl))) })),
+            ];
+
+            const failedSegments = segments.filter(s => !s.ok && !s.skipped && !s.cancelled).map(s => s.name);
+            const failedStep = cancelled ? cancelStage
+              : !mainOk ? normalFailedStep
+              : failedSegments.length ? `segment ${failedSegments.join(', ')}`
+              : uploadFailed ? `Upload to Drive (${env.DRIVE_FAILED})`
+              : 'unknown step';
+
+            let changes = [];
+            if (isPr) {
+              changes = [{ sha, subject: first(env.PR_TITLE), author: env.PR_AUTHOR }];
+            } else if (env.EVENT_NAME === 'push') {
+              const ids = parse(env.COMMIT_IDS, []), msgs = parse(env.COMMIT_MESSAGES, []), names = parse(env.COMMIT_AUTHORS, []);
+              changes = ids.map((id, i) => ({ sha: id, subject: first(msgs[i]), author: names[i] }));
+            }
+            if (!changes.length && env.HEAD_SHA) changes = [{ sha: env.HEAD_SHA, subject: first(env.HEAD_SUBJECT), author: env.HEAD_AUTHOR }];
+
+            // From the build job's start; for a run cancelled before a job started, from the run's start.
+            const start = Number(env.BUILD_START) || runStarted;
+            const secs = start ? Math.round(Date.now() / 1000) - start : undefined;
+            const startedAt = start ? new Date(start * 1000).toLocaleString('en-GB', {
+              timeZone: 'Asia/Ho_Chi_Minh', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
+            }).replace(',', '') + ' (UTC+7)' : undefined;
+            const report = {
+              name: env.REPO.split('/')[1],
+              kind: 'debug',
+              phase: 'end',
+              status: cancelled ? 'cancelled' : ok ? 'success' : 'failure',
+              jobs,
+              ...(ok && !cancelled ? {} : { failedStep }),
+              ...(supersededBy ? { supersededBy } : {}),
+              game: env.GAME_NAME || undefined,
+              platform: 'Android',
+              clean: env.CLEAN === 'true',
+              project: { name: env.REPO, url: repoUrl },
+              run: { url: `${repoUrl}/actions/runs/${env.RUN_ID}`, number: env.RUN_NUMBER },
+              ref: isPr ? { type: 'pr', name: `#${env.PR_NUMBER}`, url: env.PR_URL, title: first(env.PR_TITLE) }
+                : { type: env.REF_TYPE === 'tag' ? 'tag' : 'branch', name: env.REF_NAME },
+              commit: { sha, url: `${repoUrl}/commit/${sha}`, subject: isPr ? undefined : first(env.HEAD_SUBJECT) || undefined },
+              actor: env.ACTOR,
+              event: env.EVENT_NAME,
+              runner: env.RUNNER || undefined,
+              startedAt,
+              durationSeconds: secs !== undefined && Number.isFinite(secs) ? Math.max(0, secs) : undefined,
+              driveFolderUrl: driveOn && env.GDRIVE_FOLDER_ID ? `https://drive.google.com/drive/folders/${encodeURIComponent(env.GDRIVE_FOLDER_ID)}` : undefined,
+              version: { name: env.GAME_VERSION ? env.GAME_VERSION.replace(/^v?/i, 'v') : undefined, code: env.VERSION_CODE && env.VERSION_CODE !== '?' ? env.VERSION_CODE : undefined },
+              builds,
+              changelog: changes.map(c => ({ ...c, url: `${repoUrl}/commit/${c.sha}` })),
+              warnings: [
+                // The debug build script restore is continue-on-error: a leftover Assets/CiSdkBuild (obfuscation hook)
+                // may have been in that build.
+                ...(env.SCRIPTRESTORE_OUTCOME === 'failure' || segments.some(s => s.scriptRestoreFailed)
+                  ? ['Build script restore failed before a debug build: Assets/CiSdkBuild may still be in the project (run with clean)'] : []),
+                ...(driveOn ? [] : ['Drive chưa cấu hình: GDRIVE_SERVICE_ACCOUNT_KEY or GDRIVE_FOLDER_ID is empty, the files are GitHub artifacts (7 days)']),
+              ],
+              logUrl,
+            };
+            core.setOutput('json', JSON.stringify(report));
+
+      # Header, fields, one table row per build, alerts, changelog. A webhook error is only a warning: team-chat
+      # never fails the run for it.
+      - if: always() && steps.report.outcome == 'success'
+        continue-on-error: true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/team-chat@runner
+        with:
+          webhook-url: ${{ secrets.CHAT_WEBHOOK_URL }}
+          report: ${{ steps.report.outputs.json }}
+
+      - if: always() && steps.drivecheck.outputs.failed != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          FAILED: ${{ steps.drivecheck.outputs.failed }}
+        with:
+          script: |
+            core.setFailed(`Drive upload failed for: ${process.env.FAILED} (see the drive step of that build job)`);
