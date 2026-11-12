@@ -63,7 +63,10 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: reusable-workflows
-          path: workflows/*.yml
+          # Kept as workflows/ and scripts/ (their common root).
+          path: |
+            workflows/*.yml
+            scripts/pin-workflows.sh
           if-no-files-found: error
           retention-days: 7
 
@@ -133,6 +136,10 @@ jobs:
           # The runner commit that holds the actions as published now: what the workflows pin.
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      # GitHub refuses a GITHUB_TOKEN push that changes .github/workflows (no `workflows` permission exists for it):
+      # this push needs the secret WORKFLOWS_PUSH_TOKEN, a token with contents + workflows write on this repository
+      # (a fine-grained PAT, or a classic one with the `workflow` scope). Without it the job fails with the command to
+      # publish them by hand; the actions are already published by then.
       - name: Pin and commit the reusable workflows
         working-directory: runner-branch
         env:
@@ -140,29 +147,29 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
           ACTIONS_SHA: ${{ steps.actions.outputs.sha }}
           VERSION: ${{ needs.build.outputs.version }}
+          PUSH_TOKEN: ${{ secrets.WORKFLOWS_PUSH_TOKEN }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          files=("$SRC"/*.yml)
-          if [ ${#files[@]} -eq 0 ]; then echo "::error::no reusable workflow in the artifact"; exit 1; fi
-          case "$ACTIONS_SHA" in [0-9a-f]*) ;; *) echo "::error::no actions commit sha"; exit 1 ;; esac
-          mkdir -p .github/workflows
-          for f in "${files[@]}"; do
-            target=".github/workflows/$(basename "$f")"
-            sed -E "s#(Association-of-stupid-people/ci-sdk/\.github/actions/[a-z0-9-]+)@runner( .*)?\$#\1@${ACTIONS_SHA} \# ci-sdk v${VERSION}#" "$f" > "$target"
-            if grep -nE 'ci-sdk/\.github/actions/[a-z0-9-]+@runner' "$target"; then
-              echo "::error::$target still uses an unpinned ci-sdk action"; exit 1
-            fi
-            echo "pinned $target to $ACTIONS_SHA"
-          done
+          bash "$SRC/scripts/pin-workflows.sh" "$SRC/workflows" . "$ACTIONS_SHA" "$VERSION"
           git add .github/workflows
           if git diff --cached --quiet; then
             echo "No workflow changes to publish"
             exit 0
           fi
           git commit -m "build: update reusable workflows from ${SOURCE_SHA::7} (actions ${ACTIONS_SHA::7})"
+          if [ -z "$PUSH_TOKEN" ]; then
+            echo "::error::WORKFLOWS_PUSH_TOKEN is not set, the reusable workflows were not published. From a clone of main: git worktree add ../ci-sdk-runner origin/runner && scripts/pin-workflows.sh workflows ../ci-sdk-runner $ACTIONS_SHA $VERSION, then commit .github/workflows there and push it to runner with a token that has the workflow scope"
+            exit 1
+          fi
+          # The token reaches git through a credential helper (env), never the command line; the checkout's own
+          # GITHUB_TOKEN header is cleared for this push only.
+          push() {
+            git -c http.https://github.com/.extraheader= -c credential.helper= \
+              -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$PUSH_TOKEN"; }; f' \
+              push origin HEAD:runner
+          }
           for i in 1 2 3; do
-            git push origin HEAD:runner && exit 0
+            push && exit 0
             git pull --rebase origin runner
           done
           exit 1

@@ -66,7 +66,12 @@ env 'INPUT_RUN=npm ci' INPUT_RETRIES=2 'INPUT_RETRY-DELAY=5s' node dist/run/dist
 build, then copies `dist/<name>/` into `runner:.github/actions/<name>/` and pushes. Then it
 copies each `workflows/<name>.yml` into `runner:.github/workflows/<name>.yml` with every
 `ci-sdk/.github/actions/<x>@runner` pinned to the runner commit that holds those actions
-(`@<sha> # ci-sdk vX.Y.Z`), and pushes that as a second commit. Only the folders of the actions
+(`@<sha> # ci-sdk vX.Y.Z`, `scripts/pin-workflows.sh`), and pushes that as a second commit. GitHub
+refuses a `GITHUB_TOKEN` push that changes `.github/workflows`, so that push uses the secret
+`WORKFLOWS_PUSH_TOKEN` (contents + workflows write on this repository); without it the job fails
+after the actions are published and prints the commands to publish the workflows by hand (a
+worktree of `runner`, `scripts/pin-workflows.sh`, a push with a token that has the `workflow`
+scope). Only the folders of the actions
 built here and those workflow files are replaced; composite actions on `runner` are not touched.
 `ci.yml` runs the same checks on PRs and executes the built actions.
 `scripts/__tests__/workflows.test.ts` checks the reusable workflows statically: ci-sdk actions at
