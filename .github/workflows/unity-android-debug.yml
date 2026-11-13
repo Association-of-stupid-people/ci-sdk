@@ -57,7 +57,8 @@
 # light runner (input light-runs-on), so the END message does not wait behind builds on the Windows runner.
 # Caches: every build reuses what the runner keeps between jobs: the checkout and Unity's Library, the installed editor
 # and the Gradle cache. `clean` checks out fresh (removes Library and every other ignored file) and empties the Gradle
-# cache. IL2CPP is the exception, cleaned by every build job itself (step il2cppclean).
+# cache. IL2CPP (generated C++ and objects) is kept only after a Unity build here that exited normally; after a cancel,
+# a timeout or a Unity failure the build job cleans it first (step il2cppclean).
 # Concurrency belongs to the caller: one cached build per branch at a time, a newer run cancels the older one (the
 # license stays activated, a cancel loses no seat), a clean run in a group of its own.
 name: Unity Android debug build
@@ -272,10 +273,11 @@ jobs:
       # Stale IL2CPP state must never reach a build. A Unity build killed mid compile (a cancelled run, a timeout) leaves
       # objects in Library/Bee/artifacts/Android/<hash>/ that its build state never recorded: the next build trusts the
       # older record and links them with fresh ones (seen: ld.lld duplicate symbols between GenericMethods__9 and
-      # __10, one compiled by the debug run killed just before). So: the generated C++
-      # (il2cppOutput) always goes, and the game's IL2CPP objects too unless the previous Unity build here exited
-      # normally (marker written after it), for a release always. The rest of Library (the import cache) stays, so do
-      # the il2cpp.a runtime folders (no game code). A failed clean is a warning here (the marker is gone, so the next
+      # __10, one compiled by the debug run killed just before). So: when the previous Unity build here exited normally
+      # (marker written after it), the generated C++ (il2cppOutput) and the game's IL2CPP objects both stay and the
+      # build is incremental (only the changed C++ compiles again, as in the editor). Otherwise (cancelled, timed out,
+      # Unity failed) both go. The rest of Library (the import cache) stays, so do the il2cpp.a runtime folders (no
+      # game code). A failed clean is a warning here (the marker is gone, so the next
       # build cleans again); it fails a release.
       - id: il2cppclean
         continue-on-error: true
@@ -301,9 +303,9 @@ jobs:
             try {
               const keep = process.env.ALWAYS !== 'true' && fs.existsSync(marker);
               await rm(marker);
-              await rm(path.join(root, 'il2cppOutput'));
               core.setOutput('kept', String(keep));
-              if (keep) return core.info('The previous Unity build exited normally: IL2CPP objects kept');
+              if (keep) return core.info('The previous Unity build exited normally: IL2CPP output and objects kept');
+              await rm(path.join(root, 'il2cppOutput'));
               // Object folders of the game's C++ (they hold libil2cpp.so once linked); not the il2cpp.a runtime ones.
               const removed = [];
               for (const e of fs.existsSync(root) ? fs.readdirSync(root, { withFileTypes: true }) : []) {
@@ -630,8 +632,7 @@ jobs:
             require('fs').rmSync('Builds/unity.log', { force: true });
             require('fs').rmSync('segment-out', { recursive: true, force: true });
 
-      # The same IL2CPP clean as the normal build: after a good previous build only il2cppOutput goes, so a leg stays
-      # incremental.
+      # The same IL2CPP clean as the normal build: after a good previous build nothing goes, so a leg stays incremental.
       - id: il2cppclean
         continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -656,9 +657,9 @@ jobs:
             try {
               const keep = process.env.ALWAYS !== 'true' && fs.existsSync(marker);
               await rm(marker);
-              await rm(path.join(root, 'il2cppOutput'));
               core.setOutput('kept', String(keep));
-              if (keep) return core.info('The previous Unity build exited normally: IL2CPP objects kept');
+              if (keep) return core.info('The previous Unity build exited normally: IL2CPP output and objects kept');
+              await rm(path.join(root, 'il2cppOutput'));
               // Object folders of the game's C++ (they hold libil2cpp.so once linked); not the il2cpp.a runtime ones.
               const removed = [];
               for (const e of fs.existsSync(root) ? fs.readdirSync(root, { withFileTypes: true }) : []) {
