@@ -884,8 +884,13 @@ jobs:
               scriptRestoreFailed: env.SCRIPTRESTORE_OUTCOME === 'failure' };
             require('fs').mkdirSync('segment-out', { recursive: true });
             require('fs').writeFileSync(`segment-out/${env.NAME}.json`, JSON.stringify(result));
+            // Also in the job log (base64, one line): the notify job reads it there when the artifact below is
+            // missing (the account's artifact storage quota is used up, or the upload failed).
+            core.info(`ci-sdk-segment-result ${Buffer.from(JSON.stringify(result)).toString('base64')}`);
 
+      # A failed upload (artifact storage quota hit) does not fail the leg: its result is in the job log too.
       - if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: segment-result-${{ matrix.segment }}
@@ -930,6 +935,61 @@ jobs:
         with:
           pattern: segment-result-*
           path: ${{ steps.dirs.outputs.dir }}/segments
+
+      # A leg whose result artifact is missing (artifact storage quota hit, upload failed): its result from the
+      # ci-sdk-segment-result line of its job log, written as <name>.json next to the downloaded ones.
+      - if: always() && needs.segment.result != 'skipped'
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SEGMENTS: ${{ needs.apk.outputs.segments }}
+          SEGMENTS_DIR: ${{ steps.dirs.outputs.dir }}/segments
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const env = process.env;
+            const { owner, repo } = context.repo;
+            let requested = [];
+            try { requested = JSON.parse(env.SEGMENTS || '[]'); } catch {}
+            const have = fs.existsSync(env.SEGMENTS_DIR)
+              ? fs.readdirSync(env.SEGMENTS_DIR, { recursive: true }).map(f => path.basename(String(f))) : [];
+            const missing = requested.filter(name => !have.includes(`${name}.json`));
+            if (!missing.length) return;
+            let jobs;
+            try {
+              jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
+                { owner, repo, run_id: context.runId, filter: 'latest', per_page: 100 });
+            } catch (err) {
+              // The caller must grant actions: read.
+              core.warning(`Jobs of the run not listed, no segment result from the job logs (${missing.join(', ')}): ${err.message}`);
+              return;
+            }
+            fs.mkdirSync(env.SEGMENTS_DIR, { recursive: true });
+            for (const name of missing) {
+              // Called as a reusable workflow, a job is listed as "<caller job> / <job name>".
+              const job = jobs.find(j => j.name === `Segment ${name}` || j.name.endsWith(` / Segment ${name}`));
+              // A leg that never got a runner has no log: no result, as before.
+              if (!job || !(job.steps || []).length) continue;
+              let text;
+              // The log can lag a few seconds behind the job's end.
+              for (let i = 1; i <= 3 && text === undefined; i++) {
+                try {
+                  const { data } = await github.rest.actions.downloadJobLogsForWorkflowRun({ owner, repo, job_id: job.id });
+                  text = typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
+                } catch (err) {
+                  core.info(`${job.name}: job log not available (try ${i} of 3): ${err.message}`);
+                  if (i < 3) await new Promise(r => setTimeout(r, 15000));
+                }
+              }
+              const found = text ? [...text.matchAll(/ci-sdk-segment-result ([A-Za-z0-9+/=]+)/g)].pop() : undefined;
+              if (!found) {
+                core.warning(`${name}: no result artifact and none in its job log`);
+                continue;
+              }
+              fs.writeFileSync(path.join(env.SEGMENTS_DIR, `${name}.json`), Buffer.from(found[1], 'base64').toString('utf8'));
+              core.info(`${name}: result read from its job log`);
+            }
 
       - if: always() && env.HAVE_DRIVE != 'true'
         run: echo "::warning::GDRIVE_SERVICE_ACCOUNT_KEY or GDRIVE_FOLDER_ID is empty, the builds were not uploaded to Drive (they are GitHub artifacts)"
