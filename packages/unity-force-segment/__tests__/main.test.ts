@@ -173,3 +173,40 @@ describe('restore', () => {
     await expect(call({ mode: 'restore' })).resolves.toEqual({})
   })
 })
+
+describe('apply-runtime', () => {
+  it('patches for the segments a stamp can make (not the debug ones), then restores', async () => {
+    const out = await call({ mode: 'apply-runtime', segment: 'all' })
+    expect(out['enabled']).toBe('true')
+    expect(out['segments']).toBe('["qa"]')
+    expect(out['patched']).toBe(`${ADJUST_PATH}\nAssets/Adjust/Scripts/AdjustCiForcedSegment.cs`)
+    expect(await readFile(path.join(project, ADJUST_PATH), 'utf8')).not.toBe(ADJUST_CS)
+
+    await call({ mode: 'restore' })
+    expect(await readFile(path.join(project, ADJUST_PATH), 'utf8')).toBe(ADJUST_CS)
+  })
+
+  it('does nothing when every listed segment is a development build', async () => {
+    const out = await call({ mode: 'apply-runtime', segment: 'us' })
+    expect(out['enabled']).toBe('false')
+    expect(out['segments']).toBe('[]')
+    expect(await readFile(path.join(project, ADJUST_PATH), 'utf8')).toBe(ADJUST_CS)
+  })
+
+  it('does nothing without a segment file', async () => {
+    await rm(path.join(project, 'segment-ci.yml'))
+    const out = await call({ mode: 'apply-runtime' })
+    expect(out['enabled']).toBe('false')
+  })
+})
+
+describe('stamp', () => {
+  it('refuses a development-build segment', async () => {
+    await expect(call({ mode: 'stamp', segment: 'us' })).rejects.toThrow(/development build/)
+  })
+
+  it('needs a segment name', async () => {
+    const out = await call({ mode: 'stamp', segment: '' })
+    expect(out['enabled']).toBe('false')
+  })
+})

@@ -23,10 +23,14 @@
 # - a static build method (input build-method, default GameBuildCheck.CiAndroidApk) that builds an APK with the
 #   project's own settings (not a development build), signs it with the debug keystore and writes Builds/check.apk;
 #   with the extra argument -ciDevelopmentBuild it makes a development build (a segment with `debug: true`).
-# - segment-ci.yml at the repository root (optional): the segments of ci-sdk unity-force-segment. For each segment
-#   build only, the Adjust SDK is patched so every attribution callback returns that segment's campaign (and the IP
-#   country source its country); the patch is undone after the build. The segment builds run one after the other,
-#   after the normal APK. No segment (none listed, or `segments: none`) builds only the normal APK.
+# - segment-ci.yml at the repository root (optional): the segments of ci-sdk unity-force-segment, each forcing the
+#   Adjust attribution (and the IP country) to a campaign. With segments, the normal APK carries a dormant Adjust
+#   patch that reads the segment from assets/ci-segment.txt inside the APK: without that file (the normal APK) the
+#   game gets the real attribution. Each segment leg then adds its file to a copy of the normal APK and signs it again
+#   with the runner's Unity debug keystore (stamp, seconds, no Unity). A `debug: true` segment (development build),
+#   a leg that finds no base APK of this run (another runner), a failed runtime patch or a failed stamp builds the
+#   segment with Unity instead (the Adjust SDK patched for that build only). The legs run one after the other, after the normal APK. No
+#   segment (none listed, or `segments: none`) builds only the normal APK, with no patch.
 # - the Windows runner (input build-runs-on): unity-build runs in host mode and on its first job installs the project's
 #   Unity version and the Android modules with Unity Hub. Windows, not Linux/Docker: the Unity Linux editor cannot
 #   import H.264 .mp4 videos. Jobs on a self-hosted runner run with the rights of its service account: keep "Run
@@ -164,6 +168,10 @@ jobs:
       apk-outcome: ${{ steps.apkart.outcome }}
       # The APK exists: on Drive, or else as the fallback artifact.
       apk-ok: ${{ steps.drive.outcome == 'success' || steps.apkart.outcome == 'success' }}
+      # The segments a leg makes by stamping this job's APK (runtime step) instead of a Unity build, and the editor
+      # whose OpenJDK and apksigner the stamp uses.
+      stamp-segments: ${{ steps.segbase.outcome == 'success' && steps.runtime.outputs.segments || '[]' }}
+      editor-path: ${{ steps.unity.outputs.editor-path }}
     # Scripts are github-script (Node), not shell lines: the same on any runner OS.
     steps:
       # Start of the run, for the duration in the chat message.
@@ -263,12 +271,15 @@ jobs:
           mode: restore
 
       # A persistent workspace keeps the APK and log of an earlier run: without this a failed build would pass the upload.
+      # Also the segment base of an earlier run (segbase step).
       - id: cleanup
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             require('fs').rmSync('Builds/check.apk', { force: true });
             require('fs').rmSync('Builds/unity.log', { force: true });
+            require('fs').rmSync('Builds/segment-base.json', { force: true });
+            require('fs').rmSync('Builds/segment-base.apk', { force: true });
 
       # Stale IL2CPP state must never reach a build. A Unity build killed mid compile (a cancelled run, a timeout) leaves
       # objects in Library/Bee/artifacts/Android/<hash>/ that its build state never recorded: the next build trusts the
@@ -333,6 +344,18 @@ jobs:
           dotnet-version: '10.0.x'
         env:
           DOTNET_INSTALL_DIR: ${{ runner.tool_cache }}/dotnet
+
+      # Segments without `debug: true` get no Unity build of their own: this APK carries a dormant Adjust patch that
+      # reads the segment from assets/ci-segment.txt inside the APK. Without that file (this normal APK) the game gets
+      # the real attribution; each segment leg adds its file to a copy of this APK and signs it again with the debug
+      # keystore (stamp). A failed patch only costs time: every leg then builds its segment with Unity.
+      - id: runtime
+        if: steps.list.outcome == 'success' && steps.list.outputs.count != '0'
+        continue-on-error: true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-force-segment@runner
+        with:
+          mode: apply-runtime
+          segment: ${{ inputs.segments || 'all' }}
 
       # START message: the run's info and the planned builds, right before Unity. A chat problem never stops the build.
       - id: startreport
@@ -514,6 +537,29 @@ jobs:
               ? `AAB produced instead of APK (${file}): EditorUserBuildSettings.buildAppBundle was left on by a killed release build. Run with clean, or untick Build App Bundle on the runner`
               : `${file} is not an APK: no AndroidManifest.xml at its root`);
 
+      # Whatever happened: the persistent workspace must never keep the runtime patch. A failed restore does not fail
+      # the normal APK (the next checkout resets the tracked files, the next prerestore drops the generated ones), but
+      # no leg stamps then (segbase).
+      - id: runtimerestore
+        if: always() && steps.runtime.outcome != 'skipped'
+        continue-on-error: true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-force-segment@runner
+        with:
+          mode: restore
+
+      # The base of the segment legs: they run after this job on this runner and workspace (max-parallel 1), and use it
+      # only when it is this run's (run id and commit) from this runner (a re-run's apk job may run elsewhere). A leg on
+      # another runner finds none and builds its segment.
+      - id: segbase
+        if: steps.runtime.outputs.enabled == 'true' && steps.guard.outcome == 'success' && steps.runtimerestore.outcome == 'success' && hashFiles('Builds/check.apk') != ''
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            fs.copyFileSync('Builds/check.apk', 'Builds/segment-base.apk');
+            fs.writeFileSync('Builds/segment-base.json', JSON.stringify({ run: process.env.GITHUB_RUN_ID, sha: process.env.GITHUB_SHA, runner: process.env.RUNNER_NAME }));
+
       # Straight from this job: no artifact round trip. A failed upload does not stop the segment builds; the notify
       # job fails the run for it.
       - id: drive
@@ -606,10 +652,27 @@ jobs:
           persist-credentials: false
           clean: false
 
-      - id: serial
-        uses: Association-of-stupid-people/ci-sdk/.github/actions/extract-unity-serial@runner
+      # Stamp (seconds) instead of a Unity build (minutes): the normal APK of this run, built with the dormant segment
+      # patch, is in this workspace (segbase step of the apk job). Else (another runner, a `debug: true` segment, a
+      # failed runtime patch, a newer run's base), or when the stamp fails, the leg builds its segment with Unity.
+      - id: mode
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          NAME: ${{ matrix.segment }}
+          STAMPABLE: ${{ needs.apk.outputs.stamp-segments }}
         with:
-          license: ${{ secrets.UNITY_LICENSE }}
+          script: |
+            const fs = require('fs');
+            let stamp = false;
+            try {
+              const base = JSON.parse(fs.readFileSync('Builds/segment-base.json', 'utf8'));
+              stamp = JSON.parse(process.env.STAMPABLE || '[]').includes(process.env.NAME)
+                && base.run === process.env.GITHUB_RUN_ID && base.sha === process.env.GITHUB_SHA
+                && base.runner === process.env.RUNNER_NAME
+                && fs.existsSync('Builds/segment-base.apk');
+            } catch {}
+            core.setOutput('stamp', String(stamp));
+            core.info(stamp ? 'Stamp: the normal APK of this run plus the segment file' : 'Unity build of this segment');
 
       - id: prerestore
         uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-force-segment@runner
@@ -632,8 +695,36 @@ jobs:
             require('fs').rmSync('Builds/unity.log', { force: true });
             require('fs').rmSync('segment-out', { recursive: true, force: true });
 
+      # The segment APK without Unity: a copy of the normal APK with assets/ci-segment.txt, signed again with Unity's
+      # debug keystore (the one that signed it: checked). Written where the Unity build would write it. A failed stamp
+      # does not fail the leg: it builds the segment with Unity instead (the steps below run unless the stamp succeeded).
+      - id: stamp
+        if: steps.mode.outputs.stamp == 'true'
+        continue-on-error: true
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-force-segment@runner
+        with:
+          mode: stamp
+          segment: ${{ matrix.segment }}
+          apk: Builds/segment-base.apk
+          output: Builds/check.apk
+          editor-path: ${{ needs.apk.outputs.editor-path }}
+
+      # A failed stamp leaves no APK (stampApk); this makes sure the Unity build below cannot pass on one.
+      - if: steps.stamp.outcome == 'failure'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            require('fs').rmSync('Builds/check.apk', { force: true });
+
+      - id: serial
+        if: steps.stamp.outcome != 'success'
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/extract-unity-serial@runner
+        with:
+          license: ${{ secrets.UNITY_LICENSE }}
+
       # The same IL2CPP clean as the normal build: after a good previous build nothing goes, so a leg stays incremental.
       - id: il2cppclean
+        if: steps.stamp.outcome != 'success'
         continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
@@ -679,6 +770,7 @@ jobs:
 
       # Adjust SDK patched to return this segment's attribution, for this build only.
       - id: segment
+        if: steps.stamp.outcome != 'success'
         uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-force-segment@runner
         with:
           segment: ${{ matrix.segment }}
@@ -717,7 +809,7 @@ jobs:
 
       # The same APK check as the normal build (an AAB in check.apk fails the leg), and its size.
       - id: guard
-        if: steps.unity.outcome == 'success'
+        if: steps.unity.outcome == 'success' || steps.stamp.outcome == 'success'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           APK: Builds/check.apk
@@ -823,7 +915,9 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           NAME: ${{ matrix.segment }}
-          SEGMENT_JSON: ${{ steps.segment.outputs.json }}
+          SEGMENT_JSON: ${{ steps.segment.outputs.json || steps.stamp.outputs.json }}
+          STAMPED: ${{ steps.mode.outputs.stamp }}
+          STAMP_OUTCOME: ${{ steps.stamp.outcome }}
           JOB_STATUS: ${{ job.status }}
           LEG_TIMEOUT_MINUTES: 150
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
@@ -851,18 +945,22 @@ jobs:
             const env = process.env;
             let segment = {};
             try { segment = JSON.parse(env.SEGMENT_JSON || '{}'); } catch {}
-            // Cancelled: the job's own status. The first step that did not succeed is where it stopped.
+            // Cancelled: the job's own status. The first step that did not succeed is where it stopped. A stamped leg
+            // skips the Unity steps; a leg whose stamp failed (or was not tried) built with Unity, so the stamp is no
+            // failure of it.
+            const stamped = env.STAMP_OUTCOME === 'success';
             const cancelled = env.JOB_STATUS ? env.JOB_STATUS === 'cancelled'
-              : [env.CHECKOUT_OUTCOME, env.SERIAL_OUTCOME, env.UNITY_OUTCOME].includes('cancelled');
+              : [env.CHECKOUT_OUTCOME, env.SERIAL_OUTCOME, env.UNITY_OUTCOME, env.STAMP_OUTCOME].includes('cancelled');
             const failedStep = env.CHECKOUT_OUTCOME !== 'success' ? 'Checkout'
-              : env.SERIAL_OUTCOME !== 'success' ? 'Unity license (serial)'
               : env.PRERESTORE_OUTCOME !== 'success' ? 'Segment restore (before build)'
               // The build script restore (continue-on-error) is not a failure of the leg.
               : env.CLEANUP_OUTCOME !== 'success' ? 'Cleanup of the old APK'
-              : env.SEGMENT_OUTCOME !== 'success' ? 'Segment patch (segment-ci.yml)'
-              : env.UNITY_OUTCOME !== 'success' ? 'Unity build'
+              : env.STAMP_OUTCOME === 'cancelled' ? 'Segment stamp (normal APK + segment file)'
+              : !stamped && env.SERIAL_OUTCOME !== 'success' ? 'Unity license (serial)'
+              : !stamped && env.SEGMENT_OUTCOME !== 'success' ? 'Segment patch (segment-ci.yml)'
+              : !stamped && env.UNITY_OUTCOME !== 'success' ? 'Unity build'
               : env.GUARD_OUTCOME !== 'success' ? env.GUARD_REASON || 'APK check'
-              : env.RESTORE_OUTCOME !== 'success' ? 'Segment restore'
+              : !stamped && env.RESTORE_OUTCOME !== 'success' ? 'Segment restore'
               // On Drive, or else uploaded as the fallback artifact (which fails when the APK is missing).
               : env.DRIVE_OUTCOME !== 'success' && env.APK_OUTCOME !== 'success' ? 'APK missing'
               : '';
@@ -882,7 +980,8 @@ jobs:
               cancelled: stopped && !timedOut, timedOut, apkUrl: env.APK_URL, logUrl: env.LOG_URL, drive, size, driveFailed,
               logDrive: env.LOG_DRIVE_OUTCOME === 'success' ? env.LOG_DRIVE_LINK : undefined,
               logDriveFailed: env.LOG_DRIVE_OUTCOME === 'failure',
-              scriptRestoreFailed: env.SCRIPTRESTORE_OUTCOME === 'failure' };
+              scriptRestoreFailed: env.SCRIPTRESTORE_OUTCOME === 'failure', stamped,
+              stampFailed: env.STAMPED === 'true' && env.STAMP_OUTCOME === 'failure' };
             require('fs').mkdirSync('segment-out', { recursive: true });
             require('fs').writeFileSync(`segment-out/${env.NAME}.json`, JSON.stringify(result));
             // Also in the job log (base64, one line): the notify job reads it there when the artifact below is
@@ -1386,6 +1485,9 @@ jobs:
                 // may have been in that build.
                 ...(env.SCRIPTRESTORE_OUTCOME === 'failure' || segments.some(s => s.scriptRestoreFailed)
                   ? ['Build script restore failed before a debug build: Assets/CiSdkBuild may still be in the project (run with clean)'] : []),
+                // A failed stamp only costs time (the leg built with Unity), but every leg pays it until fixed.
+                ...(segments.some(s => s.stampFailed)
+                  ? [`Segment stamp failed (${segments.filter(s => s.stampFailed).map(s => s.name).join(', ')}): built with Unity instead, see the Segment stamp step of the leg`] : []),
                 ...(driveOn ? [] : ['Drive chưa cấu hình: GDRIVE_SERVICE_ACCOUNT_KEY or GDRIVE_FOLDER_ID is empty, the files are GitHub artifacts (7 days)']),
               ],
               logUrl,

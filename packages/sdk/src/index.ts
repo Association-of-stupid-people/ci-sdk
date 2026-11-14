@@ -46,7 +46,7 @@ export {
   type AnnotationLocation
 } from './log.js'
 export { runAction } from './action.js'
-export { listZip, extractZipEntry } from './zip.js'
+export { listZip, extractZipEntry, appendStoredZipEntry, storedEntryOffsets } from './zip.js'
 export {
   GitHubClient,
   GitHubApiError,
@@ -70,3 +70,4 @@ export {
   type ResolvedKeystore,
   type ResolveKeystoreOptions
 } from './android-keystore.js'
+export { findJava, unityJava, type FoundJava, type JavaLookup } from './java.js'

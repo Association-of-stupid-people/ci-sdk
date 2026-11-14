@@ -467,9 +467,12 @@ and optionally the IP-country source; `mode: restore` puts every file back. Game
 changed in the repository, so any game can test a UA segment. The patched files are for the CI
 build only and must never be committed.
 
-Inputs: `mode` (`apply` default, `restore` or `list`), `config` (segment file relative to
-`project-path`, default `segment-ci.yml`), `segment` (`apply`: a segment `name`, or `none`/empty to
-do nothing; `list`: a filter, see below), `project-path` (default `.`).
+Inputs: `mode` (`apply` default, `restore`, `list`, `apply-runtime` or `stamp`, see
+[below](#one-build-for-every-segment-apply-runtime--stamp)), `config` (segment file relative to
+`project-path`, default `segment-ci.yml`), `segment` (`apply`, `stamp`: a segment `name`, or
+`none`/empty to do nothing; `list`, `apply-runtime`: a filter, see below), `project-path` (default
+`.`); `stamp` only: `apk`, `output`, `editor-path`, `java-path`, `android-sdk`, `keystore`,
+`keystore-password`, `key-alias`, `key-password`.
 
 ```yaml
 # segment-ci.yml
@@ -547,6 +550,38 @@ written atomically; one that cannot be read, or whose project folder is gone, is
   with:
     mode: restore
 ```
+
+### One build for every segment: `apply-runtime` + `stamp`
+
+A Unity build per segment costs minutes each. With `mode: apply-runtime` the normal build carries a
+**dormant** patch instead, and `mode: stamp` makes each segment APK from that one APK in seconds:
+
+- `apply-runtime` patches the same Adjust methods as `apply` (and, when a listed segment sets
+  `country`, every `GetIpCountryCodeAsync`), but `AdjustCiForcedSegment` holds no value: at startup
+  (`RuntimeInitializeOnLoadMethod`, main thread) it reads the stored entry `assets/ci-segment.txt`
+  from the running APK (`Application.dataPath`, a small zip reader, no `System.IO.Compression`).
+  **No file: the real attribution and country** (the normal APK). A country source in another folder
+  (another assembly, where the internal class is not visible) gets its own reader class,
+  `CiSdkSegmentCountry<hash>.cs`. Same state file, `restore` and leftover cleanup as `apply`.
+  `segment` filters as for `list`; `debug: true` segments are left out (a development build needs
+  its own Unity build). Outputs `enabled` (`false` when no listed segment can be stamped: nothing is
+  patched), `segments` (JSON names a stamp can make) and `patched`.
+- `stamp` copies `apk` (default `Builds/check.apk`) to `output` (default
+  `Builds/segment-<name>.apk`) with `assets/ci-segment.txt` (a `ci-sdk-segment 1` line, then
+  `key=value` lines) added stored and 4-byte aligned, drops the old APK signing block and signs it
+  again with apksigner: `keystore` (default Unity's debug keystore, `~/.android/debug.keystore`,
+  `android`/`androiddebugkey`; `keystore-password`, `key-alias`, `key-password`). Passwords go
+  through the environment, never argv. It then checks the signer certificate equals the APK's own:
+  a different key fails (the segment APK would not install over the normal one). apksigner is the
+  newest `build-tools/*/lib/apksigner.jar` of `android-sdk`, `ANDROID_HOME`, `ANDROID_SDK_ROOT` or
+  the Android SDK of `editor-path` (unity-build output); java as in `aab-to-apk` (`java-path`,
+  `JAVA_HOME`, the editor's OpenJDK, `PATH`). A `debug: true` segment fails. Outputs the segment
+  outputs of `apply` plus `apk-path` and `size`.
+
+The game's log shows `[ci-sdk] segment APK: <name> (campaign <campaign>)` in a segment APK, and
+nothing in the normal one. `unity-android-debug.yml` uses both (runtime step of the apk job, stamp
+step of each segment leg) and falls back to `apply` + a Unity build when the base APK is missing or
+the stamp fails.
 
 ## `gdrive-upload` action
 

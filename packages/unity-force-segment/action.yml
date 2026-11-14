@@ -1,10 +1,17 @@
 name: unity-force-segment
-description: Temporarily patch the vendored Adjust Unity SDK so every attribution is replaced by a forced UA segment (segment QA builds), then restore the files
+description: >-
+  Force a UA segment in a Unity debug build (segment QA builds): patch the vendored Adjust SDK for one
+  segment, or once with a dormant patch that reads the segment from a file in the APK, so each segment
+  APK is the normal APK plus that file, signed again (stamp, no Unity build). Restores the files.
 author: _MoonLight_ <moonlight8978@gmail.com>
 
 inputs:
   mode:
-    description: '`list` prints the segment names of the config, `apply` patches the project, `restore` puts every file back (use it with `if: always()`)'
+    description: >-
+      `list` prints the segment names of the config. `apply` patches the project for one segment.
+      `apply-runtime` patches it once, dormant: the build gives the real attribution unless the APK
+      holds assets/ci-segment.txt. `stamp` writes a segment APK from such a build (no Unity).
+      `restore` puts every file back (use it with `if: always()`)
     required: false
     default: apply
   config:
@@ -12,17 +19,48 @@ inputs:
     required: false
     default: segment-ci.yml
   segment:
-    description: 'apply: name of the segment, or `none`/empty to do nothing. list: filter, `all` (also when empty), `none` or comma-separated names'
+    description: >-
+      apply, stamp: name of the segment, or `none`/empty to do nothing. list, apply-runtime: filter,
+      `all` (also when empty), `none` or comma-separated names
     required: false
     default: ''
   project-path:
     description: Unity project root
     required: false
     default: '.'
+  apk:
+    description: 'stamp: the APK built with apply-runtime (default Builds/check.apk)'
+    required: false
+  output:
+    description: 'stamp: segment APK to write (default Builds/segment-<name>.apk)'
+    required: false
+  editor-path:
+    description: 'stamp: Unity editor executable (unity-build output editor-path), for its OpenJDK and Android SDK (apksigner)'
+    required: false
+  java-path:
+    description: 'stamp: java executable (default JAVA_HOME, then the OpenJDK of editor-path, then PATH)'
+    required: false
+  android-sdk:
+    description: 'stamp: Android SDK with build-tools/<version>/lib/apksigner.jar (default ANDROID_HOME, ANDROID_SDK_ROOT, then the SDK of editor-path)'
+    required: false
+  keystore:
+    description: >-
+      stamp: keystore that signed the APK (default Unity's debug keystore, ~/.android/debug.keystore).
+      The stamp fails when it is not the APK's signer: the segment APK would not install over the normal one
+    required: false
+  keystore-password:
+    description: 'stamp: keystore password (default android)'
+    required: false
+  key-alias:
+    description: 'stamp: key alias (default androiddebugkey)'
+    required: false
+  key-password:
+    description: 'stamp: key password (default keystore-password, else android)'
+    required: false
 
 outputs:
   segments:
-    description: 'list: JSON array of segment names, in file order'
+    description: 'list: JSON array of segment names, in file order. apply-runtime: the listed ones a stamp can make (not debug)'
   details:
     description: >-
       list: JSON array of the same segments with what a build table needs:
@@ -30,7 +68,7 @@ outputs:
   count:
     description: 'list: number of segments'
   enabled:
-    description: '`true` when a segment was applied'
+    description: '`true` when a segment was applied or stamped (apply-runtime: when the patch was applied)'
   name:
     description: Name of the applied segment
   campaign:
@@ -51,6 +89,10 @@ outputs:
     description: Applied segment as compact JSON (name, campaign, network, adgroup, creative, trackerName, country, debug)
   patched:
     description: Newline-separated project-relative paths of the files changed or added
+  apk-path:
+    description: 'stamp: absolute path of the segment APK'
+  size:
+    description: 'stamp: bytes of the segment APK'
 
 runs:
   using: node24
