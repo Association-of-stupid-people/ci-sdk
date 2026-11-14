@@ -29979,6 +29979,8 @@ async function runAction(main) {
     }
 }
 
+Buffer.from('APK Sig Block 42', 'latin1');
+
 /** A GitHub REST call returned a non-2xx status. `status` is the HTTP status code. */
 class GitHubApiError extends CiError {
     status;

@@ -29773,6 +29773,8 @@ async function runAction(main) {
     }
 }
 
+Buffer.from('APK Sig Block 42', 'latin1');
+
 const START = '<DeveloperData Value="';
 const END = '"/>';
 /**

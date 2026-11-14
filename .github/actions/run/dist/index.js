@@ -30897,6 +30897,8 @@ async function runAction(main) {
     }
 }
 
+Buffer.from('APK Sig Block 42', 'latin1');
+
 const SHELLS = ['none', 'bash', 'sh', 'pwsh'];
 /** argv for one line of the `run` input. `none` = no shell (safe argv parsing). */
 function toArgv(line, shell) {

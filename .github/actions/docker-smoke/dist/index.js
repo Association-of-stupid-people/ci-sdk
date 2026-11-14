@@ -30286,6 +30286,8 @@ async function runAction(main) {
     }
 }
 
+Buffer.from('APK Sig Block 42', 'latin1');
+
 const dockerRunner = async (args, options = {}) => {
     const r = await exec('docker', args, {
         env: options.env,

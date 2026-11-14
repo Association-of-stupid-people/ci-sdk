@@ -29773,6 +29773,8 @@ async function runAction(main) {
     }
 }
 
+Buffer.from('APK Sig Block 42', 'latin1');
+
 function run() {
     const cfg = readInputs({
         // Not required: an empty value is a valid result (e.g. an optional var).

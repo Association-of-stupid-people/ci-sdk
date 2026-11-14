@@ -29848,6 +29848,8 @@ async function runAction(main) {
     }
 }
 
+Buffer.from('APK Sig Block 42', 'latin1');
+
 /**
  * Convert a branch pattern to a RegExp. `*` matches within one path segment,
  * `**` matches across `/`, `?` matches one character; everything else is literal.

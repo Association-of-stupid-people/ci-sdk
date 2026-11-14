@@ -30361,6 +30361,7 @@ async function extractZipEntry(file, name, dest) {
     }
     return size;
 }
+Buffer.from('APK Sig Block 42', 'latin1');
 
 /** A GitHub REST call returned a non-2xx status. `status` is the HTTP status code. */
 class GitHubApiError extends CiError {

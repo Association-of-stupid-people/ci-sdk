@@ -30933,6 +30933,8 @@ async function runAction(main) {
     }
 }
 
+Buffer.from('APK Sig Block 42', 'latin1');
+
 const DEFAULT_ARGS = '-batchmode -nographics -silent-crashes -quit -logFile - -executeMethod BuildScript.BuildCLI';
 /** Flags that put a secret on the Unity command line (visible in process lists). */
 const SECRET_FLAGS = new Set([

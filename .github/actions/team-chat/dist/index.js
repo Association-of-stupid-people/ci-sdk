@@ -29796,6 +29796,8 @@ async function runAction(main) {
     }
 }
 
+Buffer.from('APK Sig Block 42', 'latin1');
+
 /**
  * Limits of the team chat webhook (Slack Block Kit subset). The server keeps at most 50 blocks and
  * 16 kB of blocks after normalising them, dropping blocks from the end: the payload stays under

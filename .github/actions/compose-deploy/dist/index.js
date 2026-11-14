@@ -30412,6 +30412,8 @@ async function runAction(main) {
     }
 }
 
+Buffer.from('APK Sig Block 42', 'latin1');
+
 /** POSIX single-quote escaping: safe for any bytes, including newlines and `$`. */
 function shellQuote(value) {
     return `'${value.replaceAll("'", `'\\''`)}'`;

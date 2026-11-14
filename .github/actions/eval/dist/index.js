@@ -29852,6 +29852,8 @@ async function runAction(main) {
     }
 }
 
+Buffer.from('APK Sig Block 42', 'latin1');
+
 // `{provider:path}`; path may contain dots, brackets and colons (`{github:event.head_commit.id}`).
 const PLACEHOLDER = /\{(github|vars|secrets):([^{}]+)\}/g;
 /** Read `a.b[0].c` from an object (replacement for lodash.get). */

@@ -22,7 +22,7 @@ import require$$7 from 'node:querystring';
 import require$$8 from 'node:events';
 import require$$0$5 from 'node:diagnostics_channel';
 import require$$5 from 'node:tls';
-import require$$1$2 from 'node:zlib';
+import require$$1$2, { crc32 } from 'node:zlib';
 import require$$5$1 from 'node:perf_hooks';
 import require$$8$1 from 'node:util/types';
 import require$$1$1 from 'node:worker_threads';
@@ -33,10 +33,10 @@ import require$$1$5 from 'node:dns';
 import require$$5$3 from 'string_decoder';
 import child from 'child_process';
 import 'timers';
-import 'node:fs';
-import 'node:child_process';
-import 'node:crypto';
-import { mkdir as mkdir$1, writeFile as writeFile$1, rename as rename$1, readFile, rm as rm$1, readdir as readdir$1 } from 'node:fs/promises';
+import { existsSync, readdirSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { open as open$1, copyFile as copyFile$1, rm as rm$1, mkdir as mkdir$1, writeFile as writeFile$1, rename as rename$1, readFile, readdir as readdir$1, stat as stat$1 } from 'node:fs/promises';
 import 'node:stream/promises';
 import path$1 from 'node:path';
 import os$1 from 'node:os';
@@ -59,6 +59,37 @@ class InputError extends CiError {
         const lines = issues.map(i => `  - ${i.input}: ${i.message}`).join('\n');
         super('E_INPUT', `Invalid action inputs:\n${lines}`);
         this.issues = issues;
+    }
+}
+/** An operation exceeded its time budget. */
+class TimeoutError extends CiError {
+    timeoutMs;
+    constructor(timeoutMs, message) {
+        super('E_TIMEOUT', message ?? `Operation timed out after ${timeoutMs}ms`);
+        this.timeoutMs = timeoutMs;
+    }
+}
+/** The operation was cancelled (workflow cancelled, SIGINT/SIGTERM, or a parent AbortSignal). */
+class AbortError extends CiError {
+    constructor(message = 'Operation was cancelled', options) {
+        super('E_ABORTED', message, options);
+    }
+}
+/** A child process exited with a non-zero code or was killed by a signal. */
+class ExecError extends CiError {
+    command;
+    exitCode;
+    signal;
+    stdout;
+    stderr;
+    constructor(init) {
+        const how = init.signal ? `was killed by ${init.signal}` : `exited with code ${init.exitCode}`;
+        super('E_EXEC', `Command ${how}: ${init.command}`);
+        this.command = init.command;
+        this.exitCode = init.exitCode;
+        this.signal = init.signal;
+        this.stdout = init.stdout;
+        this.stderr = init.stderr;
     }
 }
 /** Human-readable message for any thrown value. */
@@ -110,6 +141,32 @@ function parseDuration(value) {
         total += Number(amount) * (UNIT_MS[unit ?? ''] ?? 0);
     }
     return Math.round(total);
+}
+
+/** Resolve after `ms`, or reject with AbortError as soon as `signal` aborts. */
+async function sleep(ms, signal) {
+    throwIfAborted(signal);
+    await new Promise((resolve, reject) => {
+        setTimeout(() => {
+            resolve();
+        }, ms);
+    });
+}
+/** Throw if the signal has fired (see {@link toAbortError}). */
+function throwIfAborted(signal) {
+    if (signal?.aborted)
+        throw toAbortError(signal);
+}
+/**
+ * Error to throw for an aborted signal. An SDK error used as the abort reason
+ * (e.g. TimeoutError) is returned as-is so callers can tell a timeout from a
+ * cancellation; anything else becomes an AbortError with the reason as `cause`.
+ */
+function toAbortError(signal) {
+    const reason = signal?.reason;
+    if (reason instanceof CiError)
+        return reason;
+    return new AbortError('Operation was cancelled', { cause: reason });
 }
 
 // We use any as a valid input type
@@ -264,6 +321,10 @@ function prepareKeyValueMessage(key, value) {
 }
 
 var commonjsGlobal = typeof globalThis !== 'undefined' ? globalThis : typeof window !== 'undefined' ? window : typeof global !== 'undefined' ? global : typeof self !== 'undefined' ? self : {};
+
+function getDefaultExportFromCjs (x) {
+	return x && x.__esModule && Object.prototype.hasOwnProperty.call(x, 'default') ? x['default'] : x;
+}
 
 var tunnel$1 = {};
 
@@ -29045,7 +29106,7 @@ function readInputs(specs, options = {}) {
     return values;
 }
 
-var crossSpawn = {exports: {}};
+var crossSpawn$1 = {exports: {}};
 
 var windows;
 var hasRequiredWindows;
@@ -29725,7 +29786,7 @@ function requireEnoent () {
 var hasRequiredCrossSpawn;
 
 function requireCrossSpawn () {
-	if (hasRequiredCrossSpawn) return crossSpawn.exports;
+	if (hasRequiredCrossSpawn) return crossSpawn$1.exports;
 	hasRequiredCrossSpawn = 1;
 
 	const cp = child;
@@ -29759,16 +29820,226 @@ function requireCrossSpawn () {
 	    return result;
 	}
 
-	crossSpawn.exports = spawn;
-	crossSpawn.exports.spawn = spawn;
-	crossSpawn.exports.sync = spawnSync;
+	crossSpawn$1.exports = spawn;
+	crossSpawn$1.exports.spawn = spawn;
+	crossSpawn$1.exports.sync = spawnSync;
 
-	crossSpawn.exports._parse = parse;
-	crossSpawn.exports._enoent = enoent;
-	return crossSpawn.exports;
+	crossSpawn$1.exports._parse = parse;
+	crossSpawn$1.exports._enoent = enoent;
+	return crossSpawn$1.exports;
 }
 
-requireCrossSpawn();
+var crossSpawnExports = requireCrossSpawn();
+var crossSpawn = /*@__PURE__*/getDefaultExportFromCjs(crossSpawnExports);
+
+const DEFAULT_MAX_BUFFER = 1024 * 1024;
+const DEFAULT_KILL_GRACE_MS = 5_000;
+/** How long to wait for stdout/stderr to close after the direct child exits. */
+const PIPE_DRAIN_MS = 1_000;
+/**
+ * Render a command for logs (not for passing to a shell). Arguments are quoted
+ * but never escaped, so a secret inside an argument stays byte-identical and
+ * the runner's log masker still recognises it.
+ */
+function formatCommand(command, args = []) {
+    return [command, ...args]
+        .map(a => (/^[\w./:=@%+-]+$/.test(a) ? a : a.includes("'") ? `"${a}"` : `'${a}'`))
+        .join(' ');
+}
+class TailBuffer {
+    max;
+    text = '';
+    constructor(max) {
+        this.max = max;
+    }
+    push(chunk) {
+        this.text += chunk;
+        if (this.text.length > this.max)
+            this.text = this.text.slice(this.text.length - this.max);
+    }
+    toString() {
+        return this.text;
+    }
+}
+/** Overlay `extra` on `base`; on Windows env keys are case-insensitive (`Path` vs `PATH`). */
+function mergeEnv(base, extra = {}) {
+    const env = { ...base };
+    if (process.platform === 'win32') {
+        const overridden = new Set(Object.keys(extra).map(k => k.toLowerCase()));
+        for (const key of Object.keys(env))
+            if (overridden.has(key.toLowerCase()))
+                delete env[key];
+    }
+    return { ...env, ...extra };
+}
+/**
+ * Kill the child's whole process tree.
+ * POSIX: the child leads its own process group (spawned detached), so the group
+ * is signalled even after the leader exited, reaching background grandchildren
+ * (`cmd &`, daemons) that still hold the output pipes.
+ * Windows: `taskkill /T` walks the tree from the leader; once the leader has
+ * exited its orphans cannot be found (documented limitation).
+ */
+function killTree(child, signal) {
+    const pid = child.pid;
+    if (pid === undefined)
+        return;
+    if (process.platform === 'win32') {
+        if (child.exitCode !== null || child.signalCode !== null)
+            return;
+        spawn('taskkill', ['/pid', String(pid), '/T', '/F'], {
+            stdio: 'ignore',
+            windowsHide: true
+        }).on('error', () => child.kill());
+        return;
+    }
+    try {
+        process.kill(-pid, signal);
+    }
+    catch {
+        // ESRCH: the group is already gone.
+        if (child.exitCode === null && child.signalCode === null)
+            child.kill(signal);
+    }
+}
+/** POSIX: wait until the process group is gone, SIGKILL it after `graceMs`. */
+async function reapGroup(child, graceMs) {
+    const pid = child.pid;
+    if (pid === undefined || process.platform === 'win32')
+        return;
+    const alive = () => {
+        try {
+            process.kill(-pid, 0);
+            return true;
+        }
+        catch {
+            return false;
+        }
+    };
+    const deadline = performance.now() + graceMs;
+    while (alive() && performance.now() < deadline)
+        await sleep(100);
+    if (alive())
+        killTree(child, 'SIGKILL');
+}
+/**
+ * Run a program **without a shell**: arguments are passed as-is, so values
+ * from PR titles, branch names or inputs cannot inject commands.
+ *
+ * - Output streams to the log live and is captured (tail-capped).
+ * - `timeout` and `signal` kill the whole process tree (SIGTERM, then SIGKILL).
+ * - Resolves shortly after the direct child exits, even if a background
+ *   process it started keeps the output pipes open (same as a `run:` step).
+ * - Windows `.cmd`/`.bat` shims (npm, npx, yarn) resolve via cross-spawn.
+ *
+ * @throws {ExecError} on a non-zero exit (unless `allowFailure`).
+ * @throws {TimeoutError | AbortError} when timed out or cancelled.
+ */
+async function exec(command, args = [], options = {}) {
+    throwIfAborted(options.signal);
+    const display = formatCommand(command, args);
+    const timeoutMs = parseDuration(options.timeout ?? 0);
+    const graceOption = options.killGrace;
+    let killGraceMs = typeof graceOption === 'function'
+        ? DEFAULT_KILL_GRACE_MS
+        : parseDuration(graceOption ?? DEFAULT_KILL_GRACE_MS);
+    const maxBuffer = options.maxBuffer ?? DEFAULT_MAX_BUFFER;
+    const env = mergeEnv(options.inheritEnv === false ? {} : process.env, options.env);
+    const started = performance.now();
+    const child = crossSpawn(command, [...args], {
+        cwd: options.cwd,
+        env,
+        stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
+        windowsHide: true
+    });
+    const stdout = new TailBuffer(maxBuffer);
+    const stderr = new TailBuffer(maxBuffer);
+    child.stdout?.setEncoding('utf8').on('data', (chunk) => {
+        stdout.push(chunk);
+        options.onStdout?.(chunk);
+        if (!options.silent)
+            process.stdout.write(chunk);
+    });
+    child.stderr?.setEncoding('utf8').on('data', (chunk) => {
+        stderr.push(chunk);
+        options.onStderr?.(chunk);
+        if (!options.silent)
+            process.stderr.write(chunk);
+    });
+    if (options.input !== undefined && child.stdin) {
+        child.stdin.on('error', () => undefined); // EPIPE if the child exits early
+        child.stdin.end(options.input);
+    }
+    let stopReason;
+    // Set once the direct child exited: a timeout/cancel during the pipe-drain
+    // window must not turn a finished command into a failure.
+    let childExited = false;
+    let graceTimer;
+    const stop = (reason) => {
+        if (stopReason || childExited)
+            return;
+        stopReason = reason;
+        if (typeof graceOption === 'function') {
+            let ms = DEFAULT_KILL_GRACE_MS;
+            try {
+                ms = graceOption(reason);
+            }
+            catch {
+                // A broken callback must not leave the process running: keep the default.
+            }
+            killGraceMs = Number.isFinite(ms) && ms >= 0 ? ms : DEFAULT_KILL_GRACE_MS;
+        }
+        killTree(child, 'SIGTERM');
+        graceTimer = setTimeout(() => killTree(child, 'SIGKILL'), killGraceMs);
+        graceTimer.unref();
+    };
+    const onAbort = () => stop(toAbortError(options.signal));
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    const timeoutTimer = timeoutMs > 0
+        ? setTimeout(() => stop(new TimeoutError(timeoutMs, `Command timed out after ${timeoutMs}ms: ${command}`)), timeoutMs)
+        : undefined;
+    let drainTimer;
+    try {
+        const { exitCode, signal } = await new Promise((resolve, reject) => {
+            let exited;
+            child.once('error', err => reject(new CiError('E_EXEC_SPAWN', `Failed to start ${command}: ${err.message}`, { cause: err })));
+            child.once('exit', (code, sig) => {
+                exited = { exitCode: code, signal: sig };
+                childExited = true;
+                // A background grandchild may hold the pipes open forever; stop waiting.
+                drainTimer = setTimeout(() => {
+                    child.stdout?.destroy();
+                    child.stderr?.destroy();
+                    resolve(exited ?? { exitCode: code, signal: sig });
+                }, PIPE_DRAIN_MS);
+            });
+            child.once('close', (code, sig) => resolve(exited ?? { exitCode: code, signal: sig }));
+        });
+        if (stopReason) {
+            await reapGroup(child, killGraceMs);
+            throw stopReason;
+        }
+        const result = {
+            command: display,
+            exitCode,
+            signal,
+            stdout: stdout.toString(),
+            stderr: stderr.toString(),
+            durationMs: Math.round(performance.now() - started)
+        };
+        if ((exitCode !== 0 || signal !== null) && !options.allowFailure) {
+            throw new ExecError(result);
+        }
+        return result;
+    }
+    finally {
+        clearTimeout(timeoutTimer);
+        clearTimeout(graceTimer);
+        clearTimeout(drainTimer);
+        options.signal?.removeEventListener('abort', onAbort);
+    }
+}
 
 /**
  * Entrypoint wrapper for an action's `main`: never leaves a floating promise,
@@ -29789,6 +30060,301 @@ async function runAction(main) {
             debug(err.stack);
         setFailed(errorMessage(err));
     }
+}
+
+const EOCD = 0x06054b50;
+const ZIP64_LOCATOR = 0x07064b50;
+const ZIP64_EOCD = 0x06064b50;
+const CENTRAL = 0x02014b50;
+const LOCAL = 0x04034b50;
+const MAX32 = 0xffffffff;
+const fail = (message) => {
+    throw new CiError('E_ZIP', message);
+};
+/** Central directory of a zip (zip64 included), read from the end of the file. */
+async function readEntries(file) {
+    const fh = await open$1(file, 'r');
+    try {
+        const { size: fileSize } = await fh.stat();
+        const tailSize = Math.min(fileSize, 22 + 0xffff);
+        const tail = Buffer.alloc(tailSize);
+        await fh.read(tail, 0, tailSize, fileSize - tailSize);
+        let eocd = -1;
+        for (let i = tailSize - 22; i >= 0; i--) {
+            if (tail.readUInt32LE(i) === EOCD) {
+                eocd = i;
+                break;
+            }
+        }
+        if (eocd < 0)
+            fail(`${file} is not a zip file`);
+        let count = tail.readUInt16LE(eocd + 10);
+        let cdSize = tail.readUInt32LE(eocd + 12);
+        let cdOffset = tail.readUInt32LE(eocd + 16);
+        if (count === 0xffff || cdSize === MAX32 || cdOffset === MAX32) {
+            const locator = eocd - 20;
+            if (locator < 0 || tail.readUInt32LE(locator) !== ZIP64_LOCATOR)
+                fail(`${file}: bad zip64`);
+            const z64Offset = Number(tail.readBigUInt64LE(locator + 8));
+            const z64 = Buffer.alloc(56);
+            await fh.read(z64, 0, 56, z64Offset);
+            if (z64.readUInt32LE(0) !== ZIP64_EOCD)
+                fail(`${file}: bad zip64 end record`);
+            count = Number(z64.readBigUInt64LE(32));
+            cdSize = Number(z64.readBigUInt64LE(40));
+            cdOffset = Number(z64.readBigUInt64LE(48));
+        }
+        const cd = Buffer.alloc(cdSize);
+        await fh.read(cd, 0, cdSize, cdOffset);
+        const entries = [];
+        let p = 0;
+        for (let n = 0; n < count; n++) {
+            if (cd.readUInt32LE(p) !== CENTRAL)
+                fail(`${file}: bad central directory`);
+            const nameLength = cd.readUInt16LE(p + 28);
+            const extraLength = cd.readUInt16LE(p + 30);
+            const commentLength = cd.readUInt16LE(p + 32);
+            const entry = {
+                flags: cd.readUInt16LE(p + 8),
+                method: cd.readUInt16LE(p + 10),
+                crc: cd.readUInt32LE(p + 16),
+                compressedSize: cd.readUInt32LE(p + 20),
+                size: cd.readUInt32LE(p + 24),
+                localOffset: cd.readUInt32LE(p + 42),
+                name: cd.toString('utf8', p + 46, p + 46 + nameLength)
+            };
+            // zip64 extra field: the 0xFFFFFFFF values follow in this order.
+            let e = p + 46 + nameLength;
+            const extraEnd = e + extraLength;
+            while (e + 4 <= extraEnd) {
+                const id = cd.readUInt16LE(e);
+                const len = cd.readUInt16LE(e + 2);
+                if (id === 0x0001) {
+                    let q = e + 4;
+                    const next = () => {
+                        const value = Number(cd.readBigUInt64LE(q));
+                        q += 8;
+                        return value;
+                    };
+                    if (entry.size === MAX32)
+                        entry.size = next();
+                    if (entry.compressedSize === MAX32)
+                        entry.compressedSize = next();
+                    if (entry.localOffset === MAX32)
+                        entry.localOffset = next();
+                }
+                e += 4 + len;
+            }
+            entries.push(entry);
+            p = extraEnd + commentLength;
+        }
+        return entries;
+    }
+    finally {
+        await fh.close();
+    }
+}
+const APK_SIG_BLOCK_MAGIC = Buffer.from('APK Sig Block 42', 'latin1');
+// zipalign's alignment extra field: id, then the alignment, then padding.
+const ALIGNMENT_EXTRA = 0xd935;
+/**
+ * Copy the zip (an APK) `src` to `dest` with one more entry, `name`, stored (not compressed) and
+ * its data aligned to `align` bytes, as zipalign leaves an APK. An APK signing block is dropped:
+ * the copy must be signed again (apksigner), which writes a new one. Not for zip64 files.
+ */
+async function appendStoredZipEntry(src, dest, name, data, align = 4) {
+    const nameBytes = Buffer.from(name, 'utf8');
+    const entries = await readEntries(src);
+    if (entries.some(e => e.name === name))
+        fail(`${src} already has ${name}`);
+    const fh = await open$1(src, 'r');
+    let cd;
+    let comment;
+    let entriesEnd;
+    try {
+        const { size: fileSize } = await fh.stat();
+        const tailSize = Math.min(fileSize, 22 + 0xffff);
+        const tail = Buffer.alloc(tailSize);
+        await fh.read(tail, 0, tailSize, fileSize - tailSize);
+        let eocd = -1;
+        for (let i = tailSize - 22; i >= 0; i--) {
+            if (tail.readUInt32LE(i) === EOCD) {
+                eocd = i;
+                break;
+            }
+        }
+        if (eocd < 0)
+            return fail(`${src} is not a zip file`);
+        const count = tail.readUInt16LE(eocd + 10);
+        const cdSize = tail.readUInt32LE(eocd + 12);
+        const cdOffset = tail.readUInt32LE(eocd + 16);
+        if (count === 0xffff || cdSize === MAX32 || cdOffset === MAX32)
+            fail(`${src}: zip64 is not supported`);
+        comment = Buffer.from(tail.subarray(eocd + 22, eocd + 22 + tail.readUInt16LE(eocd + 20)));
+        cd = Buffer.alloc(cdSize);
+        await fh.read(cd, 0, cdSize, cdOffset);
+        // APK signing block (v2+): [size u64][pairs][size u64]["APK Sig Block 42"], right before the
+        // central directory. The first size does not count itself.
+        entriesEnd = cdOffset;
+        if (cdOffset >= 32) {
+            const footer = Buffer.alloc(24);
+            await fh.read(footer, 0, 24, cdOffset - 24);
+            if (footer.subarray(8).equals(APK_SIG_BLOCK_MAGIC)) {
+                const blockSize = footer.readBigUInt64LE(0);
+                entriesEnd = cdOffset - Number(blockSize) - 8;
+                if (entriesEnd < 0)
+                    fail(`${src}: bad APK signing block`);
+                // Both size fields agree, and no entry starts inside the block: else it is not one.
+                const head = Buffer.alloc(8);
+                await fh.read(head, 0, 8, entriesEnd);
+                if (head.readBigUInt64LE(0) !== blockSize)
+                    fail(`${src}: bad APK signing block`);
+            }
+        }
+        if (entries.some(e => e.localOffset >= entriesEnd)) {
+            fail(`${src}: an entry starts after the end of the entries`);
+        }
+    }
+    finally {
+        await fh.close();
+    }
+    const crc = crc32(data) >>> 0;
+    // Data offset = entriesEnd + 30 + name + extra: the extra field pads it to `align`.
+    const minExtra = 6;
+    const pad = (align - ((entriesEnd + 30 + nameBytes.length + minExtra) % align)) % align;
+    const extra = Buffer.alloc(minExtra + pad);
+    extra.writeUInt16LE(ALIGNMENT_EXTRA, 0);
+    extra.writeUInt16LE(2 + pad, 2);
+    extra.writeUInt16LE(align, 4);
+    // DOS date 1981-01-01 00:00, as aapt2 and zipalign write it: the same bytes on every run.
+    const dosTime = 0;
+    const dosDate = (1 << 9) | (1 << 5) | 1;
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(LOCAL, 0);
+    local.writeUInt16LE(10, 4); // version needed
+    local.writeUInt16LE(0, 6); // flags
+    local.writeUInt16LE(0, 8); // stored
+    local.writeUInt16LE(dosTime, 10);
+    local.writeUInt16LE(dosDate, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(nameBytes.length, 26);
+    local.writeUInt16LE(extra.length, 28);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(CENTRAL, 0);
+    central.writeUInt16LE(10, 4); // version made by
+    central.writeUInt16LE(10, 6); // version needed
+    central.writeUInt16LE(0, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(dosTime, 12);
+    central.writeUInt16LE(dosDate, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(nameBytes.length, 28);
+    central.writeUInt16LE(0, 30); // no extra in the central directory
+    central.writeUInt16LE(0, 32); // no comment
+    central.writeUInt16LE(0, 34); // disk
+    central.writeUInt16LE(0, 36); // internal attributes
+    central.writeUInt32LE(0, 38); // external attributes
+    central.writeUInt32LE(entriesEnd, 42);
+    const newCdOffset = entriesEnd + local.length + nameBytes.length + extra.length + data.length;
+    const newCdSize = cd.length + central.length + nameBytes.length;
+    if (newCdOffset + newCdSize > MAX32 || entries.length + 1 >= 0xffff) {
+        fail(`${src}: too large without zip64`);
+    }
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(EOCD, 0);
+    eocd.writeUInt16LE(0, 4);
+    eocd.writeUInt16LE(0, 6);
+    eocd.writeUInt16LE(entries.length + 1, 8);
+    eocd.writeUInt16LE(entries.length + 1, 10);
+    eocd.writeUInt32LE(newCdSize, 12);
+    eocd.writeUInt32LE(newCdOffset, 16);
+    eocd.writeUInt16LE(comment.length, 20);
+    await copyFile$1(src, dest);
+    try {
+        const out = await open$1(dest, 'r+');
+        try {
+            await out.truncate(entriesEnd);
+            const tailBytes = Buffer.concat([
+                local,
+                nameBytes,
+                extra,
+                data,
+                cd,
+                central,
+                nameBytes,
+                eocd,
+                comment
+            ]);
+            await out.write(tailBytes, 0, tailBytes.length, entriesEnd);
+        }
+        finally {
+            await out.close();
+        }
+    }
+    catch (err) {
+        await rm$1(dest, { force: true });
+        throw err;
+    }
+}
+/** Data offset of every stored (uncompressed) entry, from its local header: name -> offset. */
+async function storedEntryOffsets(file) {
+    const entries = (await readEntries(file)).filter(e => e.method === 0);
+    const offsets = new Map();
+    const fh = await open$1(file, 'r');
+    try {
+        const local = Buffer.alloc(30);
+        for (const e of entries) {
+            await fh.read(local, 0, 30, e.localOffset);
+            if (local.readUInt32LE(0) !== LOCAL)
+                fail(`${file}: bad local header for ${e.name}`);
+            offsets.set(e.name, e.localOffset + 30 + local.readUInt16LE(26) + local.readUInt16LE(28));
+        }
+    }
+    finally {
+        await fh.close();
+    }
+    return offsets;
+}
+
+/**
+ * The OpenJDK Unity ships with its Android module, from the editor executable:
+ * - Windows/Linux: `<Editor>/Unity(.exe)` -> `<Editor>/Data/PlaybackEngines/AndroidPlayer/OpenJDK`
+ * - macOS: `Unity.app/Contents/MacOS/Unity` -> `Unity.app/Contents/PlaybackEngines/AndroidPlayer/OpenJDK`
+ */
+function unityJava(editorPath, platform) {
+    const p = platform === 'win32' ? path$1.win32 : path$1.posix;
+    const exe = platform === 'win32' ? 'java.exe' : 'java';
+    const dir = p.dirname(editorPath);
+    const engines = platform === 'darwin'
+        ? p.join(p.dirname(dir), 'PlaybackEngines')
+        : p.join(dir, 'Data', 'PlaybackEngines');
+    return p.join(engines, 'AndroidPlayer', 'OpenJDK', 'bin', exe);
+}
+/** java from `java-path`, else JAVA_HOME, else the Unity editor's OpenJDK, else `java` on PATH. */
+function findJava(lookup) {
+    const p = lookup.platform === 'win32' ? path$1.win32 : path$1.posix;
+    const exe = lookup.platform === 'win32' ? 'java.exe' : 'java';
+    if (lookup.javaPath) {
+        if (!lookup.exists(lookup.javaPath)) {
+            throw new CiError('E_JAVA', `java-path does not exist: ${lookup.javaPath}`);
+        }
+        return { path: lookup.javaPath, source: 'java-path' };
+    }
+    if (lookup.javaHome) {
+        const candidate = p.join(lookup.javaHome, 'bin', exe);
+        if (lookup.exists(candidate))
+            return { path: candidate, source: 'JAVA_HOME' };
+    }
+    if (lookup.editorPath) {
+        const candidate = unityJava(lookup.editorPath, lookup.platform);
+        if (lookup.exists(candidate))
+            return { path: candidate, source: 'unity-editor' };
+    }
+    return { path: 'java', source: 'PATH' };
 }
 
 var dist = {};
@@ -38696,6 +39262,8 @@ function listSegments(file, filter) {
 const MARKER = '// ci-sdk unity-force-segment';
 const FORCED_CLASS_FILE = 'AdjustCiForcedSegment.cs';
 const GENERATED_HEADER = 'Generated by ci-sdk unity-force-segment';
+/** Runtime mode: the class name prefix of a country reader outside the Adjust folder. */
+const COUNTRY_CLASS_PREFIX = 'CiSdkSegmentCountry';
 const SKIPPED_DIRS = new Set(['Library', 'Temp', 'obj']);
 // Whitespace is matched loosely: the vendored sources are formatted by hand.
 const FACADE = /public\s+static\s+void\s+InitSdk\s*\(\s*AdjustConfig\s/;
@@ -39040,7 +39608,9 @@ async function removeStaleGenerated(projectRoot) {
         return [];
     const removed = [];
     for (const file of await listCsFiles(assets)) {
-        if (path$1.basename(file) !== FORCED_CLASS_FILE)
+        const base = path$1.basename(file);
+        // The facade class, or a country reader of the runtime mode (runtime.ts).
+        if (base !== FORCED_CLASS_FILE && !base.startsWith(COUNTRY_CLASS_PREFIX))
             continue;
         // Only our own output: a user file that happens to share the name stays.
         if (!(await readFile(file, 'utf8')).includes(GENERATED_HEADER))
@@ -39050,6 +39620,546 @@ async function removeStaleGenerated(projectRoot) {
         removed.push(rel(root, file));
     }
     return removed;
+}
+
+// Runtime mode: the normal debug build carries a dormant patch that reads the segment from a file
+// inside the APK (SEGMENT_ENTRY). Without that file the game gets the real attribution; `stamp`
+// adds the file to a copy of the APK and signs it again, so a segment APK needs no Unity build.
+/** APK entry holding the forced segment (stored, never compressed: the reader does not inflate). */
+const SEGMENT_ENTRY = 'assets/ci-segment.txt';
+const SEGMENT_FILE_HEADER = 'ci-sdk-segment 1';
+/** Process environment variable through which the facade class hands the country to other assemblies. */
+const COUNTRY_VARIABLE = 'CI_SDK_SEGMENT_COUNTRY';
+/** The segment file of `stamp`: a header line, then `key=value` lines (values have no newline). */
+function segmentFileText(segment) {
+    const lines = [
+        SEGMENT_FILE_HEADER,
+        `name=${segment.name}`,
+        `trackerName=${segment.trackerName}`,
+        `network=${segment.network}`,
+        `campaign=${segment.campaign}`,
+        `adgroup=${segment.adgroup}`,
+        `creative=${segment.creative}`
+    ];
+    if (segment.country !== undefined)
+        lines.push(`country=${segment.country}`);
+    return `${lines.join('\n')}\n`;
+}
+/**
+ * C# members of the facade class that read the segment file from the running APK (Application.dataPath is the APK on
+ * Android). A small reader for one stored zip entry: no System.IO.Compression reference, which a
+ * .NET Framework API level does not give by default.
+ */
+function segmentReaderMembers() {
+    return `        private const string CiSdkEntry = "${SEGMENT_ENTRY}";
+        private const string CiSdkHeader = "${SEGMENT_FILE_HEADER}";
+        private const string CiSdkCountryVariable = "${COUNTRY_VARIABLE}";
+        private static readonly object CiSdkGate = new object();
+        private static bool ciSdkLoaded;
+        private static System.Collections.Generic.Dictionary<string, string> ciSdkValues;
+
+        // On the main thread before the first scene: Application.dataPath is main-thread only.
+        [UnityEngine.RuntimeInitializeOnLoadMethod(UnityEngine.RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void CiSdkPreload()
+        {
+            CiSdkLoad();
+        }
+
+        // The segment, or null (no segment file: the normal APK).
+        private static System.Collections.Generic.Dictionary<string, string> CiSdkLoad()
+        {
+            lock (CiSdkGate)
+            {
+                if (ciSdkLoaded)
+                {
+                    return ciSdkValues;
+                }
+                ciSdkLoaded = true;
+#if UNITY_ANDROID && !UNITY_EDITOR
+                try
+                {
+                    var apk = UnityEngine.Application.dataPath;
+                    if (!apk.EndsWith(".apk", System.StringComparison.OrdinalIgnoreCase))
+                    {
+                        UnityEngine.Debug.LogWarning("[ci-sdk] not running from an APK (" + apk + "): no segment");
+                    }
+                    var bytes = CiSdkReadStoredEntry(apk, CiSdkEntry);
+                    if (bytes != null)
+                    {
+                        var lines = System.Text.Encoding.UTF8.GetString(bytes).Split('\\n');
+                        if (lines.Length > 0 && lines[0].Trim() == CiSdkHeader)
+                        {
+                            var values = new System.Collections.Generic.Dictionary<string, string>();
+                            for (var i = 1; i < lines.Length; i++)
+                            {
+                                var line = lines[i].TrimEnd('\\r');
+                                var eq = line.IndexOf('=');
+                                if (eq > 0)
+                                {
+                                    values[line.Substring(0, eq)] = line.Substring(eq + 1);
+                                }
+                            }
+                            ciSdkValues = values;
+                            // For the country readers of other assemblies (no UnityEngine needed there).
+                            string country;
+                            if (values.TryGetValue("country", out country) && country.Length > 0)
+                            {
+                                System.Environment.SetEnvironmentVariable(CiSdkCountryVariable, country);
+                            }
+                            UnityEngine.Debug.Log("[ci-sdk] segment APK: " + CiSdkGet("name") + " (campaign " + CiSdkGet("campaign") + ")");
+                        }
+                    }
+                }
+                catch (System.Exception e)
+                {
+                    // Off the main thread dataPath throws: the next call (the main-thread preload) tries again.
+                    ciSdkLoaded = false;
+                    UnityEngine.Debug.LogWarning("[ci-sdk] segment file not read: " + e.Message);
+                }
+#endif
+                return ciSdkValues;
+            }
+        }
+
+        private static string CiSdkGet(string key)
+        {
+            var values = CiSdkLoad();
+            string value;
+            return values != null && values.TryGetValue(key, out value) ? value : "";
+        }
+
+        // The forced IP country, or null (no segment file, or a segment without country).
+        public static string Country()
+        {
+            var country = CiSdkGet("country");
+            return country.Length > 0 ? country : null;
+        }
+
+        private static long CiSdkU16(byte[] b, int i)
+        {
+            return b[i] | (b[i + 1] << 8);
+        }
+
+        private static long CiSdkU32(byte[] b, int i)
+        {
+            return (uint)(b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24));
+        }
+
+        private static void CiSdkRead(System.IO.Stream s, long offset, byte[] buffer)
+        {
+            s.Seek(offset, System.IO.SeekOrigin.Begin);
+            var done = 0;
+            while (done < buffer.Length)
+            {
+                var n = s.Read(buffer, done, buffer.Length - done);
+                if (n <= 0)
+                {
+                    throw new System.IO.EndOfStreamException();
+                }
+                done += n;
+            }
+        }
+
+        // The bytes of a stored entry of the zip, or null when it has none.
+        private static byte[] CiSdkReadStoredEntry(string zip, string name)
+        {
+            using (var s = new System.IO.FileStream(zip, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read))
+            {
+                var length = s.Length;
+                var tail = new byte[(int)System.Math.Min(length, 22 + 65535)];
+                CiSdkRead(s, length - tail.Length, tail);
+                var eocd = -1;
+                for (var i = tail.Length - 22; i >= 0; i--)
+                {
+                    if (CiSdkU32(tail, i) == 0x06054b50)
+                    {
+                        eocd = i;
+                        break;
+                    }
+                }
+                if (eocd < 0)
+                {
+                    return null;
+                }
+                var count = CiSdkU16(tail, eocd + 10);
+                var cd = new byte[CiSdkU32(tail, eocd + 12)];
+                CiSdkRead(s, CiSdkU32(tail, eocd + 16), cd);
+                var wanted = System.Text.Encoding.UTF8.GetBytes(name);
+                var p = 0;
+                for (var n = 0; n < count && p + 46 <= cd.Length; n++)
+                {
+                    if (CiSdkU32(cd, p) != 0x02014b50)
+                    {
+                        return null;
+                    }
+                    var nameLength = (int)CiSdkU16(cd, p + 28);
+                    var match = nameLength == wanted.Length && p + 46 + nameLength <= cd.Length;
+                    for (var k = 0; match && k < nameLength; k++)
+                    {
+                        match = cd[p + 46 + k] == wanted[k];
+                    }
+                    if (match)
+                    {
+                        if (CiSdkU16(cd, p + 10) != 0)
+                        {
+                            return null;
+                        }
+                        var local = CiSdkU32(cd, p + 42);
+                        var header = new byte[30];
+                        CiSdkRead(s, local, header);
+                        if (CiSdkU32(header, 0) != 0x04034b50)
+                        {
+                            return null;
+                        }
+                        var data = new byte[CiSdkU32(cd, p + 20)];
+                        CiSdkRead(s, local + 30 + CiSdkU16(header, 26) + CiSdkU16(header, 28), data);
+                        return data;
+                    }
+                    p += 46 + nameLength + (int)CiSdkU16(cd, p + 30) + (int)CiSdkU16(cd, p + 32);
+                }
+                return null;
+            }
+        }
+`;
+}
+/** Source of the dormant facade class: the real attribution unless the APK has a segment file. */
+function runtimeSegmentSource() {
+    return `// ${GENERATED_HEADER}. CI build only, never commit.
+using System;
+using UnityEngine;
+
+namespace AdjustSdk
+{
+    internal static class AdjustCiForcedSegment
+    {
+        public static Action<AdjustAttribution> Wrap(Action<AdjustAttribution> callback)
+        {
+            if (callback == null || CiSdkLoad() == null)
+            {
+                return callback;
+            }
+            return real => callback(Force(real));
+        }
+
+        // Also forces when Adjust answered nothing, so the segment does not depend on the network.
+        public static AdjustAttribution Force(AdjustAttribution real)
+        {
+            Debug.Log("[ci-sdk] forced Adjust attribution: network=" + CiSdkGet("network") + " campaign=" + CiSdkGet("campaign"));
+            return new AdjustAttribution
+            {
+                TrackerToken = real?.TrackerToken ?? "",
+                TrackerName = CiSdkGet("trackerName"),
+                Network = CiSdkGet("network"),
+                Campaign = CiSdkGet("campaign"),
+                Adgroup = CiSdkGet("adgroup"),
+                Creative = CiSdkGet("creative"),
+                ClickLabel = ""
+            };
+        }
+
+${segmentReaderMembers()}    }
+}
+`;
+}
+/**
+ * Source of a country reader for an IP country source outside the Adjust folder (maybe another
+ * assembly, where the internal facade class is not visible). It only reads the variable the facade
+ * class sets at startup: no UnityEngine reference, so an assembly without engine references builds.
+ */
+function runtimeCountrySource(className) {
+    return `// ${GENERATED_HEADER}. CI build only, never commit.
+internal static class ${className}
+{
+    // The forced IP country, or null (no segment file, or a segment without country).
+    public static string Country()
+    {
+        var country = System.Environment.GetEnvironmentVariable("${COUNTRY_VARIABLE}");
+        return string.IsNullOrEmpty(country) ? null : country;
+    }
+}
+`;
+}
+/** Make `GetIpCountryCodeAsync` answer the segment file's country when there is one. */
+function patchCountrySourceRuntime(text, file, reader, 
+/** The text already carries this run's facade patch (same file). */
+facadePatched = false) {
+    if (!facadePatched && text.includes(MARKER)) {
+        throw new CiError('E_PATCH', `${file} is already patched; run mode: restore first`);
+    }
+    const match = COUNTRY_SOURCE.exec(maskComments(text));
+    if (!match)
+        throw new CiError('E_PATCH', `${file}: GetIpCountryCodeAsync not found`);
+    const value = match[1] ? 'ciSdkCountry' : 'System.Threading.Tasks.Task.FromResult(ciSdkCountry)';
+    return insertFirstStatement(text, match, `{ var ciSdkCountry = ${reader}.Country(); if (ciSdkCountry != null) { return ${value}; } }`);
+}
+/**
+ * The dormant patch of the normal debug build (see SEGMENT_ENTRY). Same state file and restore as
+ * `applyPatch`; every new content is computed before anything is written.
+ * @returns project-relative paths of the files changed or added.
+ */
+async function applyRuntimePatch(options) {
+    const { stateFile } = options;
+    const root = path$1.resolve(options.projectRoot);
+    const assets = path$1.join(root, 'Assets');
+    if (!(await isDir(assets)))
+        throw new CiError('E_PATCH', `No Assets folder in ${root}`);
+    // A state left by a job that never restored must not become the "original" of this run.
+    if (await exists(stateFile))
+        await restorePatch(stateFile);
+    const sources = await readSources(assets);
+    const masked = new Map(sources.map(s => [s.file, maskComments(s.text)]));
+    const code = (s) => masked.get(s.file) ?? '';
+    const facades = sources.filter(s => FACADE.test(code(s)) && FACADE_CLASS.test(code(s)));
+    if (facades.length === 0) {
+        throw new CiError('E_PATCH', 'Adjust SDK not found: no .cs file under Assets declares InitSdk(AdjustConfig)');
+    }
+    if (facades.length > 1) {
+        const list = facades.map(s => rel(root, s.file)).join(', ');
+        throw new CiError('E_PATCH', `Several Adjust facades found (${list}); cannot choose one`);
+    }
+    const facade = facades[0];
+    const facadeDir = path$1.dirname(facade.file);
+    const changes = new Map();
+    changes.set(facade.file, {
+        source: facade,
+        text: patchFacade(facade.text, rel(root, facade.file))
+    });
+    // Generated files: absolute path -> content.
+    const generated = new Map([
+        [path$1.join(facadeDir, FORCED_CLASS_FILE), runtimeSegmentSource()]
+    ]);
+    if (options.country) {
+        const owners = sources.filter(s => COUNTRY_SOURCE.test(code(s)));
+        if (owners.length === 0) {
+            throw new CiError('E_PATCH', 'a segment sets country but no known IP country source (GetIpCountryCodeAsync) was found');
+        }
+        for (const owner of owners) {
+            const dir = path$1.dirname(owner.file);
+            let reader = 'global::AdjustSdk.AdjustCiForcedSegment';
+            // Another folder may be another assembly, where the internal facade class is not visible:
+            // its own reader, named after the folder so two readers never clash in one assembly.
+            if (dir !== facadeDir) {
+                const hash = createHash('sha256').update(rel(root, dir)).digest('hex').slice(0, 8);
+                const className = `${COUNTRY_CLASS_PREFIX}${hash}`;
+                generated.set(path$1.join(dir, `${className}.cs`), runtimeCountrySource(className));
+                reader = `global::${className}`;
+            }
+            const earlier = changes.get(owner.file);
+            changes.set(owner.file, {
+                source: owner,
+                text: patchCountrySourceRuntime(earlier?.text ?? owner.text, rel(root, owner.file), reader, !!earlier)
+            });
+        }
+    }
+    const files = [...changes.values()].map(({ source }) => ({
+        path: rel(root, source.file),
+        original: source.buffer.toString('base64')
+    }));
+    const added = [];
+    for (const file of generated.keys()) {
+        const stale = sources.find(s => s.file === file);
+        // A leftover of ours is just deleted on restore; anything else is restored byte-exact.
+        if (!stale || stale.text.includes(GENERATED_HEADER))
+            added.push(rel(root, file));
+        else
+            files.push({ path: rel(root, file), original: stale.buffer.toString('base64') });
+    }
+    const state = { version: 1, root, files, added };
+    await mkdir$1(path$1.dirname(stateFile), { recursive: true });
+    // Write then rename: a job killed mid-write never leaves a truncated state behind.
+    await writeFile$1(`${stateFile}.tmp`, JSON.stringify(state, null, 2));
+    await rename$1(`${stateFile}.tmp`, stateFile);
+    for (const { source, text } of changes.values())
+        await writeFile$1(source.file, text, 'utf8');
+    for (const [file, text] of generated)
+        await writeFile$1(file, text, 'utf8');
+    return [...changes.values()]
+        .map(c => rel(root, c.source.file))
+        .concat([...generated.keys()].map(f => rel(root, f)));
+}
+
+/**
+ * The debug keystore where the Android tools keep it: ANDROID_USER_HOME, else
+ * ANDROID_SDK_HOME/.android, else ~/.android (the first that has one; else the last).
+ */
+function defaultDebugKeystore(env = process.env, home = os$1.homedir(), exists = existsSync) {
+    const candidates = [
+        env['ANDROID_USER_HOME'] ? path$1.join(env['ANDROID_USER_HOME'], 'debug.keystore') : undefined,
+        env['ANDROID_PREFS_ROOT']
+            ? path$1.join(env['ANDROID_PREFS_ROOT'], '.android', 'debug.keystore')
+            : undefined,
+        env['ANDROID_SDK_HOME']
+            ? path$1.join(env['ANDROID_SDK_HOME'], '.android', 'debug.keystore')
+            : undefined,
+        path$1.join(home, '.android', 'debug.keystore')
+    ].filter((f) => !!f);
+    return {
+        file: candidates.find(f => exists(f)) ?? candidates[candidates.length - 1],
+        password: 'android',
+        alias: 'androiddebugkey',
+        keyPassword: 'android'
+    };
+}
+/** The Android SDK of the Unity editor's Android module (same layout as its OpenJDK). */
+function unitySdk(editorPath, platform) {
+    const p = platform === 'win32' ? path$1.win32 : path$1.posix;
+    const dir = p.dirname(editorPath);
+    const engines = platform === 'darwin'
+        ? p.join(p.dirname(dir), 'PlaybackEngines')
+        : p.join(dir, 'Data', 'PlaybackEngines');
+    return p.join(engines, 'AndroidPlayer', 'SDK');
+}
+const MIN_BUILD_TOOLS = 30;
+const versionKey = (name) => name.split(/[.-]/).map(n => Number(n) || 0);
+const newerFirst = (a, b) => {
+    const x = versionKey(a);
+    const y = versionKey(b);
+    for (let i = 0; i < Math.max(x.length, y.length); i++) {
+        const d = (y[i] ?? 0) - (x[i] ?? 0);
+        if (d !== 0)
+            return d;
+    }
+    return 0;
+};
+/**
+ * apksigner.jar of the newest build-tools found under the `android-sdk` input, ANDROID_HOME,
+ * ANDROID_SDK_ROOT and the Unity editor's Android SDK (the earlier root wins a tie). Build-tools
+ * older than 30 are skipped: their apksigner lacks options the stamp passes.
+ */
+function findApksigner(lookup) {
+    const p = lookup.platform === 'win32' ? path$1.win32 : path$1.posix;
+    const roots = [
+        lookup.androidSdk,
+        lookup.env['ANDROID_HOME'],
+        lookup.env['ANDROID_SDK_ROOT'],
+        lookup.editorPath ? unitySdk(lookup.editorPath, lookup.platform) : undefined
+    ].filter((r) => !!r);
+    const found = [];
+    for (const root of roots) {
+        const tools = p.join(root, 'build-tools');
+        let versions;
+        try {
+            versions = lookup.list(tools);
+        }
+        catch {
+            continue;
+        }
+        for (const version of versions) {
+            if ((versionKey(version)[0] ?? 0) < MIN_BUILD_TOOLS)
+                continue;
+            const jar = p.join(tools, version, 'lib', 'apksigner.jar');
+            if (lookup.exists(jar))
+                found.push({ version, jar });
+        }
+    }
+    // Stable sort: equal versions keep the root order.
+    const best = found.sort((a, b) => newerFirst(a.version, b.version))[0];
+    if (best)
+        return best.jar;
+    throw new CiError('E_APKSIGNER', `apksigner.jar (build-tools ${MIN_BUILD_TOOLS}+) not found under build-tools of ${roots.join(', ') || '(no Android SDK: set android-sdk or editor-path)'}`);
+}
+function defaultSdkLookup(androidSdk, editorPath) {
+    return {
+        androidSdk,
+        env: process.env,
+        editorPath,
+        platform: process.platform,
+        exists: existsSync,
+        list: dir => readdirSync(dir)
+    };
+}
+/** SHA-256 digests of the signer certificates (`apksigner verify --print-certs`). */
+function signerDigests(output) {
+    return [...output.matchAll(/Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]+)/g)].map(m => m[1].toLowerCase());
+}
+async function verifyCerts(java, apksigner, apk) {
+    const result = await exec(java, ['-jar', apksigner, 'verify', '--print-certs', apk], {
+        silent: true,
+        allowFailure: true
+    });
+    if (result.exitCode !== 0) {
+        throw new CiError('E_APKSIGNER', `apksigner verify failed for ${apk}: ${(result.stderr || result.stdout).trim().slice(0, 500)}`);
+    }
+    return signerDigests(result.stdout);
+}
+/**
+ * The segment APK: a copy of the base APK with the segment file (SEGMENT_ENTRY), signed again with
+ * the keystore. Fails when the keystore is not the one that signed the base APK: the segment APK
+ * would then not install over the normal one.
+ */
+async function stampApk(options) {
+    const { base, output, java, apksigner, keystore } = options;
+    if (!existsSync(base))
+        throw new CiError('E_STAMP', `Base APK not found: ${base}`);
+    if (!existsSync(keystore.file)) {
+        throw new CiError('E_STAMP', `Keystore not found: ${keystore.file}`);
+    }
+    await mkdir$1(path$1.dirname(path$1.resolve(output)), { recursive: true });
+    const unsigned = `${output}.unsigned`;
+    // Signed here, renamed to output only once every check passed: a failed stamp leaves no APK behind.
+    const signedApk = `${output}.signed`;
+    await rm$1(output, { force: true });
+    try {
+        await appendStoredZipEntry(base, unsigned, SEGMENT_ENTRY, Buffer.from(segmentFileText(options.segment), 'utf8'));
+        // Passwords through the environment, never on the command line.
+        const signed = await exec(java, [
+            '-jar',
+            apksigner,
+            'sign',
+            '--ks',
+            keystore.file,
+            '--ks-pass',
+            'env:CI_SDK_KS_PASS',
+            '--ks-key-alias',
+            keystore.alias,
+            '--key-pass',
+            'env:CI_SDK_KEY_PASS',
+            // No <apk>.idsig next to the APK (v4, for incremental adb installs only).
+            '--v4-signing-enabled',
+            'false',
+            '--out',
+            signedApk,
+            unsigned
+        ], {
+            silent: true,
+            allowFailure: true,
+            env: { CI_SDK_KS_PASS: keystore.password, CI_SDK_KEY_PASS: keystore.keyPassword }
+        });
+        if (signed.exitCode !== 0) {
+            throw new CiError('E_APKSIGNER', `apksigner sign failed: ${(signed.stderr || signed.stdout).trim().slice(0, 500)}`);
+        }
+        await rm$1(unsigned, { force: true });
+        // Native libraries are stored page aligned (16 KB since Android 15): the new signature must not
+        // move them off it, or 16 KB-page devices refuse the APK.
+        const before = await storedEntryOffsets(base);
+        const after = await storedEntryOffsets(signedApk);
+        for (const [name, offset] of before) {
+            if (!name.endsWith('.so'))
+                continue;
+            for (const page of [16384, 4096]) {
+                if (offset % page === 0 && (after.get(name) ?? 1) % page !== 0) {
+                    throw new CiError('E_STAMP', `${name} lost its ${page / 1024} KB alignment in the signed segment APK (apksigner ${apksigner})`);
+                }
+            }
+        }
+        const [baseSigners, signers] = [
+            await verifyCerts(java, apksigner, base),
+            await verifyCerts(java, apksigner, signedApk)
+        ];
+        if (signers.length === 0 || signers.join() !== baseSigners.join()) {
+            throw new CiError('E_STAMP', `${keystore.file} did not sign ${base} (base ${baseSigners.join(', ') || 'unsigned'}, keystore ${signers.join(', ') || 'none'}): the segment APK would not install over the normal one`);
+        }
+        await rename$1(signedApk, output);
+        return { size: (await stat$1(output)).size, signers };
+    }
+    catch (err) {
+        await rm$1(output, { force: true });
+        throw err;
+    }
+    finally {
+        await rm$1(unsigned, { force: true });
+        await rm$1(signedApk, { force: true });
+    }
 }
 
 /** The config file, or undefined when it does not exist (every other error is thrown). */
@@ -39084,10 +40194,19 @@ function setNoSegments() {
 }
 async function run() {
     const cfg = readInputs({
-        mode: input.oneOf(['apply', 'restore', 'list'], { default: 'apply' }),
+        mode: input.oneOf(['apply', 'restore', 'list', 'apply-runtime', 'stamp'], { default: 'apply' }),
         config: input.string({ default: 'segment-ci.yml' }),
         segment: input.string({ default: '' }),
-        projectPath: input.string({ name: 'project-path', default: '.' })
+        projectPath: input.string({ name: 'project-path', default: '.' }),
+        apk: input.string({ default: '' }),
+        output: input.string({ default: '' }),
+        editorPath: input.string({ name: 'editor-path', default: '' }),
+        javaPath: input.string({ name: 'java-path', default: '' }),
+        androidSdk: input.string({ name: 'android-sdk', default: '' }),
+        keystore: input.string({ default: '' }),
+        keystorePassword: input.string({ name: 'keystore-password', default: '' }),
+        keyAlias: input.string({ name: 'key-alias', default: '' }),
+        keyPassword: input.string({ name: 'key-password', default: '' })
     });
     if (cfg.mode === 'restore') {
         await restore(cfg.projectPath, defaultStateFile());
@@ -39120,6 +40239,28 @@ async function run() {
         setOutput('count', String(names.length));
         return;
     }
+    if (cfg.mode === 'apply-runtime') {
+        // The segments a stamp can make: the listed ones without debug (a development build needs its
+        // own Unity build).
+        const names = file ? listSegments(file, cfg.segment || 'all') : [];
+        const stampable = names
+            .map(name => file.segments.find(x => x.name === name))
+            .filter(s => !s.debug);
+        setOutput('segments', JSON.stringify(stampable.map(s => s.name)));
+        if (stampable.length === 0) {
+            notice('unity-force-segment: no segment to stamp, the runtime patch is not applied');
+            setOutput('enabled', 'false');
+            return;
+        }
+        const country = stampable.some(s => s.country !== undefined);
+        const patched = await applyRuntimePatch({ projectRoot, country, stateFile: defaultStateFile() });
+        info(`Runtime segment patch for ${stampable.map(s => s.name).join(', ')}`);
+        for (const changed of patched)
+            info(`  patched ${changed}`);
+        setOutput('enabled', 'true');
+        setOutput('patched', patched.join('\n'));
+        return;
+    }
     const selector = cfg.segment.trim();
     if (selector === '' || selector.toLowerCase() === 'none') {
         notice('unity-force-segment: no segment requested, nothing applied');
@@ -39131,11 +40272,56 @@ async function run() {
     const segment = resolveSegment(file, selector);
     if (!segment)
         throw new Error('unreachable: a named segment always resolves');
+    if (cfg.mode === 'stamp') {
+        if (segment.debug) {
+            throw new InputError([
+                {
+                    input: 'segment',
+                    message: `${segment.name} is a development build (debug: true): build it, a stamp cannot make it`
+                }
+            ]);
+        }
+        const base = path$1.resolve(cfg.apk || 'Builds/check.apk');
+        const output = path$1.resolve(cfg.output || `Builds/segment-${segment.name}.apk`);
+        const editorPath = cfg.editorPath || undefined;
+        // The editor's OpenJDK before JAVA_HOME: a runner's JAVA_HOME may be a JDK too old for apksigner.
+        const editorJava = editorPath ? unityJava(editorPath, process.platform) : undefined;
+        const java = findJava({
+            javaPath: cfg.javaPath || undefined,
+            javaHome: editorJava && existsSync(editorJava) ? undefined : process.env['JAVA_HOME'],
+            editorPath,
+            platform: process.platform,
+            exists: existsSync
+        });
+        const apksigner = findApksigner(defaultSdkLookup(cfg.androidSdk || undefined, editorPath));
+        const debugKey = defaultDebugKeystore();
+        const keystore = {
+            file: cfg.keystore || debugKey.file,
+            password: cfg.keystorePassword || debugKey.password,
+            alias: cfg.keyAlias || debugKey.alias,
+            keyPassword: cfg.keyPassword || cfg.keystorePassword || debugKey.keyPassword
+        };
+        if (cfg.keystorePassword)
+            setSecret(cfg.keystorePassword);
+        if (cfg.keyPassword)
+            setSecret(cfg.keyPassword);
+        info(`java: ${java.path} (${java.source}), apksigner: ${apksigner}`);
+        const { size } = await stampApk({ base, output, segment, java: java.path, apksigner, keystore });
+        info(`Segment "${segment.name}" (campaign "${segment.campaign}"): ${output} (${size} bytes)`);
+        setSegmentOutputs(segment);
+        setOutput('apk-path', output);
+        setOutput('size', String(size));
+        return;
+    }
     const patched = await applyPatch({ projectRoot, segment, stateFile: defaultStateFile() });
     const kind = segment.debug ? ', development build' : '';
     info(`Forcing segment "${segment.name}" (campaign "${segment.campaign}"${kind})`);
     for (const changed of patched)
         info(`  patched ${changed}`);
+    setSegmentOutputs(segment);
+    setOutput('patched', patched.join('\n'));
+}
+function setSegmentOutputs(segment) {
     setOutput('enabled', 'true');
     setOutput('name', segment.name);
     setOutput('campaign', segment.campaign);
@@ -39146,7 +40332,6 @@ async function run() {
     setOutput('country', segment.country ?? '');
     setOutput('debug', String(segment.debug));
     setOutput('json', JSON.stringify({ ...segment, country: segment.country ?? '' }));
-    setOutput('patched', patched.join('\n'));
 }
 
 /** The entrypoint for the action (bundled into dist/index.js). */
