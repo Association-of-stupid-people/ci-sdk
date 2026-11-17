@@ -1,7 +1,7 @@
 # Reusable workflow: the release of a Unity Android game from a tag vX.Y.Z (a push of the tag, or a manual run from
-# it), on a self-hosted Windows runner: a signed store AAB, one universal APK made from that same AAB for QA, both on a
-# Google Shared Drive folder, and one chat card (START before Unity, END from the notify job). The game repository
-# calls it from its own workflow (triggers, concurrency and secrets stay there):
+# it), on a self-hosted Windows runner: a signed store AAB, one universal APK made from that same AAB for QA, both on
+# the BlackGems dash (Files of a Workspace Space), and one chat card (START before Unity, END from the notify job). The
+# game repository calls it from its own workflow (triggers, concurrency and secrets stay there):
 #
 #   jobs:
 #     release:
@@ -37,11 +37,11 @@
 # files).
 #
 # Secrets: UNITY_LICENSE (content of the Unity .ulf file, only its serial is used), UNITY_EMAIL and UNITY_PASSWORD
-# (the Unity account of that license). GDRIVE_SERVICE_ACCOUNT_KEY, GDRIVE_FOLDER_ID and CHAT_WEBHOOK_URL as in
-# unity-android-debug.yml: empty Drive secrets keep the files as GitHub artifacts (7 days), an empty webhook posts
+# (the Unity account of that license). DASH_MCP_KEY, CHAT_WEBHOOK_URL and the dash-* inputs as in
+# unity-android-debug.yml: an empty DASH_MCP_KEY keeps the files as GitHub artifacts (7 days), an empty webhook posts
 # nothing. A failed upload fails the run; a failed webhook call does not.
-# Logs: the Unity log goes next to the AAB and APK on Drive, whatever the result; for a job that failed or was
-# cancelled, the notify job also puts its full GitHub job log on Drive. Chat: START right before Unity (the tag and the
+# Logs: the Unity log goes next to the AAB and APK on dash, whatever the result; for a job that failed or was
+# cancelled, the notify job also puts its full GitHub job log on dash. Chat: START right before Unity (the tag and the
 # keystore are checked by now), then one END: ✅, ⚠️ (built, but an upload or the keystore commit failed), ❌ (the
 # failed step and the log) or 🚫 (cancelled). A job stopped by its own timeout-minutes is ❌ "(timed out)".
 # Caches: the release reuses the checkout and Unity's Library (`clean` for a fresh checkout and an empty Gradle cache),
@@ -64,6 +64,18 @@ on:
         description: JSON array of the labels of the runner of the keystore and notify jobs (any OS)
         type: string
         default: '["light"]'
+      dash-area:
+        description: Dash Files area of the builds, "<kind>:<id>" (ws:19 = the Radiance Space)
+        type: string
+        default: ws:19
+      dash-folder:
+        description: Folder path in that area, segments split by / (default "CI Builds/<repository name>"); missing folders are created
+        type: string
+        default: ''
+      dash-link-template:
+        description: Link of an uploaded file on the card; {id} is the dash file id
+        type: string
+        default: https://dash.blackgems.org/api/files-tep?id={id}
     secrets:
       UNITY_LICENSE:
         required: true
@@ -79,6 +91,9 @@ on:
         required: false
       KEYSTORE_ALIAS_PASSWORD:
         required: false
+      DASH_MCP_KEY:
+        required: false
+      # Unused since ci-sdk v3.11.0 (the files go to dash): still accepted, so a caller that passes them keeps working.
       GDRIVE_SERVICE_ACCOUNT_KEY:
         required: false
       GDRIVE_FOLDER_ID:
@@ -89,9 +104,15 @@ on:
 permissions:
   contents: read
 
+# Where every upload of the run goes on dash (ci-sdk dash-upload, as the member of DASH_MCP_KEY).
+env:
+  DASH_AREA: ${{ inputs.dash-area || 'ws:19' }}
+  DASH_FOLDER: ${{ inputs.dash-folder || format('CI Builds/{0}', github.event.repository.name) }}
+  DASH_LINK_TEMPLATE: ${{ inputs.dash-link-template }}
+
 jobs:
   # Release from a tag vX.Y.Z (a push of the tag, or a manual run from it): the store AAB, signed, and one universal
-  # APK made from that same AAB for QA, both on Drive. Same runner and workspace as the debug builds.
+  # APK made from that same AAB for QA, both on dash. Same runner and workspace as the debug builds.
   release:
     name: Release AAB + APK
     if: github.ref_type == 'tag' && github.actor != 'dependabot[bot]'
@@ -142,7 +163,7 @@ jobs:
       unity-outcome: ${{ steps.unity.outcome }}
       restore-outcome: ${{ steps.restore.outcome }}
       convert-outcome: ${{ steps.convert.outcome }}
-      # Each file exists: on Drive, or else as the fallback artifact.
+      # Each file exists: on dash, or else as the fallback artifact.
       aab-ok: ${{ steps.driveaab.outcome == 'success' || steps.aabart.outcome == 'success' }}
       apk-ok: ${{ steps.driveapk.outcome == 'success' || steps.apkart.outcome == 'success' }}
     steps:
@@ -161,7 +182,7 @@ jobs:
         continue-on-error: true
         uses: Association-of-stupid-people/ci-sdk/.github/actions/unity-project-info@runner
 
-      # Drive names from the tag, and the head commit for the card.
+      # Dash names from the tag, and the head commit for the card.
       - id: meta
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
@@ -169,7 +190,7 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
           RUN_NUMBER: ${{ github.run_number }}
-          HAVE_DRIVE: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY != '' && secrets.GDRIVE_FOLDER_ID != '' }}
+          HAVE_DRIVE: ${{ secrets.DASH_MCP_KEY != '' }}
         with:
           script: |
             const env = process.env;
@@ -306,8 +327,6 @@ jobs:
           HEAD_SUBJECT: ${{ steps.meta.outputs.head-subject }}
           KEYSTORE_PATH: ${{ steps.script.outputs.keystore-path }}
           HAVE_DRIVE: ${{ steps.meta.outputs.drive }}
-          # Only the folder link is built from it, here: a job output holding a secret would be dropped.
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         with:
           script: |
             const env = process.env;
@@ -356,7 +375,6 @@ jobs:
               eta,
               // The signing key's file name (never a password).
               keystore: (env.KEYSTORE_PATH || '').split(/[\\/]/).pop() || undefined,
-              driveFolderUrl: env.HAVE_DRIVE === 'true' && env.GDRIVE_FOLDER_ID ? `https://drive.google.com/drive/folders/${encodeURIComponent(env.GDRIVE_FOLDER_ID)}` : undefined,
               version: { name: env.VERSION_NAME || undefined, code: env.VERSION_CODE || undefined },
               builds: [
                 { name: 'AAB', kind: 'aab', status: 'planned' },
@@ -413,10 +431,12 @@ jobs:
       - id: driveaab
         if: ${{ !cancelled() && steps.unity.outcome == 'success' && steps.meta.outputs.drive == 'true' }}
         continue-on-error: true
-        uses: Association-of-stupid-people/ci-sdk/.github/actions/gdrive-upload@runner
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/dash-upload@runner
         with:
-          service-account-key: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY }}
-          folder-id: ${{ secrets.GDRIVE_FOLDER_ID }}
+          key: ${{ secrets.DASH_MCP_KEY }}
+          area: ${{ env.DASH_AREA }}
+          folder: ${{ env.DASH_FOLDER }}
+          link-template: ${{ env.DASH_LINK_TEMPLATE }}
           file: Builds/release.aab
           name: ${{ steps.meta.outputs.aab-name }}
 
@@ -450,10 +470,12 @@ jobs:
       - id: driveapk
         if: ${{ !cancelled() && steps.convert.outcome == 'success' && steps.meta.outputs.drive == 'true' }}
         continue-on-error: true
-        uses: Association-of-stupid-people/ci-sdk/.github/actions/gdrive-upload@runner
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/dash-upload@runner
         with:
-          service-account-key: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY }}
-          folder-id: ${{ secrets.GDRIVE_FOLDER_ID }}
+          key: ${{ secrets.DASH_MCP_KEY }}
+          area: ${{ env.DASH_AREA }}
+          folder: ${{ env.DASH_FOLDER }}
+          link-template: ${{ env.DASH_LINK_TEMPLATE }}
           file: Builds/release.apk
           name: ${{ steps.meta.outputs.apk-name }}
 
@@ -477,18 +499,20 @@ jobs:
               if (fs.existsSync(file)) core.setOutput(key, String(fs.statSync(file).size));
             }
 
-      # The Unity log next to the AAB and APK on Drive, whatever happened.
+      # The Unity log next to the AAB and APK on dash, whatever happened.
       - id: drivelog
         if: always() && steps.unity.outcome != 'skipped' && steps.meta.outputs.drive == 'true' && hashFiles('Builds/unity.log') != ''
         continue-on-error: true
-        uses: Association-of-stupid-people/ci-sdk/.github/actions/gdrive-upload@runner
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/dash-upload@runner
         with:
-          service-account-key: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY }}
-          folder-id: ${{ secrets.GDRIVE_FOLDER_ID }}
+          key: ${{ secrets.DASH_MCP_KEY }}
+          area: ${{ env.DASH_AREA }}
+          folder: ${{ env.DASH_FOLDER }}
+          link-template: ${{ env.DASH_LINK_TEMPLATE }}
           file: Builds/unity.log
           name: ${{ steps.meta.outputs.log-name }}
 
-      # Only when Unity itself failed and its log is not on Drive: the card links it as the Unity log.
+      # Only when Unity itself failed and its log is not on dash: the card links it as the Unity log.
       - id: unitylog
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure() && steps.unity.outcome == 'failure' && steps.drivelog.outcome != 'success'
@@ -617,7 +641,7 @@ jobs:
   # The END message of the release: success, partial, failure or cancelled. It also runs when the run is cancelled
   # (always()): the result of each job comes from needs.<job>.result.
   notify:
-    name: Drive and chat
+    name: Dash and chat
     needs: [release, keystore]
     if: ${{ always() && needs.release.result != 'skipped' }}
     # The light runner: the END message does not wait behind builds on the Windows build runner. Every step is
@@ -630,7 +654,7 @@ jobs:
       actions: read
     env:
       # From the secrets, not from the build job: a job cancelled while it waited for the runner has no outputs.
-      HAVE_DRIVE: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY != '' && secrets.GDRIVE_FOLDER_ID != '' }}
+      HAVE_DRIVE: ${{ secrets.DASH_MCP_KEY != '' }}
     # Every step runs whatever happened before it (always()): the END message must go out.
     steps:
       # A fresh folder: the runner's workspace persists between jobs.
@@ -646,9 +670,9 @@ jobs:
             core.setOutput('dir', dir);
 
       - if: always() && env.HAVE_DRIVE != 'true'
-        run: echo "::warning::GDRIVE_SERVICE_ACCOUNT_KEY or GDRIVE_FOLDER_ID is empty, the builds were not uploaded to Drive (they are GitHub artifacts)"
+        run: echo "::warning::DASH_MCP_KEY is empty, the builds were not uploaded to dash (they are GitHub artifacts)"
 
-      # Which built files did not reach Drive (the release job uploads them; a failed upload fails the run here).
+      # Which built files did not reach dash (the release job uploads them; a failed upload fails the run here).
       - id: drivecheck
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -666,7 +690,7 @@ jobs:
             core.setOutput('failed', failed.join(', '));
 
       # The full GitHub log of the release job and the keystore job when they failed or were cancelled, as one file for
-      # Drive: where the Unity log does not help (checkout, keystore, aab-to-apk, upload, a killed Unity). Also each
+      # dash: where the Unity log does not help (checkout, keystore, aab-to-apk, upload, a killed Unity). Also each
       # job's page, the card's GitHub fallback. Best effort: a problem here is a warning, never the run's result.
       - id: joblog
         if: always()
@@ -693,7 +717,7 @@ jobs:
                 { owner, repo, run_id: context.runId, filter: 'latest', per_page: 100 }))
                 .map(j => ({ ...j, name: short(j.name) })).filter(j => isBuildJob(j.name));
             } catch (err) {
-              core.warning(`Jobs of the run not listed, no job log on Drive: ${err.message}`);
+              core.warning(`Jobs of the run not listed, no job log on dash: ${err.message}`);
               return;
             }
             core.setOutput('urls', JSON.stringify(Object.fromEntries(jobs.map(j => [j.name, j.html_url]))));
@@ -735,10 +759,12 @@ jobs:
       - id: drivejoblog
         if: always() && env.HAVE_DRIVE == 'true' && steps.joblog.outputs.file != ''
         continue-on-error: true
-        uses: Association-of-stupid-people/ci-sdk/.github/actions/gdrive-upload@runner
+        uses: Association-of-stupid-people/ci-sdk/.github/actions/dash-upload@runner
         with:
-          service-account-key: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY }}
-          folder-id: ${{ secrets.GDRIVE_FOLDER_ID }}
+          key: ${{ secrets.DASH_MCP_KEY }}
+          area: ${{ env.DASH_AREA }}
+          folder: ${{ env.DASH_FOLDER }}
+          link-template: ${{ env.DASH_LINK_TEMPLATE }}
           file: ${{ steps.joblog.outputs.file }}
           name: ${{ steps.joblog.outputs.name }}
 
@@ -750,8 +776,6 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           RELEASE_RESULT: ${{ needs.release.result }}
-          # Only the folder link is built from it, here: a job output holding a secret would be dropped.
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           REL_TIMED_OUT: ${{ needs.release.outputs.timed-out }}
           REL_KEYSTORE_SOURCE: ${{ needs.release.outputs.keystore-source }}
           REL_KEYSTORE_COMMITTED: ${{ needs.release.outputs.keystore-committed }}
@@ -840,8 +864,8 @@ jobs:
               [env.REL_PRERESTORE_OUTCOME, 'Segment restore (before build)'], [env.REL_SCRIPT_OUTCOME, 'Release setup'],
               [env.REL_SERIAL_OUTCOME, 'Unity license (serial)'], [env.REL_CLEANUP_OUTCOME, 'Cleanup of the old build'],
               [env.REL_IL2CPPCLEAN_OUTCOME, 'IL2CPP clean'], [env.REL_UNITY_OUTCOME, 'Unity build (AAB)'], [env.REL_RESTORE_OUTCOME, 'Build script restore'],
-              [env.REL_AAB_DRIVE_OUTCOME, 'Upload of the AAB to Drive'], [env.REL_AAB_OUTCOME, 'AAB artifact'],
-              [env.REL_CONVERT_OUTCOME, 'AAB to APK'], [env.REL_APK_DRIVE_OUTCOME, 'Upload of the APK to Drive'],
+              [env.REL_AAB_DRIVE_OUTCOME, 'Upload of the AAB to dash'], [env.REL_AAB_OUTCOME, 'AAB artifact'],
+              [env.REL_CONVERT_OUTCOME, 'AAB to APK'], [env.REL_APK_DRIVE_OUTCOME, 'Upload of the APK to dash'],
               [env.REL_APK_OUTCOME, 'APK artifact'],
             ]) || (started ? 'the release job' : 'the wait for the runner');
             // In step order.
@@ -873,8 +897,8 @@ jobs:
               }
             }
 
-            // The log of a failed build: its Unity log on Drive when Unity is where it failed, else the job's full log on
-            // Drive (joblog step), else GitHub: the Unity log artifact, else the job's page.
+            // The log of a failed build: its Unity log on dash when Unity is where it failed, else the job's full log on
+            // dash (joblog step), else GitHub: the Unity log artifact, else the job's page.
             const jobLogJobs = parse(env.JOB_LOG_JOBS, []);
             const jobUrls = parse(env.JOB_URLS, {});
             const logFor = (job, unityDrive, artifactUrl) => unityDrive
@@ -888,9 +912,9 @@ jobs:
               ...(env.REL_LOG_DRIVE_OUTCOME === 'failure' ? ['release Unity log'] : []),
               ...(env.JOB_LOG_DRIVE_OUTCOME === 'failure' ? ['job log'] : []),
             ];
-            if (logUploadsFailed.length) core.warning(`Log upload to Drive failed (${logUploadsFailed.join(', ')}): the card links the next log available (job log on Drive, else GitHub)`);
-            // A built file: its Drive link, else the fallback artifact. A missing one: why, and the log.
-            // size: bytes of the built file (measured by the build job), else what Drive reported.
+            if (logUploadsFailed.length) core.warning(`Log upload to dash failed (${logUploadsFailed.join(', ')}): the card links the next log available (job log on dash, else GitHub)`);
+            // A built file: its dash link, else the fallback artifact. A missing one: why, and the log.
+            // size: bytes of the built file (measured by the build job), else what dash reported.
             const linkOf = (driveLink, size, artifactUrl) => driveLink ? { link: driveLink, size: num(size) }
               : artifactUrl ? { link: artifactUrl, fallback: true, size: num(size) } : {};
             const built = (ok, stopped, driveLink, size, artifactUrl, why, log) => ok
@@ -904,7 +928,7 @@ jobs:
 
             const failedStep = cancelled ? cancelStage
               : !mainOk ? releaseFailedStep
-              : uploadFailed ? `Upload to Drive (${env.DRIVE_FAILED})`
+              : uploadFailed ? `Upload to dash (${env.DRIVE_FAILED})`
               : keystoreUncommitted ? 'Keystore commit' : 'unknown step';
 
             let changes = [];
@@ -957,12 +981,11 @@ jobs:
               durationSeconds: secs !== undefined && Number.isFinite(secs) ? Math.max(0, secs) : undefined,
               // The signing key's file name (never a password).
               keystore: env.REL_KEYSTORE_PATH ? keyFile : undefined,
-              driveFolderUrl: driveOn && env.GDRIVE_FOLDER_ID ? `https://drive.google.com/drive/folders/${encodeURIComponent(env.GDRIVE_FOLDER_ID)}` : undefined,
               version: { name: env.GAME_VERSION ? env.GAME_VERSION.replace(/^v?/i, 'v') : undefined, code: env.VERSION_CODE && env.VERSION_CODE !== '?' ? env.VERSION_CODE : undefined },
               builds,
               changelog: changes.map(c => ({ ...c, url: `${repoUrl}/commit/${c.sha}` })),
               warnings: [
-                ...(driveOn ? [] : ['Drive chưa cấu hình: GDRIVE_SERVICE_ACCOUNT_KEY or GDRIVE_FOLDER_ID is empty, the files are GitHub artifacts (7 days)']),
+                ...(driveOn ? [] : ['Dash chưa cấu hình: DASH_MCP_KEY is empty, the files are GitHub artifacts (7 days)']),
                 ...keystoreNotes,
               ],
               logUrl,
@@ -984,4 +1007,4 @@ jobs:
           FAILED: ${{ steps.drivecheck.outputs.failed }}
         with:
           script: |
-            core.setFailed(`Drive upload failed for: ${process.env.FAILED} (see the drive step of that build job)`);
+            core.setFailed(`Dash upload failed for: ${process.env.FAILED} (see the upload step of that build job)`);

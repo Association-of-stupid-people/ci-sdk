@@ -30,6 +30,7 @@ packages/
   unity-build/          NEW: replaces the unity-build composite (Docker by default, or host)
   unity-force-segment/  NEW: force a UA segment in the Adjust SDK for a QA build, then restore
   gdrive-upload/        NEW: upload a file to a Google Shared Drive folder with a service account key
+  dash-upload/          NEW: upload a file to the BlackGems dash Files (MCP key of a member)
   unity-android-build-script/ NEW: CI-only Unity build script: signed AAB/APK, version from a tag, then restore
   aab-to-apk/           NEW: universal APK from an AAB (pinned bundletool), signed with the same keystore
   team-chat/            NEW: CI run report -> team chat webhook card (Block Kit, escaped, limits, retries)
@@ -146,10 +147,10 @@ the secrets stay in the game repository. Games call them `@main`, and the ci-sdk
 `@runner`: a push to `main` (or a publish) reaches every game's next run, with no pin to update. A
 change that needs a new action input only works once that action is published.
 
-| Workflow                    | Jobs                                                                | Runs on              |
-| --------------------------- | ------------------------------------------------------------------- | -------------------- |
-| `unity-android-debug.yml`   | Debug APK, one APK per segment of `segment-ci.yml`, Drive + chat    | push, PR, manual run |
-| `unity-android-release.yml` | Release AAB + universal APK, commit of a new keystore, Drive + chat | tag `vX.Y.Z`         |
+| Workflow                    | Jobs                                                               | Runs on              |
+| --------------------------- | ------------------------------------------------------------------ | -------------------- |
+| `unity-android-debug.yml`   | Debug APK, one APK per segment of `segment-ci.yml`, dash + chat    | push, PR, manual run |
+| `unity-android-release.yml` | Release AAB + universal APK, commit of a new keystore, dash + chat | tag `vX.Y.Z`         |
 
 ```yaml
 # .github/workflows/debug.yaml
@@ -177,8 +178,7 @@ jobs:
       UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
       UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
       UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
-      GDRIVE_SERVICE_ACCOUNT_KEY: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY }}
-      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+      DASH_MCP_KEY: ${{ secrets.DASH_MCP_KEY }}
       CHAT_WEBHOOK_URL: ${{ secrets.CHAT_WEBHOOK_URL }}
 ```
 
@@ -192,13 +192,16 @@ debug APK, default false), `build-method` (the game's static method that writes
 `Builds/check.apk`, `-ciDevelopmentBuild` = development build; default
 `GameBuildCheck.CiAndroidApk`), `build-runs-on` and `light-runs-on` (JSON arrays of runner labels;
 defaults `["self-hosted", "Windows", "runner-windows"]` and `["light"]`). Inputs (release): `clean`,
-`build-runs-on`, `light-runs-on`. The header of each workflow file documents the behaviour
-(signing, caches, IL2CPP clean, Drive names, chat card).
+`build-runs-on`, `light-runs-on`. Both: `dash-area` (default `ws:19`, the Radiance Space),
+`dash-folder` (default `CI Builds/<repository name>`, created when missing) and
+`dash-link-template` (the card link of a file, `{id}` = dash file id). The header of each workflow
+file documents the behaviour (signing, caches, IL2CPP clean, file names, chat card).
 
 Notes:
 
 - A game in another organization cannot use `secrets: inherit`: pass each secret. Only the Unity
-  ones are required; empty Drive secrets keep the files as GitHub artifacts, an empty webhook posts
+  ones are required; an empty `DASH_MCP_KEY` keeps the files as GitHub artifacts (the old
+  `GDRIVE_*` secrets are still accepted, unused), an empty webhook posts
   nothing.
 - Jobs run on the **caller's** runners, and every `github.*` value is the caller's run (event, ref,
   actor, `GITHUB_WORKFLOW_REF`: the START ETA reads the caller workflow's earlier runs).
@@ -614,6 +617,41 @@ can cost minutes per file.
     file: Builds/game.apk
     name: game_${{ github.run_number }}.apk
 # ${{ steps.drive.outputs.link }}
+```
+
+## `dash-upload` action
+
+Uploads one file into the Files (Drive) of the BlackGems dash, as the dash member whose **MCP key**
+(`bgm_…`) it is given, and outputs `id` (dash file id), `link` (`link-template` with `{id}`),
+`name`, `size` and `folder-id`. Everything goes through the dash MCP endpoint (tools `dash_doc`
+and `dash_ghi`, one stateless JSON-RPC call each); the bytes go straight to the Google resumable
+upload URL that dash opens, so a large APK never passes through the dash server or its firewall.
+
+Inputs: `key` (required, masked), `area` (required, `<kind>:<id>` such as `ws:19`, from
+`/api/files-khu-cua-toi`), `folder` (path such as `CI Builds/My-Game`, missing folders are
+created; empty = the area root), `file` (required), `name`, `mime-type`, `link-template`
+(default `https://dash.blackgems.org/api/files-tep?id={id}`), `url` (default
+`https://dash.blackgems.org/mcp`), `attempts` (default 3).
+
+- Calls: `files-ds` (find the folders) → `files-thu-muc-tao` (missing ones) →
+  `files-tai-len-mo` `{ten, co, khu, thuMuc}` → `PUT` the bytes → `files-tai-len-xong`.
+- 429, 5xx and network errors are retried with backoff. A failed PUT drops its session
+  (`files-tai-len-huy`) and opens a new one; once the bytes are stored only the finish call is
+  retried, so a file is never uploaded twice. A tool error (`{"error": "KHU_SAI"}`, a refused
+  parameter) or a firewall page (`Ray ID`) fails at once.
+- Two runs that create the same folder at once each make one: the oldest is used from then on.
+
+```yaml
+- id: dash
+  if: env.HAVE_DASH == true
+  uses: <owner>/ci-sdk/.github/actions/dash-upload@runner
+  with:
+    key: ${{ secrets.DASH_MCP_KEY }}
+    area: ws:19
+    folder: CI Builds/My-Game
+    file: Builds/game.apk
+    name: game_${{ github.run_number }}.apk
+# ${{ steps.dash.outputs.link }}
 ```
 
 ## Android release signing (keystore resolution)

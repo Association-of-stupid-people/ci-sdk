@@ -62,6 +62,9 @@ describe.each(files)('%s', file => {
     }
   })
 
+  // Declared but unused on purpose: callers that still pass them must keep working.
+  const RETIRED_SECRETS = new Set(['GDRIVE_SERVICE_ACCOUNT_KEY', 'GDRIVE_FOLDER_ID'])
+
   it('declares every input and secret it reads', () => {
     const inputs = Object.keys(wf.on.workflow_call.inputs ?? {})
     const secrets = Object.keys(wf.on.workflow_call.secrets ?? {})
@@ -71,7 +74,8 @@ describe.each(files)('%s', file => {
       expect(secrets, `secrets.${name}`).toContain(name)
     // Every declared one is used.
     for (const name of inputs) expect(text, `input ${name}`).toContain(`inputs.${name}`)
-    for (const name of secrets) expect(text, `secret ${name}`).toContain(`secrets.${name}`)
+    for (const name of secrets.filter(s => !RETIRED_SECRETS.has(s)))
+      expect(text, `secret ${name}`).toContain(`secrets.${name}`)
   })
 
   it.each(Object.keys(wf.jobs))(
