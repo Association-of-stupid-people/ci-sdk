@@ -1,0 +1,50 @@
+name: dash-upload
+description: Upload a file to the Files (Drive) of the BlackGems dash through its MCP endpoint, with a member MCP key
+
+inputs:
+  key:
+    description: MCP key of a dash member (bgm_...). The file is uploaded as that member, with that member's rights
+    required: true
+  area:
+    description: Files area (khu) of the file, "<kind>:<id>", e.g. ws:19 (a Workspace Space) — from /api/files-khu-cua-toi
+    required: true
+  folder:
+    description: Folder path inside the area, segments split by / (e.g. "CI Builds/My-Game"); missing folders are created. Empty = the area root
+    required: false
+  file:
+    description: Local file to upload
+    required: true
+  name:
+    description: File name on dash (default the local file name)
+    required: false
+  mime-type:
+    description: MIME type (default from the extension; application/octet-stream when unknown)
+    required: false
+  link-template:
+    description: Link of an uploaded file; {id} is replaced by its dash file id
+    required: false
+    default: 'https://dash.blackgems.org/api/files-tep?id={id}'
+  url:
+    description: MCP endpoint of the dash
+    required: false
+    default: https://dash.blackgems.org/mcp
+  attempts:
+    description: Attempts of each dash call and of the upload, on network or server errors
+    required: false
+    default: '3'
+
+outputs:
+  id:
+    description: Dash file id
+  link:
+    description: Link of the file (link-template)
+  name:
+    description: File name on dash
+  size:
+    description: Size in bytes
+  folder-id:
+    description: Dash id of the folder the file is in (empty at the area root)
+
+runs:
+  using: node24
+  main: dist/index.js
